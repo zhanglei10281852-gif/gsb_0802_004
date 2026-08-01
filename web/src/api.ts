@@ -1,5 +1,7 @@
 export type ProposalStatus = 'pending' | 'approved' | 'rejected';
 export type EvidenceVerdict = 'compatible' | 'incompatible' | 'error';
+export type ExemptionStatus = 'pending' | 'active' | 'rejected' | 'revoked' | 'expired';
+export type ExemptionDirection = 'compatible' | 'incompatible';
 
 export interface CompatibilityIssue {
   code: string;
@@ -29,6 +31,25 @@ export interface EvidenceRecord {
   recordedAt: number;
 }
 
+export interface Exemption {
+  id: string;
+  candidateHash: string;
+  consumerId: string;
+  environment: string;
+  direction: ExemptionDirection;
+  reason: string;
+  requesterId: string;
+  confirmerId: string | null;
+  status: ExemptionStatus;
+  validFrom: number;
+  validUntil: number;
+  createdAt: number;
+  confirmedAt: number | null;
+  closedAt: number | null;
+  closedBy: string | null;
+  closeNote: string | null;
+}
+
 export interface Proposal {
   id: string;
   candidateHash: string;
@@ -36,6 +57,7 @@ export interface Proposal {
   baselineSchema: Record<string, unknown>;
   systemCompatibility: CompatibilityResult;
   status: ProposalStatus;
+  environment: string;
   createdAt: number;
 }
 
@@ -49,6 +71,20 @@ export interface Decision {
     evidence: EvidenceRecord[];
     requiredConsumerIds: string[];
     missingConsumerIds: string[];
+    exemptedConsumerIds: string[];
+    appliedExemptions: Array<{
+      id: string;
+      candidateHash: string;
+      consumerId: string;
+      environment: string;
+      direction: ExemptionDirection;
+      reason: string;
+      requesterId: string;
+      confirmerId: string;
+      validFrom: number;
+      validUntil: number;
+      confirmedAt: number;
+    }>;
     gateReady: boolean;
     blockingReasons: string[];
     systemCompatibility: CompatibilityResult;
@@ -59,8 +95,13 @@ export interface Decision {
 export interface ProposalDetail {
   proposal: Proposal;
   evidence: EvidenceRecord[];
+  exemptions: Exemption[];
   requiredConsumerIds: string[];
   missingConsumerIds: string[];
+  exemptedConsumerIds: string[];
+  compatibleConsumerIds: string[];
+  incompatibleConsumerIds: string[];
+  appliedExemptions: Exemption[];
   gateReady: boolean;
   blockingReasons: string[];
   decision: Decision | null;
@@ -68,6 +109,7 @@ export interface ProposalDetail {
 
 export interface Snapshot {
   consumers: Consumer[];
+  exemptions: Exemption[];
   proposals: ProposalDetail[];
 }
 
@@ -95,10 +137,10 @@ async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   snapshot: () => jsonRequest<Snapshot>('/api/snapshot'),
   proposal: (id: string) => jsonRequest<ProposalDetail>(`/api/proposals/${id}`),
-  createProposal: (candidateSchema: unknown, baselineSchema: unknown) =>
+  createProposal: (candidateSchema: unknown, baselineSchema: unknown, environment: string) =>
     jsonRequest<{ proposal: Proposal; duplicate: boolean }>('/api/proposals', {
       method: 'POST',
-      body: JSON.stringify({ candidateSchema, baselineSchema }),
+      body: JSON.stringify({ candidateSchema, baselineSchema, environment }),
     }),
   registerConsumer: (id: string, name: string) =>
     jsonRequest<{ consumer: Consumer }>('/api/consumers', {
@@ -109,6 +151,39 @@ export const api = {
     jsonRequest<{ decision: Decision }>(`/api/proposals/${id}/decision`, {
       method: 'POST',
       body: JSON.stringify({ action, reason }),
+    }),
+  exemptions: (candidateHash?: string) =>
+    jsonRequest<{ exemptions: Exemption[] }>(
+      candidateHash ? `/api/exemptions?candidateHash=${encodeURIComponent(candidateHash)}` : '/api/exemptions',
+    ),
+  requestExemption: (body: {
+    candidateHash: string;
+    consumerId: string;
+    environment: string;
+    direction: ExemptionDirection;
+    reason: string;
+    requesterId: string;
+    validFrom: number;
+    validUntil: number;
+  }) =>
+    jsonRequest<{ exemption: Exemption }>('/api/exemptions', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  confirmExemption: (id: string, confirmerId: string) =>
+    jsonRequest<{ exemption: Exemption }>(`/api/exemptions/${id}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ confirmerId }),
+    }),
+  rejectExemption: (id: string, reviewerId: string, note: string) =>
+    jsonRequest<{ exemption: Exemption }>(`/api/exemptions/${id}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ reviewerId, note }),
+    }),
+  revokeExemption: (id: string, reviewerId: string, note: string) =>
+    jsonRequest<{ exemption: Exemption }>(`/api/exemptions/${id}/revoke`, {
+      method: 'POST',
+      body: JSON.stringify({ reviewerId, note }),
     }),
   causalEvents: () => jsonRequest<{ events: CausalEvent[] }>('/api/causal-events'),
 };
@@ -124,4 +199,8 @@ export function timeAgo(ts: number, now: number): string {
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   return `${h}h ago`;
+}
+
+export function fmtTime(ts: number): string {
+  return new Date(ts).toISOString().replace('T', ' ').slice(0, 19);
 }

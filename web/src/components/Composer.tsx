@@ -25,6 +25,7 @@ const SAMPLE_CANDIDATE = {
 export function Composer({ consumers, onCreated }: { consumers: Consumer[]; onCreated: () => void }) {
   const [consumerId, setConsumerId] = useState('');
   const [consumerName, setConsumerName] = useState('');
+  const [environment, setEnvironment] = useState('production');
   const [baseline, setBaseline] = useState(JSON.stringify(SAMPLE_BASELINE, null, 2));
   const [candidate, setCandidate] = useState(JSON.stringify(SAMPLE_CANDIDATE, null, 2));
   const [msg, setMsg] = useState<string | null>(null);
@@ -51,7 +52,7 @@ export function Composer({ consumers, onCreated }: { consumers: Consumer[]; onCr
     try {
       const baselineSchema = JSON.parse(baseline);
       const candidateSchema = JSON.parse(candidate);
-      const res = await api.createProposal(candidateSchema, baselineSchema);
+      const res = await api.createProposal(candidateSchema, baselineSchema, environment);
       setMsg(res.duplicate ? 'proposal already exists (duplicate hash)' : 'proposal created');
       onCreated();
     } catch (e) {
@@ -77,6 +78,10 @@ export function Composer({ consumers, onCreated }: { consumers: Consumer[]; onCr
       </button>
 
       <p className="section-title mt16">Submit Proposal</p>
+      <label>
+        <span>Environment</span>
+        <input value={environment} onChange={(e) => setEnvironment(e.target.value)} placeholder="production" />
+      </label>
       <label>
         <span>Baseline Schema</span>
         <textarea rows={6} value={baseline} onChange={(e) => setBaseline(e.target.value)} />

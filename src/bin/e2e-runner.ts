@@ -48,7 +48,7 @@ async function waitForHealth(baseUrl: string, timeoutMs = 15000): Promise<void> 
   throw new Error(`server at ${baseUrl} did not become healthy`);
 }
 
-function spawnServer(dbPath: string, port: number): ServerHandle & { stderr: string } {
+function spawnServer(dbPath: string, port: number, extraEnv: Record<string, string> = {}): ServerHandle & { stderr: string } {
   const child: ChildProcess = spawn(process.execPath, [serverEntry], {
     env: {
       ...process.env,
@@ -56,6 +56,7 @@ function spawnServer(dbPath: string, port: number): ServerHandle & { stderr: str
       CCC_PORT: String(port),
       CCC_HOST: '127.0.0.1',
       CCC_LOG: '0',
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -385,6 +386,153 @@ async function scenarioBreakingChange(baseUrl: string): Promise<void> {
   check(reject.status === 200, 'rejection of a breaking proposal is allowed');
 }
 
+const secondCompatibleCandidate = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  type: 'object',
+  properties: {
+    orderId: { type: 'string' },
+    amount: { type: 'number', minimum: 0 },
+    priority: { type: 'string' },
+  },
+  required: ['orderId'],
+};
+
+async function scenarioExemptionsVirtualClock(baseUrl: string): Promise<void> {
+  console.log('\n[scenario] dual-reviewer exemptions, deterministic expiry (virtual clock)');
+
+  await postJson(baseUrl, '/api/consumers', { id: 'svc-a', name: 'Service A' });
+  await postJson(baseUrl, '/api/consumers', { id: 'svc-b', name: 'Service B' });
+
+  const p1 = await postJson(baseUrl, '/api/proposals', {
+    candidateSchema: compatibleCandidate,
+    baselineSchema,
+    environment: 'production',
+  });
+  check(p1.status === 201, 'created proposal P1');
+  const p1Id: string = p1.body.proposal.id;
+  const p1Hash: string = p1.body.proposal.candidateHash;
+
+  await postJson(baseUrl, `/api/proposals/${p1Id}/evidence`, {
+    consumerId: 'svc-a',
+    candidateHash: p1Hash,
+    verdict: 'compatible',
+    details: 'ok',
+    idempotencyKey: 'a1',
+  });
+
+  const req = await postJson(baseUrl, '/api/exemptions', {
+    candidateHash: p1Hash,
+    consumerId: 'svc-b',
+    environment: 'production',
+    direction: 'compatible',
+    reason: 'svc-b offline during release window',
+    requesterId: 'alice',
+    validFrom: 0,
+    validUntil: 1000,
+  });
+  check(req.status === 201, 'exemption requested');
+  const exId: string = req.body.exemption.id;
+  check(req.body.exemption.status === 'pending', 'exemption starts pending (needs second reviewer)');
+
+  const selfConfirm = await postJson(baseUrl, `/api/exemptions/${exId}/confirm`, { confirmerId: 'alice' });
+  check(selfConfirm.status === 409, 'requester cannot confirm their own exemption');
+
+  const wrongEnv = await postJson(baseUrl, '/api/exemptions', {
+    candidateHash: p1Hash,
+    consumerId: 'svc-b',
+    environment: 'staging',
+    direction: 'compatible',
+    reason: 'wrong env',
+    requesterId: 'alice',
+    validFrom: 0,
+    validUntil: 1000,
+  });
+  check(wrongEnv.status === 201, 'staging exemption can be requested separately');
+
+  const bobConfirm = await postJson(baseUrl, `/api/exemptions/${exId}/confirm`, { confirmerId: 'bob' });
+  check(bobConfirm.status === 200, 'different reviewer confirmed the exemption');
+  check(bobConfirm.body.exemption.status === 'active', 'exemption is active');
+
+  const ready = await getJson(baseUrl, `/api/proposals/${p1Id}`);
+  check(ready.gateReady === true, 'gate ready with svc-b covered by active exemption');
+  check(ready.exemptedConsumerIds.includes('svc-b'), 'svc-b listed as exempted');
+
+  const approved = await postJson(baseUrl, `/api/proposals/${p1Id}/decision`, {
+    action: 'approve',
+    reason: 'svc-b waived by dual-reviewed exemption',
+  });
+  check(approved.status === 200, 'P1 approved via exemption');
+  check(approved.body.decision.snapshot.appliedExemptions.length === 1, 'frozen snapshot records 1 applied exemption');
+  check(
+    approved.body.decision.snapshot.appliedExemptions[0].confirmerId === 'bob',
+    'frozen exemption names the second reviewer',
+  );
+
+  const p2 = await postJson(baseUrl, '/api/proposals', {
+    candidateSchema: secondCompatibleCandidate,
+    baselineSchema,
+    environment: 'production',
+  });
+  check(p2.status === 201, 'created proposal P2');
+  const p2Id: string = p2.body.proposal.id;
+  const p2Hash: string = p2.body.proposal.candidateHash;
+
+  await postJson(baseUrl, `/api/proposals/${p2Id}/evidence`, {
+    consumerId: 'svc-a',
+    candidateHash: p2Hash,
+    verdict: 'compatible',
+    details: 'ok',
+    idempotencyKey: 'a2',
+  });
+
+  const req2 = await postJson(baseUrl, '/api/exemptions', {
+    candidateHash: p2Hash,
+    consumerId: 'svc-b',
+    environment: 'production',
+    direction: 'compatible',
+    reason: 'svc-b still offline',
+    requesterId: 'alice',
+    validFrom: 0,
+    validUntil: 1000,
+  });
+  check(req2.status === 201, 'second exemption requested for P2');
+  const ex2Id: string = req2.body.exemption.id;
+  await postJson(baseUrl, `/api/exemptions/${ex2Id}/confirm`, { confirmerId: 'bob' });
+  const p2Ready = await getJson(baseUrl, `/api/proposals/${p2Id}`);
+  check(p2Ready.gateReady === true, 'P2 gate ready before expiry');
+
+  const advanced = await postJson(baseUrl, '/api/test/clock/advance', { ms: 2000 });
+  check(advanced.status === 200, `virtual clock advanced to ${advanced.body.now}`);
+  check(advanced.body.now >= 2000, 'virtual clock moved past exemption window');
+
+  const p2After = await getJson(baseUrl, `/api/proposals/${p2Id}`);
+  check(p2After.gateReady === false, 'P2 gate blocked after exemption expired');
+  check(p2After.missingConsumerIds.includes('svc-b'), 'svc-b is missing again after expiry');
+
+  const expiredList = await getJson(baseUrl, `/api/exemptions?candidateHash=${p2Hash}`);
+  check(
+    expiredList.exemptions.some((e: any) => e.id === ex2Id && e.status === 'expired'),
+    'exemption status is expired after virtual clock advance',
+  );
+
+  const events = (await getJson(baseUrl, '/api/causal-events')).events as Array<{ type: string; payload: any }>;
+  check(events.some((e) => e.type === 'exemption_expired' && e.payload.exemptionId === ex2Id),
+    'exemption_expired recorded in causal audit chain');
+
+  const p1Decision = (await getJson(baseUrl, `/api/proposals/${p1Id}`)).decision;
+  check(
+    p1Decision.snapshot.appliedExemptions.length === 1 &&
+      p1Decision.snapshot.appliedExemptions[0].validUntil === 1000,
+    'P1 frozen snapshot still carries the original exemption despite later expiry',
+  );
+
+  const approveExpired = await postJson(baseUrl, `/api/proposals/${p2Id}/decision`, {
+    action: 'approve',
+    reason: 'should fail',
+  });
+  check(approveExpired.status === 409, 'cannot approve P2 once its exemption expired');
+}
+
 async function main(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'ccc-e2e-'));
   const dbPath = join(dir, 'e2e.sqlite');
@@ -403,7 +551,23 @@ async function main(): Promise<void> {
     await scenarioBreakingChange(handle.baseUrl);
   } finally {
     if (currentHandle) await currentHandle.stop();
+  }
+
+  const vdir = mkdtempSync(join(tmpdir(), 'ccc-e2e-virtual-'));
+  const vdbPath = join(vdir, 'virtual.sqlite');
+  const vport = 4124;
+  const vhandle = spawnServer(vdbPath, vport, { CCC_CLOCK: 'virtual' });
+  try {
+    await waitForHealth(vhandle.baseUrl).catch((err) => {
+      console.error('virtual server output:\n', vhandle.stderr);
+      throw err;
+    });
+    console.log(`virtual-clock server up at ${vhandle.baseUrl}`);
+    await scenarioExemptionsVirtualClock(vhandle.baseUrl);
+  } finally {
+    await vhandle.stop();
     rmSync(dir, { recursive: true, force: true });
+    rmSync(vdir, { recursive: true, force: true });
   }
 
   console.log(`\n${totalChecks - failedChecks}/${totalChecks} checks passed`);

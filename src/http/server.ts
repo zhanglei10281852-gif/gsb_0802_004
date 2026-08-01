@@ -6,6 +6,8 @@ import { EventHub, type SSEMessage } from './event-hub.js';
 import type {
   EvidenceSubmission,
   EvidenceVerdict,
+  ExemptionDirection,
+  ExemptionRequest,
 } from '../domain/types.js';
 
 export interface ServerOptions {
@@ -15,6 +17,8 @@ export interface ServerOptions {
   port?: number;
   host?: string;
   logger?: boolean;
+  testMode?: boolean;
+  onAdvanceClock?: (ms: number) => number;
 }
 
 export async function buildServer(opts: ServerOptions): Promise<FastifyInstance> {
@@ -22,7 +26,7 @@ export async function buildServer(opts: ServerOptions): Promise<FastifyInstance>
   const repo = opts.repository;
   const hub = opts.eventHub;
 
-  app.get('/api/health', async () => ({ ok: true, time: Date.now() }));
+  app.get('/api/health', async () => ({ ok: true, time: Date.now(), testMode: !!opts.testMode }));
 
   app.get('/api/consumers', async () => ({ consumers: repo.listConsumers() }));
 
@@ -40,16 +44,17 @@ export async function buildServer(opts: ServerOptions): Promise<FastifyInstance>
   app.post(
     '/api/proposals',
     async (
-      req: FastifyRequest<{ Body: { candidateSchema?: unknown; baselineSchema?: unknown } }>,
+      req: FastifyRequest<{ Body: { candidateSchema?: unknown; baselineSchema?: unknown; environment?: string } }>,
       reply: FastifyReply,
     ) => {
-      const { candidateSchema, baselineSchema } = req.body ?? {};
+      const { candidateSchema, baselineSchema, environment } = req.body ?? {};
       if (!candidateSchema || !baselineSchema || typeof candidateSchema !== 'object' || typeof baselineSchema !== 'object') {
         return reply.code(400).send({ error: 'candidateSchema and baselineSchema objects are required' });
       }
       const result = repo.createProposal(
         candidateSchema as Record<string, unknown>,
         baselineSchema as Record<string, unknown>,
+        environment ?? 'production',
       );
       return reply.code(result.duplicate ? 200 : 201).send(result);
     },
@@ -112,12 +117,111 @@ export async function buildServer(opts: ServerOptions): Promise<FastifyInstance>
     },
   );
 
+  app.get('/api/exemptions', async (req: FastifyRequest<{ Querystring: { candidateHash?: string } }>) => {
+    repo.sweepExpiredExemptions();
+    return { exemptions: repo.listExemptions(req.query.candidateHash) };
+  });
+
+  app.post(
+    '/api/exemptions',
+    async (
+      req: FastifyRequest<{
+        Body: {
+          candidateHash?: string;
+          consumerId?: string;
+          environment?: string;
+          direction?: string;
+          reason?: string;
+          requesterId?: string;
+          validFrom?: number;
+          validUntil?: number;
+        };
+      }>,
+      reply: FastifyReply,
+    ) => {
+      const b = req.body ?? {};
+      if (
+        !b.candidateHash ||
+        !b.consumerId ||
+        !b.environment ||
+        !b.direction ||
+        !b.requesterId ||
+        b.validFrom === undefined ||
+        b.validUntil === undefined
+      ) {
+        return reply.code(400).send({
+          error: 'candidateHash, consumerId, environment, direction, requesterId, validFrom and validUntil are required',
+        });
+      }
+      if (b.direction !== 'compatible' && b.direction !== 'incompatible') {
+        return reply.code(400).send({ error: 'direction must be "compatible" or "incompatible"' });
+      }
+      const request: ExemptionRequest = {
+        candidateHash: b.candidateHash,
+        consumerId: b.consumerId,
+        environment: b.environment,
+        direction: b.direction as ExemptionDirection,
+        reason: b.reason ?? '',
+        requesterId: b.requesterId,
+        validFrom: Number(b.validFrom),
+        validUntil: Number(b.validUntil),
+      };
+      const result = repo.requestExemption(request);
+      if (!result.ok) return reply.code(409).send({ error: result.reason });
+      return reply.code(201).send({ exemption: result.exemption });
+    },
+  );
+
+  app.post(
+    '/api/exemptions/:id/confirm',
+    async (
+      req: FastifyRequest<{ Params: { id: string }; Body: { confirmerId?: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const { confirmerId } = req.body ?? {};
+      if (!confirmerId) return reply.code(400).send({ error: 'confirmerId is required' });
+      const result = repo.confirmExemption(req.params.id, confirmerId);
+      if (!result.ok) return reply.code(409).send({ error: result.reason });
+      return reply.code(200).send({ exemption: result.exemption });
+    },
+  );
+
+  app.post(
+    '/api/exemptions/:id/reject',
+    async (
+      req: FastifyRequest<{ Params: { id: string }; Body: { reviewerId?: string; note?: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const { reviewerId, note } = req.body ?? {};
+      if (!reviewerId) return reply.code(400).send({ error: 'reviewerId is required' });
+      const result = repo.closeExemption(req.params.id, reviewerId, 'reject', note ?? '');
+      if (!result.ok) return reply.code(409).send({ error: result.reason });
+      return reply.code(200).send({ exemption: result.exemption });
+    },
+  );
+
+  app.post(
+    '/api/exemptions/:id/revoke',
+    async (
+      req: FastifyRequest<{ Params: { id: string }; Body: { reviewerId?: string; note?: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const { reviewerId, note } = req.body ?? {};
+      if (!reviewerId) return reply.code(400).send({ error: 'reviewerId is required' });
+      const result = repo.closeExemption(req.params.id, reviewerId, 'revoke', note ?? '');
+      if (!result.ok) return reply.code(409).send({ error: result.reason });
+      return reply.code(200).send({ exemption: result.exemption });
+    },
+  );
+
   app.get('/api/causal-events', async () => ({ events: repo.listEvents() }));
 
   app.get('/api/snapshot', async () => {
+    repo.sweepExpiredExemptions();
     const proposals = repo.listProposals().map((p) => repo.getProposalDetail(p.id)!);
     return {
       consumers: repo.listConsumers(),
+      exemptions: repo.listExemptions(),
       proposals,
       events: repo.listEvents(),
     };
@@ -136,8 +240,10 @@ export async function buildServer(opts: ServerOptions): Promise<FastifyInstance>
       raw.write(`data: ${JSON.stringify(message)}\n\n`);
     };
 
+    repo.sweepExpiredExemptions();
     const snapshot = {
       consumers: repo.listConsumers(),
+      exemptions: repo.listExemptions(),
       proposals: repo.listProposals().map((p) => repo.getProposalDetail(p.id)!),
     };
     send({ type: 'snapshot', data: snapshot });
@@ -160,6 +266,20 @@ export async function buildServer(opts: ServerOptions): Promise<FastifyInstance>
 
     return reply;
   });
+
+  if (opts.testMode && opts.onAdvanceClock) {
+    app.post(
+      '/api/test/clock/advance',
+      async (req: FastifyRequest<{ Body: { ms?: number } }>, reply: FastifyReply) => {
+        const ms = Number(req.body?.ms ?? 0);
+        if (!Number.isFinite(ms) || ms < 0) {
+          return reply.code(400).send({ error: 'ms must be a non-negative number' });
+        }
+        const now = opts.onAdvanceClock!(ms);
+        return reply.code(200).send({ now, advanced: ms });
+      },
+    );
+  }
 
   if (opts.webRoot && existsSync(opts.webRoot)) {
     await app.register(fastifyStatic, {

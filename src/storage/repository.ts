@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { Database as DB } from 'better-sqlite3';
 import type { Clock } from '../domain/clock.js';
-import { evaluateGate } from '../domain/gate.js';
+import {
+  evaluateGate,
+  validateExemptionClosure,
+  validateExemptionConfirmation,
+  validateExemptionRequest,
+} from '../domain/gate.js';
 import { stableHash } from '../domain/hash.js';
 import { checkBackwardCompatibility } from '../domain/compatibility.js';
 import type {
@@ -13,6 +18,11 @@ import type {
   EvidenceAcceptance,
   EvidenceRecord,
   EvidenceSubmission,
+  Exemption,
+  ExemptionDirection,
+  ExemptionRequest,
+  ExemptionStatus,
+  FrozenExemption,
   Proposal,
   ProposalDetail,
   ProposalStatus,
@@ -31,6 +41,7 @@ interface ProposalRow {
   system_compatible: number;
   system_issues: string;
   status: ProposalStatus;
+  environment: string;
   created_at: number;
 }
 
@@ -58,6 +69,25 @@ interface DecisionRow {
   reason: string;
   snapshot: string;
   decided_at: number;
+}
+
+interface ExemptionRow {
+  id: string;
+  candidate_hash: string;
+  consumer_id: string;
+  environment: string;
+  direction: ExemptionDirection;
+  reason: string;
+  requester_id: string;
+  confirmer_id: string | null;
+  status: ExemptionStatus;
+  valid_from: number;
+  valid_until: number;
+  created_at: number;
+  confirmed_at: number | null;
+  closed_at: number | null;
+  closed_by: string | null;
+  close_note: string | null;
 }
 
 export class Repository {
@@ -149,6 +179,7 @@ export class Repository {
   createProposal(
     candidateSchema: Record<string, unknown>,
     baselineSchema: Record<string, unknown>,
+    environment = 'production',
   ): { proposal: Proposal; duplicate: boolean } {
     const candidateHash = stableHash(candidateSchema);
     const existing = this.db
@@ -163,8 +194,8 @@ export class Repository {
     this.db
       .prepare(
         `INSERT INTO proposals
-          (id, candidate_hash, candidate_schema, baseline_schema, system_compatible, system_issues, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+          (id, candidate_hash, candidate_schema, baseline_schema, system_compatible, system_issues, status, environment, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       )
       .run(
         id,
@@ -173,12 +204,14 @@ export class Repository {
         JSON.stringify(baselineSchema),
         systemCompatibility.compatible ? 1 : 0,
         JSON.stringify(systemCompatibility.issues),
+        environment,
         createdAt,
       );
     const proposal = this.getProposal(id)!;
     this.recordEvent('proposal_created', {
       proposalId: id,
       candidateHash,
+      environment,
       systemCompatible: systemCompatibility.compatible,
       issueCount: systemCompatibility.issues.length,
     });
@@ -326,15 +359,198 @@ export class Repository {
     return rows.map(rowToEvidence);
   }
 
-  private buildSnapshot(proposal: Proposal): DecisionSnapshot {
+  getExemption(id: string): Exemption | null {
+    const row = this.db.prepare('SELECT * FROM exemptions WHERE id = ?').get(id) as
+      | ExemptionRow
+      | undefined;
+    return row ? rowToExemption(row) : null;
+  }
+
+  listExemptions(candidateHash?: string): Exemption[] {
+    const rows = candidateHash
+      ? (this.db
+          .prepare('SELECT * FROM exemptions WHERE candidate_hash = ? ORDER BY created_at ASC')
+          .all(candidateHash) as ExemptionRow[])
+      : (this.db.prepare('SELECT * FROM exemptions ORDER BY created_at ASC').all() as ExemptionRow[]);
+    return rows.map(rowToExemption);
+  }
+
+  sweepExpiredExemptions(): Exemption[] {
+    const now = this.clock.now();
+    const expired: Exemption[] = [];
+    const run = (): Exemption[] => {
+      const rows = this.db
+        .prepare("SELECT * FROM exemptions WHERE status = 'active' AND valid_until < ?")
+        .all(now) as ExemptionRow[];
+      for (const row of rows) {
+        this.db
+          .prepare(
+            `UPDATE exemptions SET status = 'expired', closed_at = ?, closed_by = ?, close_note = ? WHERE id = ? AND status = 'active'`,
+          )
+          .run(now, 'system:expiry', `expired at ${now} (valid_until=${row.valid_until})`, row.id);
+        const ex = rowToExemption({ ...row, status: 'expired', closed_at: now, closed_by: 'system:expiry' });
+        expired.push(ex);
+        this.recordEvent('exemption_expired', {
+          exemptionId: row.id,
+          candidateHash: row.candidate_hash,
+          consumerId: row.consumer_id,
+          environment: row.environment,
+          direction: row.direction,
+          validUntil: row.valid_until,
+          expiredAt: now,
+        });
+      }
+      return expired;
+    };
+    if (this.buffering) return run();
+    return this.transactional(() => this.db.transaction(run)());
+  }
+
+  requestExemption(
+    req: ExemptionRequest,
+  ): { ok: true; exemption: Exemption } | { ok: false; reason: string } {
+    const knownConsumers = new Set(this.listConsumers().map((c) => c.id));
+    const validation = validateExemptionRequest(req, knownConsumers, this.clock.now());
+    if (!validation.ok) return { ok: false, reason: validation.reason! };
+
+    const candidate = this.getProposalByHash(req.candidateHash);
+    if (!candidate) return { ok: false, reason: 'unknown candidate hash' };
+
+    const id = randomUUID();
+    const createdAt = this.clock.now();
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO exemptions
+            (id, candidate_hash, consumer_id, environment, direction, reason, requester_id, confirmer_id,
+             status, valid_from, valid_until, created_at, confirmed_at, closed_at, closed_by, close_note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?, ?, NULL, NULL, NULL, NULL)`,
+        )
+        .run(
+          id,
+          req.candidateHash,
+          req.consumerId,
+          req.environment,
+          req.direction,
+          req.reason,
+          req.requesterId,
+          req.validFrom,
+          req.validUntil,
+          createdAt,
+        );
+    } catch (err) {
+      return { ok: false, reason: `an open exemption already exists for this candidate/consumer/environment/direction: ${(err as Error).message}` };
+    }
+
+    const exemption = this.getExemption(id)!;
+    this.recordEvent('exemption_requested', {
+      exemptionId: id,
+      candidateHash: req.candidateHash,
+      consumerId: req.consumerId,
+      environment: req.environment,
+      direction: req.direction,
+      requesterId: req.requesterId,
+      validFrom: req.validFrom,
+      validUntil: req.validUntil,
+      reason: req.reason,
+    });
+    return { ok: true, exemption };
+  }
+
+  confirmExemption(
+    id: string,
+    confirmerId: string,
+  ): { ok: true; exemption: Exemption } | { ok: false; reason: string } {
+    const txn = this.db.transaction(() => {
+      const ex = this.getExemption(id);
+      if (!ex) return { ok: false as const, reason: 'unknown exemption' };
+      const validation = validateExemptionConfirmation(ex, confirmerId);
+      if (!validation.ok) return { ok: false as const, reason: validation.reason! };
+
+      const confirmedAt = this.clock.now();
+      this.db
+        .prepare("UPDATE exemptions SET status = 'active', confirmer_id = ?, confirmed_at = ? WHERE id = ?")
+        .run(confirmerId, confirmedAt, id);
+      const updated = this.getExemption(id)!;
+      this.recordEvent('exemption_confirmed', {
+        exemptionId: id,
+        candidateHash: ex.candidateHash,
+        consumerId: ex.consumerId,
+        environment: ex.environment,
+        direction: ex.direction,
+        requesterId: ex.requesterId,
+        confirmerId,
+        confirmedAt,
+        validUntil: ex.validUntil,
+      });
+      return { ok: true as const, exemption: updated };
+    });
+    return this.transactional(() => txn());
+  }
+
+  closeExemption(
+    id: string,
+    reviewerId: string,
+    action: 'reject' | 'revoke',
+    note: string,
+  ): { ok: true; exemption: Exemption } | { ok: false; reason: string } {
+    const txn = this.db.transaction(() => {
+      const ex = this.getExemption(id);
+      if (!ex) return { ok: false as const, reason: 'unknown exemption' };
+      const validation = validateExemptionClosure(ex, reviewerId, action);
+      if (!validation.ok) return { ok: false as const, reason: validation.reason! };
+
+      const closedAt = this.clock.now();
+      const status = action === 'reject' ? 'rejected' : 'revoked';
+      this.db
+        .prepare(
+          `UPDATE exemptions SET status = ?, closed_at = ?, closed_by = ?, close_note = ? WHERE id = ?`,
+        )
+        .run(status, closedAt, reviewerId, note, id);
+      const updated = this.getExemption(id)!;
+      this.recordEvent(action === 'reject' ? 'exemption_rejected' : 'exemption_revoked', {
+        exemptionId: id,
+        candidateHash: ex.candidateHash,
+        consumerId: ex.consumerId,
+        environment: ex.environment,
+        direction: ex.direction,
+        reviewerId,
+        note,
+        closedAt,
+      });
+      return { ok: true as const, exemption: updated };
+    });
+    return this.transactional(() => txn());
+  }
+
+  private freezeExemption(ex: Exemption): FrozenExemption {
+    return {
+      id: ex.id,
+      candidateHash: ex.candidateHash,
+      consumerId: ex.consumerId,
+      environment: ex.environment,
+      direction: ex.direction,
+      reason: ex.reason,
+      requesterId: ex.requesterId,
+      confirmerId: ex.confirmerId!,
+      validFrom: ex.validFrom,
+      validUntil: ex.validUntil,
+      confirmedAt: ex.confirmedAt!,
+    };
+  }
+
+  private buildSnapshot(proposal: Proposal, now: number): DecisionSnapshot {
     const evidence = this.listEvidence(proposal.id);
     const requiredConsumerIds = this.listConsumers().map((c) => c.id).sort();
-    const evaluation = evaluateGate(proposal, evidence, requiredConsumerIds);
+    const exemptions = this.listExemptions(proposal.candidateHash);
+    const evaluation = evaluateGate(proposal, evidence, requiredConsumerIds, exemptions, now);
     return {
       proposal,
       evidence,
       requiredConsumerIds,
       missingConsumerIds: evaluation.missingConsumerIds,
+      exemptedConsumerIds: evaluation.exemptedConsumerIds,
+      appliedExemptions: evaluation.appliedExemptions.map((e) => this.freezeExemption(e)),
       gateReady: evaluation.gateReady,
       blockingReasons: evaluation.blockingReasons,
       systemCompatibility: proposal.systemCompatibility,
@@ -342,17 +558,25 @@ export class Repository {
   }
 
   getProposalDetail(id: string): ProposalDetail | null {
+    this.sweepExpiredExemptions();
+    const now = this.clock.now();
     const proposal = this.getProposal(id);
     if (!proposal) return null;
     const evidence = this.listEvidence(id);
     const requiredConsumerIds = this.listConsumers().map((c) => c.id).sort();
-    const evaluation = evaluateGate(proposal, evidence, requiredConsumerIds);
+    const exemptions = this.listExemptions(proposal.candidateHash);
+    const evaluation = evaluateGate(proposal, evidence, requiredConsumerIds, exemptions, now);
     const decision = this.getDecision(id);
     return {
       proposal,
       evidence,
+      exemptions,
       requiredConsumerIds,
       missingConsumerIds: evaluation.missingConsumerIds,
+      exemptedConsumerIds: evaluation.exemptedConsumerIds,
+      compatibleConsumerIds: evaluation.compatibleConsumers,
+      incompatibleConsumerIds: evaluation.incompatibleConsumers,
+      appliedExemptions: evaluation.appliedExemptions,
       gateReady: evaluation.gateReady,
       blockingReasons: evaluation.blockingReasons,
       decision,
@@ -365,17 +589,19 @@ export class Repository {
     reason: string,
   ): { ok: true; decision: Decision } | { ok: false; reason: string } {
     const txn = this.db.transaction<() => { ok: true; decision: Decision } | { ok: false; reason: string }>(() => {
+      this.sweepExpiredExemptions();
+      const now = this.clock.now();
       const proposal = this.getProposal(proposalId);
       if (!proposal) return { ok: false, reason: 'unknown proposal' };
       if (proposal.status !== 'pending') {
         return { ok: false, reason: `proposal already ${proposal.status}; decisions are immutable` };
       }
-      const snapshot = this.buildSnapshot(proposal);
+      const snapshot = this.buildSnapshot(proposal, now);
       if (action === 'approve' && !snapshot.gateReady) {
         return { ok: false, reason: `cannot approve: ${snapshot.blockingReasons.join('; ')}` };
       }
       const newStatus = action === 'approve' ? 'approved' : 'rejected';
-      const decidedAt = this.clock.now();
+      const decidedAt = now;
       const decisionId = randomUUID();
 
       const updateResult = this.db
@@ -410,6 +636,8 @@ export class Repository {
         reason,
         gateReady: snapshot.gateReady,
         missingConsumerIds: snapshot.missingConsumerIds,
+        exemptedConsumerIds: snapshot.exemptedConsumerIds,
+        appliedExemptionIds: snapshot.appliedExemptions.map((e) => e.id),
         evidenceCount: snapshot.evidence.length,
       });
 
@@ -447,10 +675,17 @@ export class Repository {
     }));
   }
 
-  recover(): { proposals: Proposal[]; consumers: Consumer[]; events: CausalEvent[]; lamport: number } {
+  recover(): {
+    proposals: Proposal[];
+    consumers: Consumer[];
+    exemptions: Exemption[];
+    events: CausalEvent[];
+    lamport: number;
+  } {
     return {
       proposals: this.listProposals(),
       consumers: this.listConsumers(),
+      exemptions: this.listExemptions(),
       events: this.listEvents(),
       lamport: this.lamport,
     };
@@ -472,6 +707,7 @@ function rowToProposal(row: ProposalRow): Proposal {
       issues: JSON.parse(row.system_issues) as CompatibilityIssueShape[],
     },
     status: row.status,
+    environment: row.environment ?? 'production',
     createdAt: row.created_at,
   };
 }
@@ -486,6 +722,27 @@ function rowToEvidence(row: EvidenceRow): EvidenceRecord {
     details: row.details,
     idempotencyKey: row.idempotency_key,
     recordedAt: row.recorded_at,
+  };
+}
+
+function rowToExemption(row: ExemptionRow): Exemption {
+  return {
+    id: row.id,
+    candidateHash: row.candidate_hash,
+    consumerId: row.consumer_id,
+    environment: row.environment,
+    direction: row.direction,
+    reason: row.reason,
+    requesterId: row.requester_id,
+    confirmerId: row.confirmer_id,
+    status: row.status,
+    validFrom: row.valid_from,
+    validUntil: row.valid_until,
+    createdAt: row.created_at,
+    confirmedAt: row.confirmed_at,
+    closedAt: row.closed_at,
+    closedBy: row.closed_by,
+    closeNote: row.close_note,
   };
 }
 

@@ -118,6 +118,10 @@ body {
 .badge.missing { background: #2a2a2a; color: var(--muted); }
 .badge.ready { background: #0f3320; color: var(--green); }
 .badge.blocked { background: #3d2e00; color: var(--yellow); }
+.badge.exempt { background: #2a2150; color: var(--purple); }
+.badge.pending_exemption { background: #2a2150; color: var(--purple); }
+.badge.revoked, .badge.rejected, .badge.expired { background: #2a2a2a; color: var(--muted); }
+.badge.active { background: #0f3320; color: var(--green); }
 
 .card {
   background: var(--panel);

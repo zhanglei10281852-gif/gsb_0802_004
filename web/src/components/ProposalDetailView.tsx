@@ -1,20 +1,33 @@
 import { useState } from 'react';
 import { shortHash, timeAgo, type Consumer, type ProposalDetail } from '../api';
+import { ExemptionsPanel } from './ExemptionsPanel';
 
 interface Props {
   detail: ProposalDetail;
   consumers: Consumer[];
   now: number;
   onDecide: (action: 'approve' | 'reject', reason: string) => void;
+  onExemptionChange: () => void;
 }
 
-export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) {
-  const { proposal, evidence, requiredConsumerIds, missingConsumerIds, blockingReasons, gateReady, decision } = detail;
+export function ProposalDetailView({ detail, consumers, now, onDecide, onExemptionChange }: Props) {
+  const {
+    proposal,
+    evidence,
+    exemptions,
+    requiredConsumerIds,
+    missingConsumerIds,
+    exemptedConsumerIds,
+    blockingReasons,
+    gateReady,
+    decision,
+  } = detail;
   const [reason, setReason] = useState('');
   const [tab, setTab] = useState<'candidate' | 'baseline'>('candidate');
 
   const evidenceByConsumer = new Map(evidence.map((e) => [e.consumerId, e]));
   const consumerName = (id: string) => consumers.find((c) => c.id === id)?.name ?? id;
+  const consumerNames = new Map(consumers.map((c) => [c.id, c.name]));
 
   return (
     <div>
@@ -23,7 +36,9 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
           <div>
             <h2 style={{ marginBottom: 4 }}>Proposal {shortHash(proposal.candidateHash)}</h2>
             <div className="hash-full">{proposal.candidateHash}</div>
-            <div className="muted mt8">created {timeAgo(proposal.createdAt, now)}</div>
+            <div className="muted mt8">
+              created {timeAgo(proposal.createdAt, now)} · environment: <strong>{proposal.environment}</strong>
+            </div>
           </div>
           <div className="flex-row">
             <span className={`badge ${proposal.status}`}>{proposal.status}</span>
@@ -48,16 +63,26 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
             ))}
           </ul>
         )}
+        <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          The system compatibility check is never waived by an exemption; it is recomputed from the immutable
+          candidate summary.
+        </div>
       </div>
 
       <div className="card">
         <h2>
           Consumer Evidence ({evidence.length}/{requiredConsumerIds.length})
+          {exemptedConsumerIds.length > 0 && (
+            <span className="badge exempt" style={{ marginLeft: 8 }}>
+              {exemptedConsumerIds.length} exempted
+            </span>
+          )}
         </h2>
         <div className="consumer-grid">
           {requiredConsumerIds.map((cid) => {
             const e = evidenceByConsumer.get(cid);
             const isMissing = missingConsumerIds.includes(cid);
+            const isExempted = exemptedConsumerIds.includes(cid);
             return (
               <div key={cid} className="consumer-row">
                 <div>
@@ -67,6 +92,8 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
                 <div>
                   {e ? (
                     <span className={`badge ${e.verdict}`}>{e.verdict}</span>
+                  ) : isExempted ? (
+                    <span className="badge exempt">exempted</span>
                   ) : (
                     <span className="badge missing">awaiting</span>
                   )}
@@ -80,6 +107,7 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
                       {e.details && <div className="cid">{e.details}</div>}
                     </>
                   )}
+                  {isExempted && <div className="fresh">offline; waived by active exemption</div>}
                   {isMissing && <div className="fresh">no evidence</div>}
                 </div>
               </div>
@@ -88,11 +116,21 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
         </div>
       </div>
 
+      <ExemptionsPanel
+        proposal={proposal}
+        exemptions={exemptions}
+        consumerNames={consumerNames}
+        onChange={onExemptionChange}
+      />
+
       <div className="card">
         <h2>Gate Evaluation</h2>
         {blockingReasons.length === 0 ? (
           <ul className="blocking-list">
-            <li className="ok">All evidence collected and compatible; proposal is eligible for approval.</li>
+            <li className="ok">
+              All evidence collected and compatible (or covered by active exemptions); proposal is eligible for
+              approval.
+            </li>
           </ul>
         ) : (
           <ul className="blocking-list">
@@ -105,7 +143,7 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
         {proposal.status === 'pending' && (
           <div className="actions">
             <input
-              placeholder="Decision reason (optional)…"
+              placeholder="Decision reason (optional)..."
               value={reason}
               onChange={(e) => setReason(e.target.value)}
               style={{ flex: 1 }}
@@ -127,7 +165,8 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
               <span className={decision.snapshot.gateReady ? '' : 'muted'}>
                 {decision.snapshot.gateReady ? 'ready' : 'not ready'}
               </span>{' '}
-              · {decision.snapshot.evidence.length} evidence frozen
+              · {decision.snapshot.evidence.length} evidence frozen ·{' '}
+              {decision.snapshot.appliedExemptions.length} exemption(s) frozen
             </div>
             <div className="schema-box">
               {JSON.stringify(
@@ -142,6 +181,16 @@ export function ProposalDetailView({ detail, consumers, now, onDecide }: Props) 
                     verdict: e.verdict,
                     hash: e.candidateHash,
                     recordedAt: e.recordedAt,
+                  })),
+                  appliedExemptions: decision.snapshot.appliedExemptions.map((ex) => ({
+                    consumer: ex.consumerId,
+                    environment: ex.environment,
+                    direction: ex.direction,
+                    requester: ex.requesterId,
+                    confirmer: ex.confirmerId,
+                    validFrom: ex.validFrom,
+                    validUntil: ex.validUntil,
+                    reason: ex.reason,
                   })),
                 },
                 null,

@@ -171,6 +171,10 @@ export function App() {
             consumers={consumers}
             now={now}
             onDecide={handleDecision}
+            onExemptionChange={() => {
+              void refreshSnapshot();
+              void refreshEvents();
+            }}
           />
         ) : (
           <div className="empty">Select a proposal to inspect evidence and make a decision</div>

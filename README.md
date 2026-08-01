@@ -78,6 +78,23 @@ Every mutation appends a row to `causal_events` with an auto-increment id, a mon
 
 The web workbench connects to `/api/stream` (SSE). On every (re)connection the server sends a fresh full snapshot from SQLite. Incremental events only nudge the client to refresh; reconnecting after a network blip or server restart always reconciles to the persisted state rather than relying on events that happened while the socket was down.
 
+### Time-limited, dual-reviewed exemptions
+
+A consumer that is temporarily offline during a release window can be waived, but the waiver is deliberately narrow:
+
+- **Scoped** — an exemption binds exactly one `(candidateHash, consumerId, environment, direction)`. It cannot cover a different candidate, a different environment, or a different compatibility direction.
+- **Two reviewers** — a reviewer (the requester) files the exemption; a *different* reviewer must confirm it before it becomes `active`. Self-confirmation is rejected with HTTP 409. Pending exemptions do not affect the gate.
+- **Time-limited** — each exemption has `validFrom`/`validUntil`. Once `validUntil` passes it is swept to `expired` (on the next read/decision/clock advance) and stops participating in new decisions. It can also be `revoked` at any time. Expiry and revocation are recorded as causal events.
+- **Does not dilute the candidate summary** — an exemption never changes the candidate hash or the system compatibility result. A breaking schema is still blocked by the system check even if every consumer is exempted.
+- **Does not override real evidence** — if a consumer actually reports `incompatible`, that verdict blocks the gate regardless of any exemption.
+- **Frozen in the decision snapshot** — when a decision is made, every applied exemption is copied into the immutable `DecisionSnapshot` (requester, confirmer, window, reason). Later expiry or revocation changes the exemption row for *future* decisions but never mutates the historical snapshot. A new proposal after an exemption expired sees the gate blocked again.
+
+Exemption lifecycle events (`exemption_requested`, `exemption_confirmed`, `exemption_rejected`, `exemption_revoked`, `exemption_expired`) are appended to the same causal audit chain as proposals, evidence, and decisions.
+
+### Deterministic timing tests (virtual clock)
+
+The e2e suite also starts a second server with `CCC_CLOCK=virtual`, which replaces the wall clock with a `VirtualClock`. A test-only endpoint `POST /api/test/clock/advance {ms}` advances the clock and immediately sweeps expired exemptions, so expiry can be asserted deterministically without sleeping real time. This endpoint is only registered when the virtual clock is enabled and is never present in normal operation.
+
 ## Architecture
 
 The contract/gate core is deliberately decoupled from adapters:
@@ -103,13 +120,18 @@ test/              Vitest unit tests
 | --- | --- | --- |
 | GET | `/api/health` | Liveness |
 | GET/POST | `/api/consumers` | List / register consumers |
-| GET/POST | `/api/proposals` | List / submit `{candidateSchema, baselineSchema}` |
-| GET | `/api/proposals/:id` | Detail with evidence, gate state, blocking reasons, decision |
+| GET/POST | `/api/proposals` | List / submit `{candidateSchema, baselineSchema, environment?}` |
+| GET | `/api/proposals/:id` | Detail with evidence, exemptions, gate state, blocking reasons, decision |
 | POST | `/api/proposals/:id/evidence` | Agent report `{consumerId, candidateHash, verdict, details, idempotencyKey}` |
 | POST | `/api/proposals/:id/decision` | `{action: "approve"|"reject", reason}` |
-| GET | `/api/snapshot` | Full state snapshot (consumers + proposal details + events) |
+| GET/POST | `/api/exemptions?candidateHash=` | List / request a dual-reviewed, time-limited exemption |
+| POST | `/api/exemptions/:id/confirm` | Second reviewer confirms (`{confirmerId}`, must differ from requester) |
+| POST | `/api/exemptions/:id/reject` | Reject a pending exemption (`{reviewerId, note}`) |
+| POST | `/api/exemptions/:id/revoke` | Revoke an active exemption (`{reviewerId, note}`) |
+| GET | `/api/snapshot` | Full state snapshot (consumers + exemptions + proposal details + events) |
 | GET | `/api/causal-events` | Append-only causal log |
 | GET | `/api/stream` | Server-Sent Events: snapshot on connect, then causal events |
+| POST | `/api/test/clock/advance` | Test-only: advance virtual clock (`{ms}`); only when `CCC_CLOCK=virtual` |
 
 ## Fault recovery boundaries
 
@@ -118,6 +140,7 @@ test/              Vitest unit tests
 - **Concurrent decisions:** SQLite transaction + unique constraint guarantee one effective decision.
 - **Process restart:** all durable state is in SQLite; the Lamport clock and causal log are reconstructed on boot.
 - **New evidence after a decision:** rejected; the stored snapshot is immutable.
+- **Exemption expiry/revocation after a decision:** the exemption row changes status for future decisions, but the `appliedExemptions` already frozen inside the decision snapshot are never altered.
 - **Web disconnect:** SSE auto-reconnects and receives a fresh full snapshot; missed events are not required for correctness.
 
 ## End-to-end scenarios
@@ -133,6 +156,7 @@ test/              Vitest unit tests
 7. SSE snapshot on connect.
 8. Killing and restarting the server process on the same SQLite file (asserted status, evidence, snapshot, and causal log all survive with identical clocks/order).
 9. A breaking candidate that all consumers claim is fine (asserted system gate still blocks approval; rejection allowed).
+10. On a separate **virtual-clock** server: dual-reviewer exemption request (self-confirm rejected, different reviewer accepted), approval through the exemption, frozen snapshot containing the exemption, then a second proposal whose exemption expires deterministically after advancing the virtual clock (asserted gate re-blocks, `exemption_expired` audited, and the earlier frozen snapshot is unchanged).
 
 ## Local development workflow
 
