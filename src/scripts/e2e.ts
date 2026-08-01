@@ -272,6 +272,93 @@ async function main(): Promise<void> {
     const p2Final = (await req('GET', `${BASE}/api/proposals/${p2.id}`)).body;
     const snapshotP2 = JSON.stringify(p2Final.decision.snapshot);
 
+    // ---- 阶段 E：限时豁免（双审确认 / 撤销 / 到期 / 历史快照不变） ----
+    console.log('[e2e] 阶段 E：限时豁免全生命周期');
+    const created3 = await req('POST', `${BASE}/api/proposals`, {
+      title: 'order-events v4（消费方离线）',
+      baseline: BASELINE,
+      candidate: COMPATIBLE_CANDIDATE,
+      consumers: ['billing', 'search', 'offline-svc'],
+      evidenceTtlMs: TTL_MS,
+      environment: 'prod',
+    });
+    const p3 = created3.body;
+    for (const c of ['billing', 'search']) {
+      await req('POST', `${BASE}/api/proposals/${p3.id}/evidence`, {
+        consumerId: c, candidateDigest: p3.candidateDigest, verdict: 'pass', runId: `run-${c}-p3`, idempotencyKey: `k3-${c}`,
+      });
+    }
+    const p3Blocked = (await req('GET', `${BASE}/api/proposals/${p3.id}`)).body;
+    check(p3Blocked.gate.blockers.some((b: any) => b.code === 'missing_evidence' && b.consumer === 'offline-svc'), 'P3 因 offline-svc 离线被阻塞');
+    const exmReq = await req('POST', `${BASE}/api/proposals/${p3.id}/exemptions`, {
+      consumerId: 'offline-svc', direction: 'backward', reason: '发布窗口内暂时离线', requestedBy: 'release-mgr', ttlMs: 60000,
+    });
+    check(exmReq.status === 201 && exmReq.body.status === 'pending', '豁免申请已创建（待复核）');
+    const exmId = exmReq.body.id;
+    const selfConfirm = await req('POST', `${BASE}/api/exemptions/${exmId}/confirm`, { by: 'release-mgr' });
+    check(selfConfirm.status === 422, '申请人不能复核自己的豁免', selfConfirm.status);
+    const c1 = await req('POST', `${BASE}/api/exemptions/${exmId}/confirm`, { by: 'reviewer-a' });
+    check(c1.status === 200 && c1.body.status === 'pending', '第一名审核人确认后仍待复核');
+    const cDup = await req('POST', `${BASE}/api/exemptions/${exmId}/confirm`, { by: 'reviewer-a' });
+    check(cDup.status === 409, '同一审核人不能重复确认', cDup.status);
+    const c2 = await req('POST', `${BASE}/api/exemptions/${exmId}/confirm`, { by: 'reviewer-b' });
+    check(c2.status === 200 && c2.body.status === 'active', '第二名审核人确认后豁免生效');
+    const p3Ready = (await req('GET', `${BASE}/api/proposals/${p3.id}`)).body;
+    check(p3Ready.gate.status === 'ready' && p3Ready.gate.waived.length === 1, '生效豁免抵消缺失证据，门禁就绪', p3Ready.gate);
+    const dec3 = await req('POST', `${BASE}/api/proposals/${p3.id}/decisions`, {
+      action: 'approve', decidedBy: 'lead-a', expectedVersion: p3Ready.version, rationale: '豁免覆盖离线消费方',
+    });
+    check(dec3.status === 201 && dec3.body.decision.snapshot.exemptionsUsed.length === 1, '决策快照逐条拷贝生效豁免');
+    const snapshotP3 = JSON.stringify(dec3.body.decision.snapshot);
+    const revoke = await req('POST', `${BASE}/api/exemptions/${exmId}/revoke`, { by: 'ops', reason: '离线窗口提前结束' });
+    check(revoke.status === 200 && revoke.body.effectiveStatus === 'revoked', '豁免已撤销');
+    const p3After = (await req('GET', `${BASE}/api/proposals/${p3.id}`)).body;
+    check(JSON.stringify(p3After.decision.snapshot) === snapshotP3, '撤销豁免后历史决策快照保持原样');
+    check(p3After.status === 'approved', '撤销豁免不改变既有批准结论');
+
+    // 到期路径：豁免到期后退出新决策，到期原因进入审计链
+    const created4 = await req('POST', `${BASE}/api/proposals`, {
+      title: 'order-events v5（豁免到期）',
+      baseline: BASELINE,
+      candidate: COMPATIBLE_CANDIDATE,
+      consumers: ['billing', 'offline-2'],
+      evidenceTtlMs: TTL_MS,
+    });
+    const p4 = created4.body;
+    await req('POST', `${BASE}/api/proposals/${p4.id}/evidence`, {
+      consumerId: 'billing', candidateDigest: p4.candidateDigest, verdict: 'pass', runId: 'run-b-p4', idempotencyKey: 'k4-billing',
+    });
+    const exmReject = await req('POST', `${BASE}/api/proposals/${p4.id}/exemptions`, {
+      consumerId: 'offline-2', direction: 'backward', reason: '窗口外申请', requestedBy: 'release-mgr', ttlMs: 60000,
+    });
+    const rejected = await req('POST', `${BASE}/api/exemptions/${exmReject.body.id}/reject`, { by: 'reviewer-c', reason: '不符合豁免政策' });
+    check(rejected.status === 200 && rejected.body.effectiveStatus === 'rejected' && rejected.body.rejectReason === '不符合豁免政策', '豁免可被拒绝并注明原因');
+    const exmShort = await req('POST', `${BASE}/api/proposals/${p4.id}/exemptions`, {
+      consumerId: 'offline-2', direction: 'backward', reason: '短时离线', requestedBy: 'release-mgr', ttlMs: 500,
+    });
+    await req('POST', `${BASE}/api/exemptions/${exmShort.body.id}/confirm`, { by: 'reviewer-a' });
+    await req('POST', `${BASE}/api/exemptions/${exmShort.body.id}/confirm`, { by: 'reviewer-b' });
+    const p4Waived = (await req('GET', `${BASE}/api/proposals/${p4.id}`)).body;
+    check(p4Waived.gate.status === 'ready' && p4Waived.gate.waived.length === 1, 'P4 短时豁免生效，门禁就绪');
+    await req('POST', `${BASE}/api/clock/advance`, { ms: 600 });
+    const p4Expired = (await req('GET', `${BASE}/api/proposals/${p4.id}`)).body;
+    const exmExpiredView = p4Expired.exemptions.find((x: any) => x.id === exmShort.body.id);
+    check(exmExpiredView?.effectiveStatus === 'expired', '时钟推进后豁免到期');
+    check(p4Expired.gate.blockers.some((b: any) => b.code === 'missing_evidence' && b.consumer === 'offline-2'), '到期豁免不再参与新决策');
+    check(p4Expired.events.some((e: any) => e.type === 'EXEMPTION_EXPIRED' && String(e.payload.reason).includes('到期')), '到期原因已进入审计链');
+    const approveExpired = await req('POST', `${BASE}/api/proposals/${p4.id}/decisions`, {
+      action: 'approve', decidedBy: 'lead-a', expectedVersion: p4Expired.version,
+    });
+    check(approveExpired.status === 422, '到期豁免下批准被门禁拦截');
+    await req('POST', `${BASE}/api/proposals/${p4.id}/evidence`, {
+      consumerId: 'offline-2', candidateDigest: p4.candidateDigest, verdict: 'pass', runId: 'run-o2-late', idempotencyKey: 'k4-offline2',
+    });
+    const p4Final = (await req('GET', `${BASE}/api/proposals/${p4.id}`)).body;
+    const dec4 = await req('POST', `${BASE}/api/proposals/${p4.id}/decisions`, {
+      action: 'approve', decidedBy: 'lead-a', expectedVersion: p4Final.version,
+    });
+    check(dec4.status === 201, '离线消费方恢复报送后正常批准');
+
     // ---- 阶段 D：重启恢复与 SSE 重放 ----
     console.log('[e2e] 阶段 D：重启恢复');
     const before = (await req('GET', `${BASE}/api/snapshot`)).body;
@@ -280,11 +367,17 @@ async function main(): Promise<void> {
     server = startServer(dbPath);
     await waitHealthy();
     const after = (await req('GET', `${BASE}/api/snapshot`)).body;
-    check(after.proposals.length === 2, '重启后提案数量完整');
+    check(after.proposals.length === 4, '重启后提案数量完整');
     const p1r = after.proposals.find((p: any) => p.id === p1.id);
     const p2r = after.proposals.find((p: any) => p.id === p2.id);
+    const p3r = after.proposals.find((p: any) => p.id === p3.id);
+    const p4r = after.proposals.find((p: any) => p.id === p4.id);
     check(p1r?.status === 'approved' && JSON.stringify(p1r.decision.snapshot) === snapshotP1, 'P1 决策快照在重启后一致');
     check(p2r?.status === 'approved' && JSON.stringify(p2r.decision.snapshot) === snapshotP2, 'P2 决策快照在重启后一致');
+    check(p3r?.status === 'approved' && JSON.stringify(p3r.decision.snapshot) === snapshotP3, 'P3（含豁免）决策快照在重启后一致');
+    check(p3r?.exemptions[0]?.effectiveStatus === 'revoked', 'P3 豁免撤销状态在重启后保留');
+    check(p4r?.status === 'approved', 'P4 在重启后保持已批准');
+    check(p4r?.exemptions.some((x: any) => x.effectiveStatus === 'expired') && p4r?.exemptions.some((x: any) => x.effectiveStatus === 'rejected'), 'P4 豁免到期/拒绝状态在重启后保留');
     check(after.eventCursor >= before.eventCursor, '事件游标连续（重启不丢事件）', { before: before.eventCursor, after: after.eventCursor });
     check(p1r.events.length === p1.events.length + 1, '因果事件记录完整（含迟到证据事件）');
 

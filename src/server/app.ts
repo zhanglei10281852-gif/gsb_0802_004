@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import Ajv2020Class from 'ajv/dist/2020.js';
 import type { Clock } from '../core/clock.js';
@@ -65,6 +65,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       candidate: body.candidate,
       consumers: Array.isArray(body.consumers) ? body.consumers.map(String) : [],
       evidenceTtlMs: typeof body.evidenceTtlMs === 'number' ? body.evidenceTtlMs : undefined,
+      environment: typeof body.environment === 'string' ? body.environment : undefined,
     });
     return reply.status(201).send(detail);
   });
@@ -128,6 +129,41 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     });
     return reply.status(201).send({ decision });
   });
+
+  /** 申请限时豁免：仅覆盖当前候选摘要 + 指定消费方/环境/兼容方向。 */
+  app.post('/api/proposals/:id/exemptions', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body)) throw new StoreError('BAD_REQUEST', 400, '请求体必须是 JSON 对象');
+    if (typeof body.consumerId !== 'string' || !body.consumerId) {
+      throw new StoreError('BAD_REQUEST', 400, 'consumerId 必须是非空字符串');
+    }
+    if (typeof body.ttlMs !== 'number') {
+      throw new StoreError('BAD_REQUEST', 400, 'ttlMs 必须是数字（豁免必须限时）');
+    }
+    const view = store.requestExemption(id, {
+      consumerId: body.consumerId,
+      direction: body.direction as 'backward' | 'forward',
+      reason: String(body.reason ?? ''),
+      requestedBy: String(body.requestedBy ?? ''),
+      ttlMs: body.ttlMs,
+      environment: typeof body.environment === 'string' ? body.environment : undefined,
+    });
+    return reply.status(201).send(view);
+  });
+
+  const exemptionAction = (
+    handler: (id: string, by: string, reason?: string) => unknown,
+  ) => async (req: FastifyRequest) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body)) throw new StoreError('BAD_REQUEST', 400, '请求体必须是 JSON 对象');
+    return handler(id, String(body.by ?? ''), typeof body.reason === 'string' ? body.reason : undefined);
+  };
+
+  app.post('/api/exemptions/:id/confirm', exemptionAction((id, by) => store.confirmExemption(id, by)));
+  app.post('/api/exemptions/:id/reject', exemptionAction((id, by, reason) => store.rejectExemption(id, by, reason)));
+  app.post('/api/exemptions/:id/revoke', exemptionAction((id, by, reason) => store.revokeExemption(id, by, reason)));
 
   /** 一致快照：网页重连后以此为准，而不是依赖进程内事件。 */
   app.get('/api/snapshot', async () => store.snapshot());

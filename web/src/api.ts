@@ -31,9 +31,47 @@ export interface Blocker {
   message: string;
 }
 
+export interface WaivedBlocker extends Blocker {
+  exemptionId: string;
+  confirmedBy: string[];
+}
+
 export interface GateResult {
   status: 'ready' | 'blocked';
   blockers: Blocker[];
+  waived: WaivedBlocker[];
+}
+
+export type ExemptionDirection = 'backward' | 'forward';
+export type ExemptionStoredStatus = 'pending' | 'active' | 'rejected' | 'revoked';
+export type ExemptionStatus = ExemptionStoredStatus | 'expired';
+
+export interface ExemptionConfirmation {
+  by: string;
+  at: number;
+}
+
+export interface ExemptionView {
+  id: string;
+  proposalId: string;
+  candidateDigest: string;
+  consumerId: string;
+  environment: string;
+  direction: ExemptionDirection;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  ttlMs: number;
+  expiresAt: number;
+  status: ExemptionStoredStatus;
+  effectiveStatus: ExemptionStatus;
+  confirmations: ExemptionConfirmation[];
+  rejectedBy: string | null;
+  rejectedAt: number | null;
+  rejectReason: string | null;
+  revokedBy: string | null;
+  revokedAt: number | null;
+  revokeReason: string | null;
 }
 
 export interface Decision {
@@ -66,10 +104,12 @@ export interface ProposalDetail {
   compat: CompatResult;
   consumers: string[];
   evidenceTtlMs: number;
+  environment: string;
   createdAt: number;
   updatedAt: number;
   evidence: EvidenceRecord[];
   gate: GateResult;
+  exemptions: ExemptionView[];
   decision: Decision | null;
   events: DomainEvent[];
 }
@@ -87,6 +127,30 @@ export interface CreateProposalBody {
   candidate: unknown;
   consumers: string[];
   evidenceTtlMs?: number;
+  environment?: string;
+}
+
+export interface CreateExemptionBody {
+  consumerId: string;
+  direction: ExemptionDirection;
+  reason: string;
+  requestedBy: string;
+  ttlMs: number;
+  environment?: string;
+}
+
+export interface ConfirmExemptionBody {
+  by: string;
+}
+
+export interface RejectExemptionBody {
+  by: string;
+  reason?: string;
+}
+
+export interface RevokeExemptionBody {
+  by: string;
+  reason?: string;
 }
 
 export interface SubmitRevisionBody {
@@ -175,6 +239,34 @@ export function submitRevision(id: string, body: SubmitRevisionBody): Promise<Pr
 
 export function submitDecision(id: string, body: SubmitDecisionBody): Promise<{ decision: Decision }> {
   return request<{ decision: Decision }>(`/api/proposals/${encodeURIComponent(id)}/decisions`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function createExemption(proposalId: string, body: CreateExemptionBody): Promise<ExemptionView> {
+  return request<ExemptionView>(`/api/proposals/${encodeURIComponent(proposalId)}/exemptions`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function confirmExemption(id: string, body: ConfirmExemptionBody): Promise<ExemptionView> {
+  return request<ExemptionView>(`/api/exemptions/${encodeURIComponent(id)}/confirm`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function rejectExemption(id: string, body: RejectExemptionBody): Promise<ExemptionView> {
+  return request<ExemptionView>(`/api/exemptions/${encodeURIComponent(id)}/reject`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function revokeExemption(id: string, body: RevokeExemptionBody): Promise<ExemptionView> {
+  return request<ExemptionView>(`/api/exemptions/${encodeURIComponent(id)}/revoke`, {
     method: 'POST',
     body: JSON.stringify(body),
   });

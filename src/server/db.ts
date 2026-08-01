@@ -50,6 +50,28 @@ CREATE TABLE IF NOT EXISTS decisions (
   decided_at    INTEGER NOT NULL,
   snapshot_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS exemptions (
+  id               TEXT PRIMARY KEY,
+  proposal_id      TEXT NOT NULL REFERENCES proposals(id),
+  candidate_digest TEXT NOT NULL,
+  consumer_id      TEXT NOT NULL,
+  environment      TEXT NOT NULL,
+  direction        TEXT NOT NULL CHECK (direction IN ('backward','forward')),
+  reason           TEXT NOT NULL,
+  requested_by     TEXT NOT NULL,
+  requested_at     INTEGER NOT NULL,
+  ttl_ms           INTEGER NOT NULL,
+  expires_at       INTEGER NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('pending','active','rejected','revoked','expired')),
+  confirmations_json TEXT NOT NULL,
+  rejected_by      TEXT,
+  rejected_at      INTEGER,
+  reject_reason    TEXT,
+  revoked_by       TEXT,
+  revoked_at       INTEGER,
+  revoke_reason    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_exemptions_proposal ON exemptions(proposal_id);
 CREATE TABLE IF NOT EXISTS events (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           INTEGER NOT NULL,
@@ -59,5 +81,11 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_proposal ON events(proposal_id);
 `);
+
+  // 轻量迁移：为既有库补充 proposals.environment 列。
+  const cols = db.prepare(`PRAGMA table_info(proposals)`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === 'environment')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN environment TEXT NOT NULL DEFAULT 'prod'`);
+  }
   return db;
 }

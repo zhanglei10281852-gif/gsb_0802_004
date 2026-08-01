@@ -1,15 +1,17 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { ApiError, submitDecision, submitRevision } from '../api';
-import type { Blocker, EvidenceRecord, ProposalDetail } from '../api';
+import type { Blocker, EvidenceRecord, ProposalDetail, WaivedBlocker } from '../api';
 import {
   BLOCKER_CODE_LABEL,
   COMPAT_STATUS_LABEL,
   DECISION_ACTION_LABEL,
+  EVENT_TYPE_LABEL,
   PROPOSAL_STATUS_LABEL,
   formatTime,
   shortDigest,
 } from '../format';
+import { ExemptionSection } from './ExemptionSection';
 
 interface ProposalDetailViewProps {
   proposal: ProposalDetail;
@@ -26,6 +28,26 @@ function BlockerList({ blockers }: { blockers: Blocker[] }) {
           <span className="blocker-label">{BLOCKER_CODE_LABEL[b.code]}</span>
           {b.consumer && <span className="blocker-consumer">{b.consumer}</span>}
           <span className="blocker-message">{b.message}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function WaivedList({ waived }: { waived: WaivedBlocker[] }) {
+  return (
+    <ul className="blocker-list">
+      {waived.map((b, i) => (
+        <li key={`${b.exemptionId}-${b.code}-${b.consumer ?? ''}-${i}`} className="blocker-item waived-item">
+          <code className="blocker-code waived-code">{b.code}</code>
+          <span className="blocker-label">{BLOCKER_CODE_LABEL[b.code]}</span>
+          {b.consumer && <span className="blocker-consumer">{b.consumer}</span>}
+          <span className="badge badge-waived">已豁免</span>
+          <span className="blocker-message">{b.message}</span>
+          <span className="waived-cover">
+            由豁免单 <span className="mono" title={b.exemptionId}>{shortDigest(b.exemptionId)}</span> 覆盖，复核人：
+            {b.confirmedBy.join('、')}
+          </span>
         </li>
       ))}
     </ul>
@@ -179,6 +201,10 @@ export function ProposalDetailView({ proposal, serverTime, onRefresh }: Proposal
             </dd>
           </div>
           <div>
+            <dt>环境</dt>
+            <dd>{proposal.environment}</dd>
+          </div>
+          <div>
             <dt>证据 TTL</dt>
             <dd>{proposal.evidenceTtlMs} 毫秒</dd>
           </div>
@@ -308,12 +334,21 @@ export function ProposalDetailView({ proposal, serverTime, onRefresh }: Proposal
         )}
       </section>
 
-      {!gateReady && (
+      {(!gateReady || proposal.gate.waived.length > 0) && (
         <section className="panel">
           <h2 className="panel-title">阻塞原因</h2>
-          <BlockerList blockers={proposal.gate.blockers} />
+          {proposal.gate.blockers.length > 0 && <BlockerList blockers={proposal.gate.blockers} />}
+          {proposal.gate.waived.length > 0 && (
+            <div>
+              <h3 className="panel-subtitle">已豁免</h3>
+              <p className="muted">以下阻塞项被生效中的豁免抵消，不再参与当前门禁判定。</p>
+              <WaivedList waived={proposal.gate.waived} />
+            </div>
+          )}
         </section>
       )}
+
+      <ExemptionSection proposal={proposal} serverTime={serverTime} onRefresh={onRefresh} />
 
       {isOpen && (
         <section className="panel">
@@ -443,7 +478,9 @@ export function ProposalDetailView({ proposal, serverTime, onRefresh }: Proposal
                   <tr key={ev.id}>
                     <td className="mono">{ev.id}</td>
                     <td>{formatTime(ev.ts)}</td>
-                    <td className="mono">{ev.type}</td>
+                    <td className="mono" title={ev.type}>
+                      {EVENT_TYPE_LABEL[ev.type] ?? ev.type}
+                    </td>
                     <td className="mono payload-cell" title={payloadText}>
                       {payloadText.length > 120 ? `${payloadText.slice(0, 120)}…` : payloadText}
                     </td>

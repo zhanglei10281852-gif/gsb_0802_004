@@ -39,6 +39,14 @@ examples/      演示场景
 
 **门禁状态机**（纯函数，`evaluateGate`）：就绪 = 每个声明的消费方都有针对当前候选摘要的、未超过 TTL 的、`pass` 证据，且兼容性非破坏性。阻塞原因可解释：`missing_evidence`（未报送）、`stale_evidence`（过期）、`failed_evidence`（验证失败）、`breaking_compat`（破坏性变更，批准时可由负责人显式 `acknowledgeBreaking` 豁免）。驳回同样需要证据齐备且新鲜——失败与破坏性恰恰是驳回理由。
 
+**限时豁免**（消费方在发布窗口内暂时离线时）：
+
+- **范围**：每张豁免单精确覆盖四元组（候选摘要、消费方、环境、兼容方向 `backward`/`forward`），且只能针对提案的**当前**候选摘要申请——候选修订后旧豁免自然失效，不会稀释候选摘要语义。
+- **四眼原则**：豁免需**两名不同审核人**确认后才生效；申请人不能复核自己的豁免，同一审核人不能重复确认。待复核的豁免可被拒绝（注明原因）。
+- **效力**：生效中的豁免仅抵消该消费方在当前候选下的 `missing_evidence` / `stale_evidence` 阻塞（backward 方向），被豁免的阻塞项移入 `gate.waived` 保留痕迹；`failed_evidence` 与 `breaking_compat` **永远不可豁免**。
+- **限时与退出**：豁免必须携带 `ttlMs`；到期后由过期扫描物化为 `expired` 并把到期原因写入审计链（`EXEMPTION_EXPIRED`），也可随时 `revoke`。过期、被撤销、被拒绝的豁免**不再参与任何新决策**。
+- **快照不可变**：决策快照逐条拷贝决策时实际使用的豁免（`exemptionsUsed`，含复核人），此后豁免被撤销或到期都不改变已形成的历史结论。
+
 **决策**：`POST /api/proposals/:id/decisions` 携带 `expectedVersion` 做乐观并发控制。门禁评估、版本 CAS、快照落库在同一 SQLite 事务内完成；并发审批恰好一个生效，其余收到 409。决策快照逐条拷贝当时采用的证据、兼容性结论与门禁结果，落库后无任何更新路径——提案已关闭后到达的证据标记为 `closed`、旧候选证据标记为 `stale_candidate`，都会被记录审计但永远不参与门禁。
 
 ## 故障恢复边界
@@ -86,10 +94,14 @@ examples/      演示场景
 
 | 方法/路径 | 说明 |
 | --- | --- |
-| `POST /api/proposals` | 创建提案（基线+候选+消费方清单），返回摘要、兼容性与门禁 |
+| `POST /api/proposals` | 创建提案（基线+候选+消费方清单，可选 environment），返回摘要、兼容性与门禁 |
 | `POST /api/proposals/:id/revisions` | 提交新候选修订（`expectedVersion` 乐观锁） |
 | `POST /api/proposals/:id/evidence` | 代理报送证据（幂等键去重；旧候选/已关闭隔离记录） |
 | `POST /api/proposals/:id/decisions` | 门禁通过后决策并保存不可变快照（CAS） |
+| `POST /api/proposals/:id/exemptions` | 申请限时豁免（当前候选+消费方+环境+兼容方向，必须 ttlMs） |
+| `POST /api/exemptions/:id/confirm` | 审核人确认；两名不同审核人确认后生效（申请人除外） |
+| `POST /api/exemptions/:id/reject` | 拒绝待复核豁免（注明原因） |
+| `POST /api/exemptions/:id/revoke` | 撤销生效中豁免（立即退出新决策，历史快照不变） |
 | `GET /api/proposals[/:id]` | 列表 / 详情（含证据、阻塞原因、决策快照、事件） |
 | `GET /api/snapshot` | 一致快照（单事务），供网页重连恢复 |
 | `GET /api/events?since=` | SSE：先重放 SQLite 历史事件再实时推送 |

@@ -10,6 +10,7 @@ interface CreateProposalFormProps {
 export function CreateProposalForm({ onCreated }: CreateProposalFormProps) {
   const [title, setTitle] = useState('');
   const [consumersText, setConsumersText] = useState('');
+  const [environment, setEnvironment] = useState('');
   const [ttlText, setTtlText] = useState('');
   const [baselineText, setBaselineText] = useState('');
   const [candidateText, setCandidateText] = useState('');
@@ -60,9 +61,11 @@ export function CreateProposalForm({ onCreated }: CreateProposalFormProps) {
         candidate,
         consumers,
         evidenceTtlMs,
+        environment: environment.trim() === '' ? undefined : environment.trim(),
       });
       setTitle('');
       setConsumersText('');
+      setEnvironment('');
       setTtlText('');
       setBaselineText('');
       setCandidateText('');
@@ -96,6 +99,15 @@ export function CreateProposalForm({ onCreated }: CreateProposalFormProps) {
           value={consumersText}
           onChange={(e) => setConsumersText(e.target.value)}
           placeholder="例如：order-service, billing-service"
+        />
+      </label>
+      <label className="field">
+        <span className="field-label">环境（可空）</span>
+        <input
+          type="text"
+          value={environment}
+          onChange={(e) => setEnvironment(e.target.value)}
+          placeholder="prod"
         />
       </label>
       <label className="field">
