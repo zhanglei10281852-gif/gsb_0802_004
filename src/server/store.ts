@@ -1,0 +1,491 @@
+import { randomUUID } from 'node:crypto';
+import type { Clock } from '../core/clock.js';
+import { stableDigest } from '../core/canonical.js';
+import { checkCompatibility } from '../core/compat.js';
+import { decisionBlockers, evaluateGate, latestApplicableEvidence } from '../core/gate.js';
+import type {
+  CompatResult,
+  Decision,
+  DecisionAction,
+  DecisionSnapshot,
+  DomainEvent,
+  EvidenceInput,
+  EvidenceRecord,
+  ProposalDetail,
+} from '../core/types.js';
+import { openDatabase, type Db } from './db.js';
+
+export class StoreError extends Error {
+  constructor(
+    public code: string,
+    public httpStatus: number,
+    message: string,
+    public details?: unknown,
+  ) {
+    super(message);
+    this.name = 'StoreError';
+  }
+}
+
+export interface CreateProposalInput {
+  title: string;
+  createdBy?: string;
+  baseline: unknown;
+  candidate: unknown;
+  consumers: string[];
+  evidenceTtlMs?: number;
+}
+
+export interface EvidenceResult {
+  outcome: 'recorded' | 'duplicate' | 'stale_candidate' | 'closed';
+  evidence: EvidenceRecord;
+}
+
+export interface DecideInput {
+  action: DecisionAction;
+  decidedBy: string;
+  expectedVersion: number;
+  rationale?: string;
+  acknowledgeBreaking?: boolean;
+}
+
+export interface Snapshot {
+  serverTime: number;
+  eventCursor: number;
+  proposals: ProposalDetail[];
+}
+
+interface ProposalRow {
+  id: string;
+  title: string;
+  status: 'open' | 'approved' | 'rejected';
+  version: number;
+  baseline_json: string;
+  baseline_digest: string;
+  candidate_json: string;
+  candidate_digest: string;
+  compat_json: string;
+  consumers_json: string;
+  evidence_ttl_ms: number;
+  created_at: number;
+  updated_at: number;
+  decision_id: string | null;
+}
+
+interface EvidenceRow {
+  id: number;
+  proposal_id: string;
+  consumer_id: string;
+  candidate_digest: string;
+  verdict: 'pass' | 'fail';
+  run_id: string;
+  idempotency_key: string;
+  details_json: string | null;
+  recorded_at: number;
+  applies_to_current: number;
+}
+
+export class Store {
+  private db: Db;
+  private clock: Clock;
+  private defaultTtlMs: number;
+  private listeners = new Set<(e: DomainEvent) => void>();
+
+  constructor(opts: { path: string; clock: Clock; defaultTtlMs: number }) {
+    this.db = openDatabase(opts.path);
+    this.clock = opts.clock;
+    this.defaultTtlMs = opts.defaultTtlMs;
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  /** SSE 等场景订阅提交后的新事件。事件先落库，提交后才推送。 */
+  onEvent(fn: (e: DomainEvent) => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private emit(events: DomainEvent[]): void {
+    for (const e of events) for (const l of this.listeners) l(e);
+  }
+
+  private getRow(id: string): ProposalRow | undefined {
+    return this.db.prepare('SELECT * FROM proposals WHERE id = ?').get(id) as ProposalRow | undefined;
+  }
+
+  private mustGetRow(id: string): ProposalRow {
+    const row = this.getRow(id);
+    if (!row) throw new StoreError('NOT_FOUND', 404, `提案 ${id} 不存在`);
+    return row;
+  }
+
+  createProposal(input: CreateProposalInput): ProposalDetail {
+    if (!input.title || typeof input.title !== 'string') {
+      throw new StoreError('BAD_REQUEST', 400, 'title 不能为空');
+    }
+    if (!Array.isArray(input.consumers) || input.consumers.length === 0) {
+      throw new StoreError('BAD_REQUEST', 400, 'consumers 必须是非空数组');
+    }
+    const consumers = input.consumers.map((c) => String(c).trim()).filter(Boolean);
+    if (new Set(consumers).size !== consumers.length || consumers.length === 0) {
+      throw new StoreError('BAD_REQUEST', 400, 'consumers 存在重复或空项');
+    }
+    const compat = checkCompatibility(input.baseline, input.candidate);
+    const now = this.clock.now();
+    const id = `prp_${randomUUID()}`;
+    const baselineDigest = stableDigest(input.baseline);
+    const candidateDigest = stableDigest(input.candidate);
+    const ttl = input.evidenceTtlMs && input.evidenceTtlMs > 0 ? Math.floor(input.evidenceTtlMs) : this.defaultTtlMs;
+
+    let created: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO proposals (id, title, status, version, baseline_json, baseline_digest,
+             candidate_json, candidate_digest, compat_json, consumers_json, evidence_ttl_ms,
+             created_at, updated_at, decision_id)
+           VALUES (?, ?, 'open', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(
+          id,
+          input.title,
+          JSON.stringify(input.baseline),
+          baselineDigest,
+          JSON.stringify(input.candidate),
+          candidateDigest,
+          JSON.stringify(compat),
+          JSON.stringify(consumers),
+          ttl,
+          now,
+          now,
+        );
+      created = [
+        this.appendEvent(id, 'PROPOSAL_CREATED', {
+          title: input.title,
+          createdBy: input.createdBy ?? null,
+          baselineDigest,
+          candidateDigest,
+          compatStatus: compat.status,
+          consumers,
+          evidenceTtlMs: ttl,
+        }),
+      ];
+    });
+    tx();
+    this.emit(created);
+    return this.getProposal(id)!;
+  }
+
+  addRevision(proposalId: string, candidate: unknown, expectedVersion: number): ProposalDetail {
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const p = this.mustGetRow(proposalId);
+      if (p.status !== 'open') {
+        throw new StoreError('PROPOSAL_CLOSED', 409, `提案已${p.status === 'approved' ? '批准' : '驳回'}，不能再修订候选`);
+      }
+      if (p.version !== expectedVersion) {
+        throw new StoreError('VERSION_CONFLICT', 409, `版本冲突：期望 ${expectedVersion}，当前 ${p.version}`);
+      }
+      const baseline = JSON.parse(p.baseline_json) as unknown;
+      const compat = checkCompatibility(baseline, candidate);
+      const newDigest = stableDigest(candidate);
+      const now = this.clock.now();
+      const res = this.db
+        .prepare(
+          `UPDATE proposals SET candidate_json = ?, candidate_digest = ?, compat_json = ?,
+             version = version + 1, updated_at = ? WHERE id = ? AND version = ?`,
+        )
+        .run(JSON.stringify(candidate), newDigest, JSON.stringify(compat), now, proposalId, expectedVersion);
+      if (res.changes !== 1) {
+        throw new StoreError('VERSION_CONFLICT', 409, '并发修订冲突，请刷新后重试');
+      }
+      events = [
+        this.appendEvent(proposalId, 'CANDIDATE_REVISED', {
+          fromDigest: p.candidate_digest,
+          toDigest: newDigest,
+          version: expectedVersion + 1,
+          compatStatus: compat.status,
+        }),
+      ];
+    });
+    tx();
+    this.emit(events);
+    return this.getProposal(proposalId)!;
+  }
+
+  /**
+   * 证据报送。幂等：相同 idempotencyKey 的重试只生效一次；
+   * 旧候选摘要或已关闭提案的证据会被记录但标记为不适用，绝不污染当前门禁。
+   */
+  recordEvidence(proposalId: string, input: EvidenceInput): EvidenceResult {
+    let result!: EvidenceResult;
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const p = this.mustGetRow(proposalId);
+      const existing = this.db
+        .prepare('SELECT * FROM evidence WHERE idempotency_key = ?')
+        .get(input.idempotencyKey) as EvidenceRow | undefined;
+      if (existing) {
+        if (
+          existing.proposal_id !== proposalId ||
+          existing.consumer_id !== input.consumerId ||
+          existing.candidate_digest !== input.candidateDigest ||
+          existing.verdict !== input.verdict ||
+          existing.run_id !== input.runId
+        ) {
+          throw new StoreError(
+            'IDEMPOTENCY_CONFLICT',
+            409,
+            `幂等键 ${input.idempotencyKey} 已被不同内容的报送占用`,
+          );
+        }
+        result = { outcome: 'duplicate', evidence: this.mapEvidence(existing) };
+        return;
+      }
+      const consumers = JSON.parse(p.consumers_json) as string[];
+      if (!consumers.includes(input.consumerId)) {
+        throw new StoreError('UNKNOWN_CONSUMER', 422, `消费方 ${input.consumerId} 不在提案 ${proposalId} 的依赖清单中`, {
+          consumers,
+        });
+      }
+      if (input.verdict !== 'pass' && input.verdict !== 'fail') {
+        throw new StoreError('BAD_REQUEST', 400, 'verdict 必须是 pass 或 fail');
+      }
+      const applies = p.status === 'open' && input.candidateDigest === p.candidate_digest;
+      const outcome: EvidenceResult['outcome'] =
+        p.status !== 'open' ? 'closed' : input.candidateDigest !== p.candidate_digest ? 'stale_candidate' : 'recorded';
+      const recordedAt = this.clock.now();
+      const ins = this.db
+        .prepare(
+          `INSERT INTO evidence (proposal_id, consumer_id, candidate_digest, verdict, run_id,
+             idempotency_key, details_json, recorded_at, applies_to_current)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          proposalId,
+          input.consumerId,
+          input.candidateDigest,
+          input.verdict,
+          input.runId,
+          input.idempotencyKey,
+          input.details === undefined ? null : JSON.stringify(input.details),
+          recordedAt,
+          applies ? 1 : 0,
+        );
+      const row = this.db.prepare('SELECT * FROM evidence WHERE id = ?').get(ins.lastInsertRowid) as EvidenceRow;
+      result = { outcome, evidence: this.mapEvidence(row) };
+      events = [
+        this.appendEvent(proposalId, 'EVIDENCE_RECORDED', {
+          evidenceId: row.id,
+          outcome,
+          consumerId: input.consumerId,
+          verdict: input.verdict,
+          runId: input.runId,
+          candidateDigest: input.candidateDigest,
+          appliesToCurrent: applies,
+        }),
+      ];
+    });
+    tx();
+    this.emit(events);
+    return result;
+  }
+
+  /**
+   * 决策。门禁评估、版本 CAS、快照落库在同一事务内完成：
+   * 并发审批只有一个能胜出；决策快照从此不可变，后到的证据无法改变当时的结论。
+   */
+  decide(proposalId: string, input: DecideInput): Decision {
+    if (!input.decidedBy) throw new StoreError('BAD_REQUEST', 400, 'decidedBy 不能为空');
+    let decision!: Decision;
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const p = this.mustGetRow(proposalId);
+      if (p.version !== input.expectedVersion) {
+        throw new StoreError('VERSION_CONFLICT', 409, `版本冲突：期望 ${input.expectedVersion}，当前 ${p.version}`);
+      }
+      if (p.status !== 'open') {
+        throw new StoreError('DECISION_ALREADY_MADE', 409, `提案已存在有效决策（${p.status}），不能重复决策`);
+      }
+      const compat = JSON.parse(p.compat_json) as CompatResult;
+      const consumers = JSON.parse(p.consumers_json) as string[];
+      const evidence = this.evidenceFor(proposalId);
+      const now = this.clock.now();
+      const gate = evaluateGate({
+        candidateDigest: p.candidate_digest,
+        consumers,
+        evidence,
+        compat,
+        now,
+        ttlMs: p.evidence_ttl_ms,
+      });
+      const remaining = decisionBlockers(gate, input.action, input.acknowledgeBreaking === true);
+      if (remaining.length > 0) {
+        throw new StoreError('GATE_BLOCKED', 422, '门禁未通过，不能对该候选作出决策', { blockers: remaining });
+      }
+      const snapshot: DecisionSnapshot = {
+        proposalId,
+        version: p.version,
+        baselineDigest: p.baseline_digest,
+        candidateDigest: p.candidate_digest,
+        compat,
+        gate,
+        evidenceUsed: [...latestApplicableEvidence(evidence, p.candidate_digest).values()],
+        action: input.action,
+        decidedBy: input.decidedBy,
+        rationale: input.rationale ?? null,
+        decidedAt: now,
+        acknowledgeBreaking: input.acknowledgeBreaking === true,
+      };
+      const id = `dec_${randomUUID()}`;
+      this.db
+        .prepare(
+          `INSERT INTO decisions (id, proposal_id, action, decided_by, rationale, decided_at, snapshot_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(id, proposalId, input.action, input.decidedBy, input.rationale ?? null, now, JSON.stringify(snapshot));
+      const res = this.db
+        .prepare(
+          `UPDATE proposals SET status = ?, version = version + 1, updated_at = ?, decision_id = ?
+           WHERE id = ? AND version = ? AND status = 'open'`,
+        )
+        .run(input.action === 'approve' ? 'approved' : 'rejected', now, id, proposalId, input.expectedVersion);
+      if (res.changes !== 1) {
+        throw new StoreError('VERSION_CONFLICT', 409, '并发决策冲突，请刷新后重试');
+      }
+      decision = { id, proposalId, action: input.action, decidedBy: input.decidedBy, rationale: input.rationale ?? null, decidedAt: now, snapshot };
+      events = [
+        this.appendEvent(proposalId, 'DECISION_MADE', {
+          decisionId: id,
+          action: input.action,
+          decidedBy: input.decidedBy,
+          candidateDigest: p.candidate_digest,
+          snapshotDigest: stableDigest(snapshot),
+        }),
+      ];
+    });
+    tx();
+    this.emit(events);
+    return decision;
+  }
+
+  getProposal(id: string): ProposalDetail | null {
+    const row = this.getRow(id);
+    if (!row) return null;
+    return this.assemble(row);
+  }
+
+  listProposals(): ProposalDetail[] {
+    const rows = this.db.prepare('SELECT * FROM proposals ORDER BY created_at, id').all() as ProposalRow[];
+    return rows.map((r) => this.assemble(r));
+  }
+
+  /** 一致快照：单个只读事务内取全量状态，供网页重连后恢复一致视图。 */
+  snapshot(): Snapshot {
+    const tx = this.db.transaction(() => {
+      const cursor = (this.db.prepare('SELECT COALESCE(MAX(id), 0) AS c FROM events').get() as { c: number }).c;
+      return { serverTime: this.clock.now(), eventCursor: cursor, proposals: this.listProposals() };
+    });
+    return tx();
+  }
+
+  eventsSince(id: number): DomainEvent[] {
+    const rows = this.db.prepare('SELECT * FROM events WHERE id > ? ORDER BY id').all(id) as {
+      id: number;
+      ts: number;
+      proposal_id: string;
+      type: string;
+      payload_json: string;
+    }[];
+    return rows.map((r) => ({ id: r.id, ts: r.ts, proposalId: r.proposal_id, type: r.type, payload: JSON.parse(r.payload_json) }));
+  }
+
+  private appendEvent(proposalId: string, type: string, payload: unknown): DomainEvent {
+    const ts = this.clock.now();
+    const ins = this.db
+      .prepare('INSERT INTO events (ts, proposal_id, type, payload_json) VALUES (?, ?, ?, ?)')
+      .run(ts, proposalId, type, JSON.stringify(payload));
+    return { id: Number(ins.lastInsertRowid), ts, proposalId, type, payload };
+  }
+
+  private evidenceFor(proposalId: string): EvidenceRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM evidence WHERE proposal_id = ? ORDER BY id')
+      .all(proposalId) as EvidenceRow[];
+    return rows.map((r) => this.mapEvidence(r));
+  }
+
+  private mapEvidence(r: EvidenceRow): EvidenceRecord {
+    return {
+      id: r.id,
+      proposalId: r.proposal_id,
+      consumerId: r.consumer_id,
+      candidateDigest: r.candidate_digest,
+      verdict: r.verdict,
+      runId: r.run_id,
+      idempotencyKey: r.idempotency_key,
+      details: r.details_json === null ? undefined : JSON.parse(r.details_json),
+      recordedAt: r.recorded_at,
+      appliesToCurrent: r.applies_to_current === 1,
+    };
+  }
+
+  private assemble(row: ProposalRow): ProposalDetail {
+    const compat = JSON.parse(row.compat_json) as CompatResult;
+    const consumers = JSON.parse(row.consumers_json) as string[];
+    const evidence = this.evidenceFor(row.id);
+    const gate = evaluateGate({
+      candidateDigest: row.candidate_digest,
+      consumers,
+      evidence,
+      compat,
+      now: this.clock.now(),
+      ttlMs: row.evidence_ttl_ms,
+    });
+    let decision: Decision | null = null;
+    if (row.decision_id) {
+      const d = this.db.prepare('SELECT * FROM decisions WHERE id = ?').get(row.decision_id) as
+        | { id: string; proposal_id: string; action: DecisionAction; decided_by: string; rationale: string | null; decided_at: number; snapshot_json: string }
+        | undefined;
+      if (d) {
+        decision = {
+          id: d.id,
+          proposalId: d.proposal_id,
+          action: d.action,
+          decidedBy: d.decided_by,
+          rationale: d.rationale,
+          decidedAt: d.decided_at,
+          snapshot: JSON.parse(d.snapshot_json) as DecisionSnapshot,
+        };
+      }
+    }
+    return {
+      id: row.id,
+      title: row.title,
+      status: row.status,
+      version: row.version,
+      baseline: JSON.parse(row.baseline_json),
+      candidate: JSON.parse(row.candidate_json),
+      baselineDigest: row.baseline_digest,
+      candidateDigest: row.candidate_digest,
+      compat,
+      consumers,
+      evidenceTtlMs: row.evidence_ttl_ms,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      evidence,
+      gate,
+      decision,
+      events: this.eventsSinceFor(row.id),
+    };
+  }
+
+  private eventsSinceFor(proposalId: string): DomainEvent[] {
+    const rows = this.db
+      .prepare('SELECT * FROM events WHERE proposal_id = ? ORDER BY id')
+      .all(proposalId) as { id: number; ts: number; proposal_id: string; type: string; payload_json: string }[];
+    return rows.map((r) => ({ id: r.id, ts: r.ts, proposalId: r.proposal_id, type: r.type, payload: JSON.parse(r.payload_json) }));
+  }
+}
