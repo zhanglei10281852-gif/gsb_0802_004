@@ -1,0 +1,147 @@
+# Data Contract Change Control Center
+
+A locally-runnable control center for evolving JSON Schema event contracts across dozens of collaborating services. It replaces the "producer shipped, one consumer silently breaks" accident with an evidence-based gate: producers submit a baseline and a candidate schema, every consumer's build agent reports verification evidence, and release managers can only decide on the exact candidate once evidence is complete. Every decision is frozen as an immutable snapshot.
+
+Built with Node.js 20, TypeScript, React, Fastify, SQLite, and JSON Schema 2020-12. No Docker, no remote database, no external services.
+
+## Quick start
+
+```powershell
+npm install
+npm run build
+npm start
+```
+
+Then open http://127.0.0.1:3000. The SQLite database is created at `dist/data/ccc.sqlite` by default; override with `CCC_DB_PATH`.
+
+Other fixed entry points:
+
+| Command | What it does |
+| --- | --- |
+| `npm install` | Installs dependencies |
+| `npm test` | Runs the Vitest unit suite (domain + storage guarantees) |
+| `npm run build` | Compiles the TypeScript server and builds the React UI into `dist/` |
+| `npm start` | Starts the compiled server and serves the built workbench |
+| `npm run e2e` | Builds everything, spawns the real server, runs the scripted agent simulator against it (including a process restart), and asserts all invariants |
+
+Environment variables: `CCC_PORT` (default 3000), `CCC_HOST` (default 127.0.0.1), `CCC_DB_PATH`, `CCC_WEB_ROOT`, `CCC_LOG=1` for request logging.
+
+## Core semantics
+
+### Stable candidate identity
+
+A candidate is identified by `sha256(canonicalJSON(candidateSchema))`, where canonicalization recursively sorts object keys ([hash.ts](src/domain/hash.ts)). Key ordering, formatting, or whitespace differences between producers do not create duplicate proposals. Evidence is bound to this hash, so a report for a different candidate can never silently attach to the current proposal.
+
+### Backward compatibility
+
+At submission the system runs a sound 2020-12 compatibility check ([compatibility.ts](src/domain/compatibility.ts)): the candidate is backward-compatible iff every instance accepted by the baseline is also accepted by the candidate. It validates both schemas with Ajv 2020-12 and structurally compares `type`, `required`, `properties`, `additionalProperties`, `enum`, `const`, numeric/string/array bounds, and common combinators. When it cannot prove safety it reports a blocking issue rather than guessing.
+
+### Evidence gate
+
+A proposal is `gateReady` only when **all** of the following hold ([gate.ts](src/domain/gate.ts)):
+
+1. Every registered consumer has exactly one evidence record for this candidate hash.
+2. Every consumer verdict is `compatible`.
+3. The system compatibility check passed.
+4. The proposal is still `pending`.
+
+The "Approve" button is disabled until the gate is ready; "Reject" is always available while pending. Blocking reasons are shown verbatim.
+
+### Immutable decisions
+
+When a decision is made, the system stores a full snapshot of the proposal, all evidence, required/missing consumers, and the gate evaluation inside the `decisions` row. After a decision:
+
+- The proposal status is flipped atomically (`UPDATE ... WHERE status='pending'`).
+- New evidence is rejected with HTTP 409 and an `evidence_rejected` causal event.
+- The snapshot is never mutated, so a later arriving "incompatible" report cannot retroactively change what was approved.
+
+### Idempotency and ordering
+
+Each evidence submission carries an `idempotencyKey`. The same key retried for the same `(proposal, consumer)` is a no-op and returns the original record (`deduped: true`). A genuinely new key updates that consumer's latest evidence while pending. This collapses duplicate retries, dropped responses, and "wrote the DB then crashed before replying" into exactly one effective write.
+
+Late results are quarantined:
+- Unknown consumer id → rejected.
+- `candidateHash` not equal to the proposal hash → rejected (old candidate / wrong proposal).
+- Proposal already decided → rejected.
+
+Every rejection is still written to the append-only causal log as `evidence_rejected` so anomalies are explainable rather than invisible.
+
+### Concurrency
+
+Approval runs in a single `BEGIN IMMEDIATE` SQLite transaction that re-evaluates the gate, performs a conditional status update, and inserts the decision. A `UNIQUE(proposal_id)` constraint on `decisions` is the hard backstop: two concurrent approvals cannot both succeed. One wins, the other receives HTTP 409.
+
+### Causal log and recovery
+
+Every mutation appends a row to `causal_events` with an auto-increment id, a monotonic Lamport `clock`, and a wall-clock `recordedAt`. SQLite (WAL mode) is the source of truth — there is no in-memory state that can disagree with it. On restart the repository re-reads all rows and resumes the Lamport clock from `MAX(clock)`, so history, ordering, and decisions survive a process kill.
+
+### Snapshot-on-reconnect, not in-process hope
+
+The web workbench connects to `/api/stream` (SSE). On every (re)connection the server sends a fresh full snapshot from SQLite. Incremental events only nudge the client to refresh; reconnecting after a network blip or server restart always reconciles to the persisted state rather than relying on events that happened while the socket was down.
+
+## Architecture
+
+The contract/gate core is deliberately decoupled from adapters:
+
+```
+src/domain/        pure logic: hashing, compatibility, gate state machine, clock
+src/storage/       SQLite schema + repository (transactions, idempotency, snapshots)
+src/http/          Fastify routes, SSE hub, static serving
+src/agent/         script-controlled build agent simulator + fault-injecting HTTP client
+src/bin/server.ts  production entry
+src/bin/e2e-runner.ts  end-to-end orchestrator (spawns/restarts the real server)
+web/               React workbench (Vite)
+test/              Vitest unit tests
+```
+
+- The repository depends only on the `Clock` interface and a DB handle. The simulator uses a `VirtualClock`; production uses `SystemClock`. Clocks are swappable.
+- The HTTP layer never implements gate rules; it calls the domain/storage. The SSE `EventHub` is a tiny pub/sub that is fed by the repository's event sink — storage does not import Fastify.
+- The fault-injecting HTTP client ([simulator.ts](src/agent/simulator.ts)) can `duplicate` a request or `dropResponse` (abort after send, modeling write-before-reply crash). The e2e runner composes these without sleeping real time except for small process-health polls.
+
+## HTTP API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/health` | Liveness |
+| GET/POST | `/api/consumers` | List / register consumers |
+| GET/POST | `/api/proposals` | List / submit `{candidateSchema, baselineSchema}` |
+| GET | `/api/proposals/:id` | Detail with evidence, gate state, blocking reasons, decision |
+| POST | `/api/proposals/:id/evidence` | Agent report `{consumerId, candidateHash, verdict, details, idempotencyKey}` |
+| POST | `/api/proposals/:id/decision` | `{action: "approve"|"reject", reason}` |
+| GET | `/api/snapshot` | Full state snapshot (consumers + proposal details + events) |
+| GET | `/api/causal-events` | Append-only causal log |
+| GET | `/api/stream` | Server-Sent Events: snapshot on connect, then causal events |
+
+## Fault recovery boundaries
+
+- **Crash after write, before reply:** the evidence transaction commits before the response is written. The agent retries with the same `idempotencyKey`; the server returns the existing record. No duplicate evidence, no lost write.
+- **Duplicate / out-of-order delivery:** idempotency keys collapse duplicates; hash + consumer validation rejects stale/unknown deliveries. The unique `(proposal_id, consumer_id)` index guarantees one current evidence per consumer.
+- **Concurrent decisions:** SQLite transaction + unique constraint guarantee one effective decision.
+- **Process restart:** all durable state is in SQLite; the Lamport clock and causal log are reconstructed on boot.
+- **New evidence after a decision:** rejected; the stored snapshot is immutable.
+- **Web disconnect:** SSE auto-reconnects and receives a fresh full snapshot; missed events are not required for correctness.
+
+## End-to-end scenarios
+
+`npm run e2e` exercises, against the compiled server:
+
+1. Registering consumers and submitting a compatible proposal.
+2. Duplicate evidence delivery (asserted deduped).
+3. Dropped-response / crash-after-write followed by a retry (asserted one evidence, deduped).
+4. Unknown-consumer and wrong-hash late results (asserted rejected, no pollution).
+5. Two concurrent approvals (asserted exactly one wins).
+6. Post-decision evidence (asserted rejected, snapshot frozen).
+7. SSE snapshot on connect.
+8. Killing and restarting the server process on the same SQLite file (asserted status, evidence, snapshot, and causal log all survive with identical clocks/order).
+9. A breaking candidate that all consumers claim is fine (asserted system gate still blocks approval; rejection allowed).
+
+## Local development workflow
+
+```powershell
+# run the server directly from TS (no UI build; use Vite dev server for UI)
+npm run dev
+
+# in another terminal, run the UI with HMR (proxies /api to :3000)
+npx vite
+```
+
+The Vite dev server runs on http://localhost:5173 and proxies `/api` to the Fastify server on port 3000.
