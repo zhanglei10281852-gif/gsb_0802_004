@@ -31,6 +31,8 @@ const scenarios = [
   "rollout-duplicate-out-of-order",
   "rollout-pause-retry-rollback",
   "rollout-receipt-loss-recovery",
+  "rollout-topology-change",
+  "rollout-concurrent-receipt-topology",
 ];
 
 function runScenario(name: string, port: number): Promise<ScenarioResult> {

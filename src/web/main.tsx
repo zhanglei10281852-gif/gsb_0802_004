@@ -677,6 +677,10 @@ function RolloutsPanel({
   >("success");
   const [receiptMsg, setReceiptMsg] = useState("deployed");
   const [receiptKey, setReceiptKey] = useState("rcpt-1");
+  const [newConsumerId, setNewConsumerId] = useState("analytics");
+  const [topologyReason, setTopologyReason] = useState(
+    "new required dependency during rollout",
+  );
 
   async function guard(fn: () => Promise<void>): Promise<void> {
     setBusy(true);
@@ -718,6 +722,14 @@ function RolloutsPanel({
     });
   }
 
+  async function addConsumer(): Promise<void> {
+    await api.addRequiredConsumer(proposal.proposalId, {
+      consumerId: newConsumerId,
+      addedBy: "release-manager",
+      reason: topologyReason,
+    });
+  }
+
   return (
     <div>
       <p style={{ color: "var(--muted)", fontSize: 13 }}>
@@ -729,6 +741,83 @@ function RolloutsPanel({
         but does <strong>not</strong> change the contract decision or revive any
         expired/revoked exemptions.
       </p>
+
+      {approved && (proposal.additions?.length ?? 0) > 0 && (
+        <div
+          className="panel"
+          style={{
+            background: "var(--panel-2)",
+            marginBottom: 16,
+            border: "1px solid var(--amber)",
+          }}
+        >
+          <h3 style={{ marginTop: 0 }}>
+            Topology: required consumers added after the decision
+          </h3>
+          <p style={{ color: "var(--muted)", fontSize: 12, marginTop: 0 }}>
+            The decision snapshot (captured {proposal.decision?.decidedAt}) is
+            immutable and still lists the original {proposal.consumers.length}{" "}
+            consumer(s). The additions below create a coverage gap until each
+            re-verifies against the candidate. An active rollout auto-pauses
+            (reason <code>topology-gap</code>) until the gap closes.
+          </p>
+          {proposal.additions.map((a) => (
+            <div key={a.consumerId} className="consumer-row">
+              <div>
+                <div className="consumer-id">{a.consumerId}</div>
+                <div className="consumer-detail">
+                  added by {a.addedBy}: {a.reason}
+                </div>
+              </div>
+              <span className={`badge ${a.reverifiedAt ? "pass" : "failed"}`}>
+                {a.reverifiedAt
+                  ? `re-verified by ${a.reverifiedBy}`
+                  : "gap — awaiting re-verification"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {approved && (
+        <div
+          className="panel"
+          style={{ background: "var(--panel-2)", marginBottom: 16 }}
+        >
+          <h3 style={{ marginTop: 0 }}>Add a required dependency</h3>
+          <p style={{ color: "var(--muted)", fontSize: 12, marginTop: 0 }}>
+            If a new consumer becomes required while a rollout is in flight, add
+            it here. The decision snapshot is unchanged; any not-yet-started
+            wave pauses automatically until the new consumer reports PASS
+            evidence against this candidate.
+          </p>
+          <div className="form-row">
+            <div className="field">
+              <label>New consumer id</label>
+              <input
+                value={newConsumerId}
+                onChange={(e) => setNewConsumerId(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>Reason</label>
+              <input
+                value={topologyReason}
+                onChange={(e) => setTopologyReason(e.target.value)}
+              />
+            </div>
+          </div>
+          {error && (
+            <div className="blocker">
+              <span className="code">ERROR</span>
+              {error}
+            </div>
+          )}
+          <button disabled={busy} onClick={() => void guard(addConsumer)}>
+            Add required consumer &amp; auto-pause rollout if needed
+          </button>
+        </div>
+      )}
 
       {approved && rollouts.length === 0 && (
         <div
@@ -874,6 +963,22 @@ function RolloutCard({
               {rollout.rollbackTargetWaveId &&
                 rollout.status === "rolled-back" &&
                 ` (rolled back at wave ${rollout.currentWaveSequence})`}
+            </div>
+          )}
+          {rollout.status === "paused" && rollout.pauseReason && (
+            <div
+              className="consumer-detail"
+              style={{
+                color:
+                  rollout.pauseReason === "topology-gap"
+                    ? "var(--amber)"
+                    : "var(--muted)",
+              }}
+            >
+              paused:{" "}
+              {rollout.pauseReason === "topology-gap"
+                ? `coverage gap for ${rollout.gapConsumerIds.join(", ")} — re-verification required before resume`
+                : "operator-initiated pause"}
             </div>
           )}
         </div>

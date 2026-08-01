@@ -73,7 +73,8 @@ Every state change (`proposal-created`, `evidence-accepted`, `evidence-rejected`
 `decision-recorded`, `proposal-superseded`, `exemption-requested`, `exemption-approved`,
 `exemption-rejected`, `exemption-revoked`, `rollout-created`, `rollout-started`, `rollout-paused`,
 `rollout-resumed`, `rollout-completed`, `rollout-failed`, `wave-deploying`, `wave-result`,
-`wave-retried`, `receipt-rejected`, `rollout-rolled-back`) is appended to an append-only `event_log`.
+`wave-retried`, `receipt-rejected`, `rollout-rolled-back`, `topology-changed`,
+`reverification-concluded`) is appended to an append-only `event_log`.
 Each event's hash commits to the previous event's hash (`prev_hash`), forming a tamper-evident chain.
 Rollout events are written to the **bound proposal's** chain, so a proposal's full history — gate,
 exemptions, lineage and staged rollout — verifies as one chain with `EventLog.verifyChain(proposalId)`.
@@ -170,35 +171,75 @@ and attempts, send test receipts, and pause/resume/retry/rollback. The adapter s
 happy-path phased rollout, duplicate and out-of-order receipts, pause/retry/rollback, and receipt loss
 (hard crash after the receipt is committed but before the reply, then restart + idempotent retry).
 
+### 12. Topology changes during rollout (coverage gaps)
+
+A new consumer can become a **required dependency while a rollout is already in flight**. The historical
+decision snapshot is never mutated; instead the addition is recorded separately and the rollout is gated
+until the gap is closed.
+
+- **Post-decision required consumers.** `POST /api/proposals/:id/required-consumers`
+  (`{consumerId, addedBy, reason, schema?}`) can only target an **approved** proposal, and only for a
+  consumer that was not already required at decision time. It emits a `topology-changed` event and
+  stores the addition in `additions_json`; the original `consumers` and the decision snapshot are
+  unchanged. The effective required set is the union of decision-time consumers and additions.
+- **Automatic pause on a coverage gap.** After an addition, every **active** rollout for the proposal is
+  evaluated. If the new consumer has no fresh PASS evidence against the bound candidate digest
+  (`no-evidence` / `not-pass` / `stale`), the rollout is paused with
+  `pauseReason = "topology-gap"` and the gap consumer ids are recorded. A `topology-gap` pause **cannot
+  be resumed by an operator** until the gap closes; the workbench shows the causal basis (which consumer
+  is missing verification).
+- **Deterministic concurrent receipts.** A deployment receipt that lands after the topology pause is
+  still committed deterministically: it is recorded (idempotent on its key), the wave is marked
+  `succeeded`/`failed`/`unknown`, but the rollout does **not** advance waves or complete while the gap
+  remains. A duplicate receipt is deduped. Because both the topology pause and the receipt commit run in
+  SQLite transactions, the committed result is always deterministic regardless of arrival order.
+- **Traceable re-verification.** A PASS evidence report for an un-reverified addition against the bound
+  candidate digest is accepted as a **re-verification** (the one narrow exception to the
+  `proposal-decided` rule), marks the addition reverified (with `reverifiedAt`, `reverifiedBy`,
+  `evidenceId`), and emits both `evidence-accepted` (`postDecision: true`) and a
+  `reverification-concluded` event on the same proposal lineage. A non-PASS result leaves the gap open.
+- **Auto-resume / completion.** Once all gaps are closed, topology-paused rollouts resume automatically:
+  the current wave advances to the next one, or — if the last wave already succeeded while paused — the
+  rollout completes. The causal chain records `rollout-resumed` (`reason: "topology-gap"`) and, when
+  applicable, `rollout-completed`.
+
+The adapter simulator covers this end to end in `rollout-topology-change` (addition mid-rollout, paused
+receipt recorded without completing, re-verification completes the rollout) and
+`rollout-concurrent-receipt-topology` (a committed prod receipt arriving concurrently with the topology
+change is accepted, deduped on retry, and the rollout completes only after the gap is verified).
+
 ---
 
 ## Failure & Recovery Boundaries
 
-| Failure                                                  | Behavior                                                                                                                                                                                                    |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent retries a report (duplicate)                       | Idempotency key → original result, no duplicate row.                                                                                                                                                        |
-| Server writes evidence, then crashes **before replying** | Write is committed in a SQLite transaction; on restart the evidence is present. Agent retry is deduped. The `crash-after-write` e2e scenario exercises this with a real hard-kill.                          |
-| Response lost / out-of-order delivery                    | Idempotency keys + server-assigned `receivedAt` make ordering safe; only the latest evidence per consumer matters, and wrong digests are rejected.                                                          |
-| Late report for an old candidate                         | `candidate-mismatch`, ignored.                                                                                                                                                                              |
-| Unknown consumer reports                                 | `unknown-consumer`, ignored.                                                                                                                                                                                |
-| Evidence arrives after a decision                        | `proposal-decided`, ignored; snapshot is untouched.                                                                                                                                                         |
-| Candidate revised while waiting                          | Create a successor (`POST /api/proposals/:id/successor`); old proposal is atomically `superseded`, its exemptions revoked, and the successor starts with a new digest and no inherited evidence/exemptions. |
-| Late/old build result arrives after supersession         | `proposal-superseded`, recorded on the **predecessor** (with `successorId`); it is never written to and cannot release the successor.                                                                       |
-| Concurrently deciding and superseding a proposal         | Compare-and-swap: either the decision wins (then supersession is rejected as already-decided) or supersession wins (then deciding the old proposal is rejected as `superseded`) — never both.               |
-| Two release managers approve concurrently                | Compare-and-swap in SQLite → exactly one wins, other gets 409.                                                                                                                                              |
-| Exemption TTL passes                                     | It is reported as `expired` at read time; it stops gating new decisions but remains in the audit chain.                                                                                                     |
-| Exemption revoked                                        | Status becomes `revoked`; it stops gating immediately. Revocation after a decision is rejected so the snapshot stays stable.                                                                                |
-| Exemption requested for wrong scope/env/candidate        | It stays active in its own scope but never applies to another environment/consumer/candidate.                                                                                                               |
-| Same reviewer reviews twice / requester self-reviews     | Rejected with 409; only two _distinct_ approvals count.                                                                                                                                                     |
-| Duplicate adapter receipt (same Idempotency-Key)         | Original result returned (`deduped: true`); no second receipt row, wave does not double-advance.                                                                                                            |
-| Out-of-order / early receipt for a future wave           | Rejected as `wave-not-current` and recorded as `receipt-rejected`; it cannot start a future wave early.                                                                                                     |
-| Receipt arrives after rollout completes/is rolled back   | Rejected as `rollout-not-active`; terminal rollout is unchanged.                                                                                                                                            |
-| Adapter reports `failure` / `unknown`                    | `failure` fails the rollout (retryable via a new rollout after rollback); `unknown` leaves the wave retriable without failing the rollout. `retry` resets it to `deploying` and bumps attempts.             |
-| Server commits a receipt, then crashes before replying   | Receipt + wave result + events are committed in one transaction; on restart the adapter retries with the same key and is deduped. The `rollout-receipt-loss-recovery` e2e scenario exercises this.          |
-| Rollback requested                                       | In-progress/succeeded waves marked `rolled-back`, rollout becomes terminal; the bound decision snapshot and any expired/revoked exemptions are unchanged.                                                   |
-| Process restart                                          | All proposals, evidence, decisions, exemptions, rollouts, receipts and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`.        |
-| Clock skew / real-time waiting in tests                  | The clock is injectable. With `VIRTUAL_CLOCK=1` the server uses a manual clock advanced over `POST /api/debug/clock/advance`, so freshness scenarios run instantly.                                         |
-| Tampering with the event log                             | Hash chain verification fails.                                                                                                                                                                              |
+| Failure                                                         | Behavior                                                                                                                                                                                                    |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent retries a report (duplicate)                              | Idempotency key → original result, no duplicate row.                                                                                                                                                        |
+| Server writes evidence, then crashes **before replying**        | Write is committed in a SQLite transaction; on restart the evidence is present. Agent retry is deduped. The `crash-after-write` e2e scenario exercises this with a real hard-kill.                          |
+| Response lost / out-of-order delivery                           | Idempotency keys + server-assigned `receivedAt` make ordering safe; only the latest evidence per consumer matters, and wrong digests are rejected.                                                          |
+| Late report for an old candidate                                | `candidate-mismatch`, ignored.                                                                                                                                                                              |
+| Unknown consumer reports                                        | `unknown-consumer`, ignored.                                                                                                                                                                                |
+| Evidence arrives after a decision                               | `proposal-decided`, ignored; snapshot is untouched.                                                                                                                                                         |
+| Candidate revised while waiting                                 | Create a successor (`POST /api/proposals/:id/successor`); old proposal is atomically `superseded`, its exemptions revoked, and the successor starts with a new digest and no inherited evidence/exemptions. |
+| Late/old build result arrives after supersession                | `proposal-superseded`, recorded on the **predecessor** (with `successorId`); it is never written to and cannot release the successor.                                                                       |
+| Concurrently deciding and superseding a proposal                | Compare-and-swap: either the decision wins (then supersession is rejected as already-decided) or supersession wins (then deciding the old proposal is rejected as `superseded`) — never both.               |
+| Two release managers approve concurrently                       | Compare-and-swap in SQLite → exactly one wins, other gets 409.                                                                                                                                              |
+| Exemption TTL passes                                            | It is reported as `expired` at read time; it stops gating new decisions but remains in the audit chain.                                                                                                     |
+| Exemption revoked                                               | Status becomes `revoked`; it stops gating immediately. Revocation after a decision is rejected so the snapshot stays stable.                                                                                |
+| Exemption requested for wrong scope/env/candidate               | It stays active in its own scope but never applies to another environment/consumer/candidate.                                                                                                               |
+| Same reviewer reviews twice / requester self-reviews            | Rejected with 409; only two _distinct_ approvals count.                                                                                                                                                     |
+| Duplicate adapter receipt (same Idempotency-Key)                | Original result returned (`deduped: true`); no second receipt row, wave does not double-advance.                                                                                                            |
+| Out-of-order / early receipt for a future wave                  | Rejected as `wave-not-current` and recorded as `receipt-rejected`; it cannot start a future wave early.                                                                                                     |
+| Receipt arrives after rollout completes/is rolled back          | Rejected as `rollout-not-active`; terminal rollout is unchanged.                                                                                                                                            |
+| Adapter reports `failure` / `unknown`                           | `failure` fails the rollout (retryable via a new rollout after rollback); `unknown` leaves the wave retriable without failing the rollout. `retry` resets it to `deploying` and bumps attempts.             |
+| Server commits a receipt, then crashes before replying          | Receipt + wave result + events are committed in one transaction; on restart the adapter retries with the same key and is deduped. The `rollout-receipt-loss-recovery` e2e scenario exercises this.          |
+| Rollback requested                                              | In-progress/succeeded waves marked `rolled-back`, rollout becomes terminal; the bound decision snapshot and any expired/revoked exemptions are unchanged.                                                   |
+| New required consumer added mid-rollout                         | Addition recorded (decision snapshot untouched); active rollout auto-pauses with `pauseReason=topology-gap` until the new consumer is re-verified. Operator resume is rejected while the gap remains.       |
+| Deployment receipt committed concurrently with a topology pause | Receipt is recorded and the wave is marked, but the rollout stays paused and does not advance/complete until gaps close; duplicate keys dedupe. Result is deterministic (SQLite transactions).              |
+| Re-verification report for an added consumer                    | A PASS against the bound candidate digest closes the gap, concludes re-verification on the lineage, and auto-resumes/completes the rollout; a non-PASS result keeps it paused.                              |
+| Process restart                                                 | All proposals, evidence, decisions, exemptions, rollouts, receipts and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`.        |
+| Clock skew / real-time waiting in tests                         | The clock is injectable. With `VIRTUAL_CLOCK=1` the server uses a manual clock advanced over `POST /api/debug/clock/advance`, so freshness scenarios run instantly.                                         |
+| Tampering with the event log                                    | Hash chain verification fails.                                                                                                                                                                              |
 
 **Transaction boundary:** evidence insert + its event append happen in one SQLite transaction;
 status transition + its event append happen in one transaction; decision row update + its event
@@ -244,11 +285,13 @@ Environment variables: `PORT` (default 3000), `HOST` (default 127.0.0.1), `DB_PA
 npm run e2e
 ```
 
-This runs seventeen real-subprocess scenarios covering evidence (happy path, duplicate, stale,
-crash-after-write, wrong/unknown), the two-reviewer exemption lifecycle, proposal lineage, and the
+This runs nineteen real-subprocess scenarios covering evidence (happy path, duplicate, stale,
+crash-after-write, wrong/unknown), the two-reviewer exemption lifecycle, proposal lineage, the
 staged rollout (`rollout-phased`, `rollout-duplicate-out-of-order`, `rollout-pause-retry-rollback`,
-and `rollout-receipt-loss-recovery` with a hard crash + restart + idempotent retry). Each boots the
-compiled `dist/server/main.js` with a virtual clock and drives it over real HTTP.
+and `rollout-receipt-loss-recovery` with a hard crash + restart + idempotent retry), and topology
+changes during rollout (`rollout-topology-change` and `rollout-concurrent-receipt-topology`, covering
+coverage-gap auto-pause, deterministic concurrent receipts, and traceable re-verification). Each boots
+the compiled `dist/server/main.js` with a virtual clock and drives it over real HTTP.
 
 ### Run a single simulator scenario manually
 
@@ -275,6 +318,7 @@ npx vite             # UI on :5173, proxies /api and /events to :3000
 | `GET`  | `/api/proposals`                                    | List proposals.                                                                                                                             |
 | `GET`  | `/api/proposals/:id?environment=prod`               | Full gate view: proposal, evidence, blockers, freshness, applied exemptions, event log.                                                     |
 | `POST` | `/api/proposals/:id/successor`                      | Create a successor from a revised `{candidate, author, ttlMs?, note?}`; predecessor is atomically superseded and its exemptions revoked.    |
+| `POST` | `/api/proposals/:id/required-consumers`             | Add a post-decision required dependency `{consumerId, addedBy, reason, schema?}`; auto-pauses active rollouts until re-verified.            |
 | `POST` | `/api/proposals/:id/evidence`                       | Agent reports evidence (requires `Idempotency-Key`).                                                                                        |
 | `POST` | `/api/proposals/:id/decision`                       | `{kind: approve\|reject, decider, rationale, environment?}`. Approve requires zero blockers (exemptions applied for that environment).      |
 | `POST` | `/api/proposals/:id/exemptions`                     | Request a scoped, time-boxed exemption (`consumerId, environment, direction, reason, requestedBy, ttlMs`).                                  |
@@ -301,14 +345,14 @@ never relies on in-process-only state.
 ## Layout
 
 ```
-src/core/        Pure domain: types, digest, compatibility (JSON Schema 2020-12), gate & rollout state machines, clock, errors
+src/core/        Pure domain: types, digest, compatibility (JSON Schema 2020-12), gate, rollout & topology state machines, clock, errors
 src/storage/     SQLite schema, hash-chained event log, proposal/exemption/rollout repositories (transactions, idempotency, CAS)
 src/service/     GateService orchestrating repositories + injectable clock/faults
 src/server/      Fastify app, routes, SSE, debug clock/fault control
 src/web/         React workbench (Vite)
 src/agent/       Build-agent + deployment-adapter simulator with scriptable scenarios
 e2e/             Compiled end-to-end runner (boots real servers + simulator)
-test/            Integration tests (repository concurrency/dedup/recovery, rollout, lineage, HTTP)
+test/            Integration tests (repository concurrency/dedup/recovery, rollout, topology, lineage, HTTP)
 ```
 
 The core modules have zero imports from `src/server`, `src/storage`, `src/web`, or `src/agent` —

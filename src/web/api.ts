@@ -50,6 +50,27 @@ export const api = {
       },
     ).then((r) => json(r));
   },
+  addRequiredConsumer(
+    proposalId: string,
+    body: {
+      consumerId: string;
+      addedBy: string;
+      reason: string;
+    },
+  ): Promise<{
+    proposal: StoredProposal;
+    pausedRollouts: string[];
+    gapConsumerIds: string[];
+  }> {
+    return fetch(
+      `/api/proposals/${encodeURIComponent(proposalId)}/required-consumers`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ).then((r) => json(r));
+  },
   decide(
     id: string,
     kind: "approve" | "reject",
@@ -235,6 +256,11 @@ export function connectEvents(
     es.addEventListener("wave-retried", handler("wave-retried"));
     es.addEventListener("receipt-rejected", handler("receipt-rejected"));
     es.addEventListener("rollout-rolled-back", handler("rollout-rolled-back"));
+    es.addEventListener("topology-changed", handler("topology-changed"));
+    es.addEventListener(
+      "reverification-concluded",
+      handler("reverification-concluded"),
+    );
 
     es.onerror = () => {
       onStateChange("reconnecting");

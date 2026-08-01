@@ -607,6 +607,49 @@ export class AgentSimulator {
           }
           break;
         }
+        case "add-required-consumer": {
+          const targetId = resolveTarget(step);
+          const res = await this.client.addRequiredConsumer(targetId, {
+            consumerId: step.consumerId ?? "analytics",
+            addedBy: step.author ?? "release-mgr",
+            reason: step.reason ?? "new required dependency",
+          });
+          this.logger.log(
+            `added required consumer ${step.consumerId}; paused rollouts=${res.pausedRollouts.length} gaps=${res.gapConsumerIds.join(",")}`,
+          );
+          if (res.pausedRollouts.length === 0) {
+            throw new Error("expected an active rollout to be auto-paused");
+          }
+          break;
+        }
+        case "report-gap-evidence": {
+          const targetId = resolveTarget(step);
+          const view = await this.client.getGateView(targetId);
+          const candidateDigest = view.proposal.candidateDigest;
+          runCounter++;
+          const key =
+            step.idempotencyKey ??
+            `gap-${step.consumerId}-${targetId}-run${runCounter}`;
+          const rep = await this.client.reportEvidence({
+            proposalId: targetId,
+            candidateDigest,
+            consumerId: step.consumerId ?? "analytics",
+            status: "pass",
+            detail: step.detail ?? "re-verified after topology change",
+            reportedAt: Date.now(),
+            idempotencyKey: key,
+            agentRunId: `gap-run-${runCounter}`,
+          });
+          this.logger.log(
+            `gap evidence for ${step.consumerId} accepted=${rep.accepted} deduped=${rep.deduped}`,
+          );
+          if (!rep.accepted) {
+            throw new Error(
+              `expected gap evidence to be accepted, got ${rep.reason}`,
+            );
+          }
+          break;
+        }
       }
     }
 

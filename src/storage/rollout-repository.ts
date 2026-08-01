@@ -22,10 +22,19 @@ import {
   rollback,
   startRollout,
 } from '../core/rollout.js';
+import {
+  applyGapPause,
+  canResume,
+  computeCoverageGaps,
+  gapConsumerIds,
+  resumeAfterReverification,
+} from '../core/topology.js';
 import type {
   CausalEvent,
+  ConsumerId,
   CreateRolloutInput,
   DecisionSnapshot,
+  PauseReason,
   ProposalId,
   ReceiptInput,
   ReceiptResult,
@@ -45,6 +54,7 @@ interface RolloutRow {
   created_at: number;
   started_at: number | null;
   paused_at: number | null;
+  pause_reason: PauseReason | null;
   finished_at: number | null;
   current_wave_sequence: number;
   previous_version: string | null;
@@ -53,6 +63,7 @@ interface RolloutRow {
   note: string | null;
   snapshot_json: string;
   waves_json: string;
+  gap_consumer_ids: string;
   expected_version: number;
 }
 
@@ -82,6 +93,7 @@ function rowToRollout(
     createdAt: row.created_at,
     startedAt: row.started_at,
     pausedAt: row.paused_at,
+    pauseReason: row.pause_reason,
     finishedAt: row.finished_at,
     currentWaveSequence: row.current_wave_sequence,
     previousVersion: row.previous_version,
@@ -90,6 +102,7 @@ function rowToRollout(
     note: row.note,
     snapshot: JSON.parse(row.snapshot_json),
     waves: JSON.parse(row.waves_json) as Wave[],
+    gapConsumerIds: JSON.parse(row.gap_consumer_ids ?? '[]') as string[],
     receipts: receipts.map((r) => ({
       receiptId: r.receipt_id,
       rolloutId: r.rollout_id,
@@ -155,15 +168,16 @@ export class RolloutRepository {
     this.db
       .prepare(
         `UPDATE rollouts
-         SET status = ?, started_at = ?, paused_at = ?, finished_at = ?, current_wave_sequence = ?,
+         SET status = ?, started_at = ?, paused_at = ?, pause_reason = ?, finished_at = ?, current_wave_sequence = ?,
              previous_version = ?, rollback_target_wave_id = ?, rolled_back_at = ?, note = ?,
-             waves_json = ?, expected_version = expected_version + 1
+             waves_json = ?, gap_consumer_ids = ?, expected_version = expected_version + 1
          WHERE rollout_id = ?`,
       )
       .run(
         rollout.status,
         rollout.startedAt,
         rollout.pausedAt,
+        rollout.pauseReason,
         rollout.finishedAt,
         rollout.currentWaveSequence,
         rollout.previousVersion,
@@ -171,6 +185,7 @@ export class RolloutRepository {
         rollout.rolledBackAt,
         rollout.note,
         JSON.stringify(rollout.waves),
+        JSON.stringify(rollout.gapConsumerIds ?? []),
         rollout.rolloutId,
       );
   }
@@ -267,6 +282,7 @@ export class RolloutRepository {
       createdAt: now,
       startedAt: null,
       pausedAt: null,
+      pauseReason: null,
       finishedAt: null,
       currentWaveSequence: 0,
       previousVersion: input.previousVersion ?? null,
@@ -276,15 +292,16 @@ export class RolloutRepository {
       snapshot,
       waves,
       receipts: [],
+      gapConsumerIds: [],
     };
 
     this.db
       .prepare(
         `INSERT INTO rollouts
-          (rollout_id, proposal_id, topic, status, owner, created_at, started_at, paused_at, finished_at,
+          (rollout_id, proposal_id, topic, status, owner, created_at, started_at, paused_at, pause_reason, finished_at,
            current_wave_sequence, previous_version, rollback_target_wave_id, rolled_back_at, note,
-           snapshot_json, waves_json, expected_version)
-         VALUES (?, ?, ?, 'planned', ?, ?, NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?, ?, 0)`,
+           snapshot_json, waves_json, gap_consumer_ids, expected_version)
+         VALUES (?, ?, ?, 'planned', ?, ?, NULL, NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?, ?, '[]', 0)`,
       )
       .run(
         rolloutId,
@@ -347,13 +364,22 @@ export class RolloutRepository {
   pause(rolloutId: RolloutId, pausedBy: string): StoredRollout {
     const rollout = this.requireById(rolloutId);
     const now = this.clock.now();
-    const { rollout: next } = pauseRollout(rollout, now);
+    if (rollout.status !== 'active') {
+      throw new ConflictError(`cannot pause rollout in status ${rollout.status}`);
+    }
+    const next: StoredRollout = {
+      ...rollout,
+      status: 'paused',
+      pausedAt: now,
+      pauseReason: 'operator',
+    };
     this.db.transaction(() => {
       this.persist(next);
       const current = getCurrentWave(next);
       this.append(next.proposalId, now, 'rollout-paused', {
         rolloutId,
         pausedBy,
+        reason: 'operator',
         atWaveSequence: current?.sequence ?? next.currentWaveSequence,
       });
     })();
@@ -363,16 +389,41 @@ export class RolloutRepository {
   resume(rolloutId: RolloutId, resumedBy: string): StoredRollout {
     const rollout = this.requireById(rolloutId);
     const now = this.clock.now();
+    if (rollout.status !== 'paused') {
+      throw new ConflictError(`cannot resume rollout in status ${rollout.status}`);
+    }
+    if (rollout.pauseReason === 'topology-gap') {
+      const proposal = this.proposals.requireById(rollout.proposalId);
+      const evidence = this.proposals.getEvidence(rollout.proposalId);
+      const gaps = computeCoverageGaps(
+        proposal,
+        proposal.additions ?? [],
+        evidence,
+        now,
+        proposal.ttlMs,
+      );
+      if (!canResume(rollout, gaps, 'operator')) {
+        throw new ConflictError(
+          `cannot resume: coverage gap remains for ${gaps.map((g) => g.consumerId).join(', ')}`,
+        );
+      }
+    }
     const { rollout: next, effects } = resumeRollout(rollout, now);
+    const resumed: StoredRollout = {
+      ...next,
+      pauseReason: null,
+      gapConsumerIds: [],
+    };
     this.db.transaction(() => {
-      this.persist(next);
+      this.persist(resumed);
       this.append(next.proposalId, now, 'rollout-resumed', {
         rolloutId,
         resumedBy,
+        reason: rollout.pauseReason ?? 'operator',
         atWaveSequence: next.currentWaveSequence,
       });
       if (effects.includes('wave-deploying')) {
-        const current = getCurrentWave(next);
+        const current = getCurrentWave(resumed);
         if (current) {
           this.append(next.proposalId, now, 'wave-deploying', {
             rolloutId,
@@ -385,6 +436,104 @@ export class RolloutRepository {
       }
     })();
     return this.requireById(rolloutId);
+  }
+
+  /**
+   * Evaluate a proposal's current coverage against any active rollouts and
+   * auto-pause them if a new required consumer creates a gap for a wave that
+   * has not started. Returns the rollout ids that were paused.
+   */
+  evaluateTopologyPause(proposalId: ProposalId): { paused: RolloutId[]; gapConsumerIds: ConsumerId[] } {
+    const proposal = this.proposals.requireById(proposalId);
+    const evidence = this.proposals.getEvidence(proposalId);
+    const now = this.clock.now();
+    const gaps = computeCoverageGaps(
+      proposal,
+      proposal.additions ?? [],
+      evidence,
+      now,
+      proposal.ttlMs,
+    );
+    const gapIds = gapConsumerIds(gaps);
+    const paused: RolloutId[] = [];
+    if (gaps.length === 0) return { paused, gapConsumerIds: gapIds };
+
+    const active = this.listForProposal(proposalId).filter(
+      (r) => r.status === 'active',
+    );
+    for (const rollout of active) {
+      const next = applyGapPause(rollout, gaps, now);
+      if (next !== rollout) {
+        this.db.transaction(() => {
+          this.persist(next);
+          const current = getCurrentWave(next);
+          this.append(next.proposalId, now, 'rollout-paused', {
+            rolloutId: rollout.rolloutId,
+            pausedBy: 'topology-monitor',
+            reason: 'topology-gap',
+            atWaveSequence: current?.sequence ?? next.currentWaveSequence,
+            gapConsumerIds: gapIds,
+          });
+        })();
+        paused.push(rollout.rolloutId);
+      }
+    }
+    return { paused, gapConsumerIds: gapIds };
+  }
+
+  /**
+   * After a required consumer is re-verified, resume any topology-paused
+   * rollout once all gaps are closed.
+   */
+  evaluateTopologyResume(proposalId: ProposalId): RolloutId[] {
+    const proposal = this.proposals.requireById(proposalId);
+    const evidence = this.proposals.getEvidence(proposalId);
+    const now = this.clock.now();
+    const gaps = computeCoverageGaps(
+      proposal,
+      proposal.additions ?? [],
+      evidence,
+      now,
+      proposal.ttlMs,
+    );
+    const resumed: RolloutId[] = [];
+    if (gaps.length > 0) return resumed;
+
+    const paused = this.listForProposal(proposalId).filter(
+      (r) => r.status === 'paused' && r.pauseReason === 'topology-gap',
+    );
+    for (const rollout of paused) {
+      const next = resumeAfterReverification(rollout, gaps, now);
+      if (!next) continue;
+      this.db.transaction(() => {
+        this.persist(next);
+        this.append(next.proposalId, now, 'rollout-resumed', {
+          rolloutId: rollout.rolloutId,
+          resumedBy: 'topology-monitor',
+          reason: 'topology-gap',
+          atWaveSequence: next.currentWaveSequence,
+        });
+        const current = getCurrentWave(next);
+        if (current && current.status === 'deploying') {
+          this.append(next.proposalId, now, 'wave-deploying', {
+            rolloutId: rollout.rolloutId,
+            waveId: current.waveId,
+            waveSequence: current.sequence,
+            environment: current.environment,
+            attempt: current.attempts,
+          });
+        }
+        if (next.status === 'completed') {
+          this.append(next.proposalId, now, 'rollout-completed', {
+            rolloutId: rollout.rolloutId,
+            waveCount: next.waves.length,
+            candidateDigest: next.snapshot.candidateDigest,
+          });
+        }
+      })();
+      resumed.push(rollout.rolloutId);
+    }
+    return resumed;
   }
 
   retry(

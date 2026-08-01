@@ -45,6 +45,17 @@ export interface LineageLink {
   note: string | null;
 }
 
+export interface RequiredConsumerAddition {
+  consumerId: ConsumerId;
+  addedAt: number;
+  addedBy: string;
+  reason: string;
+  schema: JsonSchema;
+  reverifiedAt: number | null;
+  reverifiedBy: string | null;
+  evidenceId: string | null;
+}
+
 export interface StoredProposal {
   proposalId: ProposalId;
   topic: string;
@@ -54,6 +65,8 @@ export interface StoredProposal {
   baselineDigest: string;
   compatibility: CompatibilityReport;
   consumers: ConsumerRef[];
+  requiredConsumers: ConsumerRef[];
+  additions: RequiredConsumerAddition[];
   author: string;
   status: ProposalStatus;
   createdAt: number;
@@ -223,6 +236,8 @@ export type RolloutStatus =
   | "rolled-back"
   | "failed";
 
+export type PauseReason = "operator" | "topology-gap";
+
 export type WaveStatus =
   | "pending"
   | "deploying"
@@ -287,6 +302,7 @@ export interface StoredRollout {
   createdAt: number;
   startedAt: number | null;
   pausedAt: number | null;
+  pauseReason: PauseReason | null;
   finishedAt: number | null;
   currentWaveSequence: number;
   previousVersion: string | null;
@@ -296,6 +312,7 @@ export interface StoredRollout {
   snapshot: RolloutSnapshot;
   waves: Wave[];
   receipts: ReceiptRecord[];
+  gapConsumerIds: string[];
 }
 
 export interface CreateRolloutInput {
@@ -338,7 +355,9 @@ export type CausalEvent =
   | WaveResultEvent
   | WaveRetriedEvent
   | ReceiptRejectedEvent
-  | RolloutRolledBackEvent;
+  | RolloutRolledBackEvent
+  | TopologyChangedEvent
+  | ReverificationConcludedEvent;
 
 export interface BaseEvent {
   eventId: number;
@@ -488,7 +507,9 @@ export interface RolloutPausedEvent extends BaseEvent {
   payload: {
     rolloutId: RolloutId;
     pausedBy: string;
+    reason: PauseReason;
     atWaveSequence: number;
+    gapConsumerIds?: ConsumerId[];
   };
 }
 
@@ -497,6 +518,7 @@ export interface RolloutResumedEvent extends BaseEvent {
   payload: {
     rolloutId: RolloutId;
     resumedBy: string;
+    reason: PauseReason;
     atWaveSequence: number;
   };
 }
@@ -586,5 +608,32 @@ export interface RolloutRolledBackEvent extends BaseEvent {
     targetWaveId: WaveId | null;
     previousVersion: string | null;
     note: string;
+  };
+}
+
+export interface TopologyChangedEvent extends BaseEvent {
+  eventType: "topology-changed";
+  payload: {
+    consumerId: ConsumerId;
+    addedBy: string;
+    reason: string;
+    snapshotConsumerCount: number;
+    requiredConsumerCount: number;
+    rolloutId: RolloutId | null;
+    rolloutPaused: boolean;
+    gapConsumerIds: ConsumerId[];
+  };
+}
+
+export interface ReverificationConcludedEvent extends BaseEvent {
+  eventType: "reverification-concluded";
+  payload: {
+    consumerId: ConsumerId;
+    reverifiedBy: string;
+    evidenceId: string;
+    candidateDigest: string;
+    rolloutId: RolloutId | null;
+    rolloutResumed: boolean;
+    remainingGapConsumerIds: ConsumerId[];
   };
 }

@@ -87,6 +87,32 @@ export async function registerRoutes(
   );
 
   app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
+    "/api/proposals/:id/required-consumers",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const consumerId = String(body.consumerId ?? "");
+      if (!consumerId) {
+        reply.status(400).send({
+          error: "INVALID_CONSUMER",
+          message: "consumerId is required",
+        });
+        return;
+      }
+      const result = service.addRequiredConsumer({
+        proposalId: req.params.id,
+        consumerId,
+        addedBy: String(body.addedBy ?? "operator"),
+        reason: String(body.reason ?? "new required dependency"),
+        schema:
+          body.schema && typeof body.schema === "object"
+            ? (body.schema as Record<string, unknown>)
+            : { type: "object" },
+      });
+      reply.status(201).send(result);
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
     "/api/proposals/:id/evidence",
     async (req, reply) => {
       const body = req.body ?? {};

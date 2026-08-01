@@ -36,7 +36,9 @@ export interface ScenarioStep {
     | "retry-wave"
     | "rollback-rollout"
     | "expect-rollout-status"
-    | "expect-wave-status";
+    | "expect-wave-status"
+    | "add-required-consumer"
+    | "report-gap-evidence";
   consumerId?: string;
   result?: EvidenceStatus | "success" | "failure" | "unknown";
   detail?: string;

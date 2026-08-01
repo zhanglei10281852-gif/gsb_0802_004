@@ -990,6 +990,204 @@ export function rolloutReceiptLossRecoveryScenario(): Scenario {
   };
 }
 
+export function rolloutTopologyChangeScenario(): Scenario {
+  return {
+    name: "rollout-topology-change",
+    topic: "order.events",
+    baseline,
+    candidate,
+    consumers: [
+      { consumerId: "billing", schema: consumerSchema },
+      { consumerId: "payments", schema: consumerSchema },
+    ],
+    ttlMs: 60000,
+    steps: [
+      { action: "report", consumerId: "billing", result: "pass" },
+      { action: "report", consumerId: "payments", result: "pass" },
+      { action: "decide", kind: "approve", decider: "release-mgr" },
+      {
+        action: "create-rollout",
+        owner: "release-mgr",
+        waves: [
+          { environment: "canary", adapter: "canary-adapter" },
+          { environment: "prod", adapter: "prod-adapter" },
+        ],
+        previousVersion: "v1.4.2",
+        captureRolloutAs: "r1",
+      },
+      {
+        action: "expect-rollout-status",
+        targetRollout: "r1",
+        expectedStatus: "active",
+      },
+
+      {
+        action: "rollout-receipt",
+        targetRollout: "r1",
+        waveSequence: 1,
+        result: "success",
+        idempotencyKey: "canary-ok",
+      },
+      {
+        action: "expect-wave-status",
+        targetRollout: "r1",
+        waveSequence: 2,
+        expectedWaveStatus: "deploying",
+      },
+
+      {
+        action: "add-required-consumer",
+        consumerId: "analytics",
+        author: "platform-oncall",
+        reason: "analytics became required during rollout",
+      },
+      {
+        action: "expect-rollout-status",
+        targetRollout: "r1",
+        expectedStatus: "paused",
+      },
+
+      {
+        action: "rollout-receipt",
+        targetRollout: "r1",
+        waveSequence: 2,
+        result: "success",
+        idempotencyKey: "prod-early",
+        expectAccepted: true,
+        expectDeduped: false,
+      },
+      {
+        action: "expect-wave-status",
+        targetRollout: "r1",
+        waveSequence: 2,
+        expectedWaveStatus: "succeeded",
+      },
+      {
+        action: "expect-rollout-status",
+        targetRollout: "r1",
+        expectedStatus: "paused",
+      },
+
+      {
+        action: "rollout-receipt",
+        targetRollout: "r1",
+        waveSequence: 2,
+        result: "success",
+        idempotencyKey: "prod-early",
+        expectAccepted: true,
+        expectDeduped: true,
+      },
+
+      {
+        action: "report-gap-evidence",
+        consumerId: "analytics",
+        idempotencyKey: "analytics-reverify",
+      },
+      {
+        action: "expect-rollout-status",
+        targetRollout: "r1",
+        expectedStatus: "completed",
+      },
+    ],
+  };
+}
+
+export function rolloutConcurrentReceiptTopologyScenario(): Scenario {
+  return {
+    name: "rollout-concurrent-receipt-topology",
+    topic: "order.events",
+    baseline,
+    candidate,
+    consumers: [
+      { consumerId: "billing", schema: consumerSchema },
+      { consumerId: "payments", schema: consumerSchema },
+    ],
+    ttlMs: 60000,
+    steps: [
+      { action: "report", consumerId: "billing", result: "pass" },
+      { action: "report", consumerId: "payments", result: "pass" },
+      { action: "decide", kind: "approve", decider: "release-mgr" },
+      {
+        action: "create-rollout",
+        owner: "release-mgr",
+        waves: [
+          { environment: "canary", adapter: "canary-adapter" },
+          { environment: "prod", adapter: "prod-adapter" },
+        ],
+        captureRolloutAs: "r1",
+      },
+
+      {
+        action: "rollout-receipt",
+        targetRollout: "r1",
+        waveSequence: 1,
+        result: "success",
+        idempotencyKey: "canary-ok",
+      },
+      {
+        action: "expect-wave-status",
+        targetRollout: "r1",
+        waveSequence: 2,
+        expectedWaveStatus: "deploying",
+      },
+
+      {
+        action: "add-required-consumer",
+        consumerId: "analytics",
+        author: "platform-oncall",
+        reason: "topology change while prod wave is deploying",
+      },
+      {
+        action: "expect-rollout-status",
+        targetRollout: "r1",
+        expectedStatus: "paused",
+      },
+
+      {
+        action: "rollout-receipt",
+        targetRollout: "r1",
+        waveSequence: 2,
+        result: "success",
+        idempotencyKey: "prod-while-paused",
+        expectAccepted: true,
+        expectDeduped: false,
+      },
+      {
+        action: "expect-wave-status",
+        targetRollout: "r1",
+        waveSequence: 2,
+        expectedWaveStatus: "succeeded",
+      },
+      {
+        action: "expect-rollout-status",
+        targetRollout: "r1",
+        expectedStatus: "paused",
+      },
+
+      {
+        action: "rollout-receipt",
+        targetRollout: "r1",
+        waveSequence: 2,
+        result: "success",
+        idempotencyKey: "prod-while-paused",
+        expectAccepted: true,
+        expectDeduped: true,
+      },
+
+      {
+        action: "report-gap-evidence",
+        consumerId: "analytics",
+        idempotencyKey: "analytics-reverify",
+      },
+      {
+        action: "expect-rollout-status",
+        targetRollout: "r1",
+        expectedStatus: "completed",
+      },
+    ],
+  };
+}
+
 export const scenarios: Record<string, () => Scenario> = {
   "happy-path": happyPathScenario,
   "duplicate-evidence": duplicateEvidenceScenario,
@@ -1008,4 +1206,7 @@ export const scenarios: Record<string, () => Scenario> = {
   "rollout-duplicate-out-of-order": rolloutDuplicateOutOfOrderScenario,
   "rollout-pause-retry-rollback": rolloutPauseResumeRollbackScenario,
   "rollout-receipt-loss-recovery": rolloutReceiptLossRecoveryScenario,
+  "rollout-topology-change": rolloutTopologyChangeScenario,
+  "rollout-concurrent-receipt-topology":
+    rolloutConcurrentReceiptTopologyScenario,
 };

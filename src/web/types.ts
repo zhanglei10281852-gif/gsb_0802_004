@@ -39,6 +39,17 @@ export interface LineageLink {
   note: string | null;
 }
 
+export interface RequiredConsumerAddition {
+  consumerId: string;
+  addedAt: number;
+  addedBy: string;
+  reason: string;
+  schema: JsonSchema;
+  reverifiedAt: number | null;
+  reverifiedBy: string | null;
+  evidenceId: string | null;
+}
+
 export interface StoredProposal {
   proposalId: string;
   topic: string;
@@ -48,6 +59,8 @@ export interface StoredProposal {
   baselineDigest: string;
   compatibility: CompatibilityReport;
   consumers: ConsumerRef[];
+  requiredConsumers: ConsumerRef[];
+  additions: RequiredConsumerAddition[];
   author: string;
   status: ProposalStatus;
   createdAt: number;
@@ -241,6 +254,7 @@ export interface StoredRollout {
   createdAt: number;
   startedAt: number | null;
   pausedAt: number | null;
+  pauseReason: "operator" | "topology-gap" | null;
   finishedAt: number | null;
   currentWaveSequence: number;
   previousVersion: string | null;
@@ -250,4 +264,5 @@ export interface StoredRollout {
   snapshot: RolloutSnapshot;
   waves: Wave[];
   receipts: ReceiptRecord[];
+  gapConsumerIds: string[];
 }

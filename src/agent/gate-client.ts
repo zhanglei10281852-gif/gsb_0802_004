@@ -147,7 +147,10 @@ export class GateClient {
       note?: string;
       autoStart?: boolean;
     },
-  ): Promise<{ rollout: import("../web/types").StoredRollout; proposal: StoredProposal }> {
+  ): Promise<{
+    rollout: import("../web/types").StoredRollout;
+    proposal: StoredProposal;
+  }> {
     return this.request(
       "POST",
       `/api/proposals/${encodeURIComponent(proposalId)}/rollouts`,
@@ -158,7 +161,10 @@ export class GateClient {
   async getRollout(
     rolloutId: string,
   ): Promise<import("../web/types").StoredRollout> {
-    return this.request("GET", `/api/rollouts/${encodeURIComponent(rolloutId)}`);
+    return this.request(
+      "GET",
+      `/api/rollouts/${encodeURIComponent(rolloutId)}`,
+    );
   }
 
   async pauseRollout(
@@ -204,6 +210,25 @@ export class GateClient {
       "POST",
       `/api/rollouts/${encodeURIComponent(rolloutId)}/rollback`,
       { rolledBackBy, note },
+    );
+  }
+
+  async addRequiredConsumer(
+    proposalId: string,
+    body: {
+      consumerId: string;
+      addedBy: string;
+      reason: string;
+    },
+  ): Promise<{
+    proposal: StoredProposal;
+    pausedRollouts: string[];
+    gapConsumerIds: string[];
+  }> {
+    return this.request(
+      "POST",
+      `/api/proposals/${encodeURIComponent(proposalId)}/required-consumers`,
+      body,
     );
   }
 

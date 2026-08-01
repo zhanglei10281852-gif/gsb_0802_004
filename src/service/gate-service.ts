@@ -105,6 +105,12 @@ export class GateService {
     if (this.faults.shouldCrashAfterWrite?.("before-evidence-insert")) {
       this.simulateCrash();
     }
+    const before = this.repo.requireById(input.proposalId);
+    const wasReverification =
+      before.status === "approved" &&
+      (before.additions ?? []).some(
+        (a) => a.consumerId === input.consumerId && a.reverifiedAt === null,
+      );
     const result = this.repo.ingestEvidence(input);
     if (!result.accepted) {
       this.publishDrained();
@@ -119,12 +125,99 @@ export class GateService {
       this.simulateCrash();
     }
     this.repo.refreshGateStatus(input.proposalId);
+    let resumedRollouts: string[] = [];
+    if (wasReverification && !result.deduped) {
+      resumedRollouts = this.rollouts.evaluateTopologyResume(
+        input.proposalId,
+      );
+      if (resumedRollouts.length > 0) {
+        this.enrichReverificationEvent(
+          input.proposalId,
+          input.consumerId,
+          resumedRollouts,
+        );
+      }
+    }
     this.publishDrained();
     return {
       accepted: true,
       deduped: result.deduped,
       proposal: this.repo.requireById(input.proposalId),
     };
+  }
+
+  addRequiredConsumer(input: {
+    proposalId: string;
+    consumerId: string;
+    addedBy: string;
+    reason: string;
+    schema?: Record<string, unknown>;
+  }): {
+    proposal: StoredProposal;
+    pausedRollouts: string[];
+    gapConsumerIds: string[];
+  } {
+    const { proposal, addition } = this.repo.addRequiredConsumer({
+      ...input,
+      schema: input.schema ?? { type: "object" },
+    });
+    const { paused, gapConsumerIds } = this.rollouts.evaluateTopologyPause(
+      input.proposalId,
+    );
+    this.enrichTopologyEvent(
+      input.proposalId,
+      addition.consumerId,
+      paused,
+      gapConsumerIds,
+    );
+    this.publishDrained();
+    return {
+      proposal: this.repo.requireById(input.proposalId),
+      pausedRollouts: paused,
+      gapConsumerIds,
+    };
+  }
+
+  private enrichTopologyEvent(
+    proposalId: string,
+    consumerId: string,
+    paused: string[],
+    gapConsumerIds: string[],
+  ): void {
+    const rolloutId = paused[0] ?? null;
+    this.repo.replaceLastEventPayload(
+      proposalId,
+      "topology-changed",
+      (payload) => ({
+        ...payload,
+        rolloutId,
+        rolloutPaused: paused.length > 0,
+        gapConsumerIds,
+        consumerId,
+      }),
+    );
+  }
+
+  private enrichReverificationEvent(
+    proposalId: string,
+    consumerId: string,
+    resumedRollouts: string[],
+  ): void {
+    const proposal = this.repo.requireById(proposalId);
+    const remainingGap = (proposal.additions ?? [])
+      .filter((a) => a.reverifiedAt === null)
+      .map((a) => a.consumerId);
+    this.repo.replaceLastEventPayload(
+      proposalId,
+      "reverification-concluded",
+      (payload) => ({
+        ...payload,
+        consumerId,
+        rolloutId: resumedRollouts[0] ?? null,
+        rolloutResumed: resumedRollouts.length > 0,
+        remainingGapConsumerIds: remainingGap,
+      }),
+    );
   }
 
   private simulateCrash(): never {

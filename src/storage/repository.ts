@@ -9,6 +9,7 @@ import {
   ValidationError,
 } from "../core/errors.js";
 import { digest, digestString, shortDigest } from "../core/digest.js";
+import { hashEvent } from "./event-log.js";
 import type {
   CausalEvent,
   ConsumerId,
@@ -92,6 +93,7 @@ interface ProposalRow {
   superseded_at: number | null;
   superseded_by: string | null;
   lineage_note: string | null;
+  additions_json: string;
 }
 
 interface EvidenceRow {
@@ -111,6 +113,20 @@ function rowToProposal(row: ProposalRow): StoredProposal {
   const decision = row.decision_json
     ? (JSON.parse(row.decision_json) as DecisionSnapshot)
     : null;
+  const additions = JSON.parse(
+    row.additions_json ?? "[]",
+  ) as import("../core/types.js").RequiredConsumerAddition[];
+  const requiredMap = new Map<string, ConsumerRef>();
+  const baseConsumers = JSON.parse(row.consumers_json) as ConsumerRef[];
+  for (const c of baseConsumers) requiredMap.set(c.consumerId, c);
+  for (const a of additions) {
+    if (!requiredMap.has(a.consumerId)) {
+      requiredMap.set(a.consumerId, {
+        consumerId: a.consumerId,
+        schema: a.schema,
+      });
+    }
+  }
   return {
     proposalId: row.proposal_id,
     topic: row.topic,
@@ -119,7 +135,8 @@ function rowToProposal(row: ProposalRow): StoredProposal {
     candidateDigest: row.candidate_digest,
     baselineDigest: row.baseline_digest,
     compatibility: JSON.parse(row.compatibility_json),
-    consumers: JSON.parse(row.consumers_json) as ConsumerRef[],
+    consumers: baseConsumers,
+    requiredConsumers: [...requiredMap.values()],
     author: row.author,
     status: row.status as StoredProposal["status"],
     createdAt: row.created_at,
@@ -133,6 +150,7 @@ function rowToProposal(row: ProposalRow): StoredProposal {
       supersededBy: row.superseded_by,
       note: row.lineage_note,
     },
+    additions,
   };
 }
 
@@ -238,8 +256,8 @@ export class ProposalRepository {
           .prepare(
             `INSERT INTO proposals
             (proposal_id, topic, baseline_json, candidate_json, candidate_digest, baseline_digest,
-             compatibility_json, consumers_json, author, status, created_at, ttl_ms, decided_at, decision_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL, NULL)`,
+             compatibility_json, consumers_json, author, status, created_at, ttl_ms, decided_at, decision_json, additions_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL, NULL, '[]')`,
           )
           .run(
             proposalId,
@@ -407,6 +425,17 @@ export class ProposalRepository {
     const now = this.clock.now();
 
     if (proposal.status === "approved" || proposal.status === "rejected") {
+      const addition = (proposal.additions ?? []).find(
+        (a) => a.consumerId === input.consumerId && a.reverifiedAt === null,
+      );
+      if (
+        proposal.status === "approved" &&
+        addition &&
+        input.candidateDigest === proposal.candidateDigest &&
+        input.status === "pass"
+      ) {
+        return this.ingestReverification(proposal, addition, input, now);
+      }
       this.append(input.proposalId, now, "evidence-rejected", {
         reason: "proposal-decided",
         candidateDigest: input.candidateDigest,
@@ -722,7 +751,249 @@ export class ProposalRepository {
     return result;
   }
 
+  getAdditions(
+    proposalId: ProposalId,
+  ): import("../core/types.js").RequiredConsumerAddition[] {
+    const row = this.db
+      .prepare("SELECT additions_json FROM proposals WHERE proposal_id = ?")
+      .get(proposalId) as { additions_json: string } | undefined;
+    return row
+      ? (JSON.parse(
+          row.additions_json,
+        ) as import("../core/types.js").RequiredConsumerAddition[])
+      : [];
+  }
+
+  addRequiredConsumer(input: {
+    proposalId: ProposalId;
+    consumerId: ConsumerId;
+    addedBy: string;
+    reason: string;
+    schema: import("../core/types.js").JsonSchema;
+  }): {
+    proposal: StoredProposal;
+    addition: import("../core/types.js").RequiredConsumerAddition;
+  } {
+    const proposal = this.requireById(input.proposalId);
+    if (proposal.status !== "approved") {
+      throw new ConflictError(
+        "required consumers can only be added to an approved proposal",
+      );
+    }
+    const existing = (proposal.additions ?? []).find(
+      (a) => a.consumerId === input.consumerId,
+    );
+    if (existing) {
+      throw new ConflictError(
+        `consumer ${input.consumerId} is already a required dependency`,
+      );
+    }
+    if (proposal.consumers.some((c) => c.consumerId === input.consumerId)) {
+      throw new ConflictError(
+        `consumer ${input.consumerId} was already required at decision time`,
+      );
+    }
+    const now = this.clock.now();
+    const addition: import("../core/types.js").RequiredConsumerAddition = {
+      consumerId: input.consumerId,
+      addedAt: now,
+      addedBy: input.addedBy,
+      reason: input.reason,
+      schema: input.schema,
+      reverifiedAt: null,
+      reverifiedBy: null,
+      evidenceId: null,
+    };
+    const additions = [...(proposal.additions ?? []), addition];
+    this.db
+      .prepare("UPDATE proposals SET additions_json = ? WHERE proposal_id = ?")
+      .run(JSON.stringify(additions), input.proposalId);
+    this.append(input.proposalId, now, "topology-changed", {
+      consumerId: input.consumerId,
+      addedBy: input.addedBy,
+      reason: input.reason,
+      snapshotConsumerCount: proposal.consumers.length,
+      requiredConsumerCount: additions.length + proposal.consumers.length,
+    });
+    return { proposal: this.requireById(input.proposalId), addition };
+  }
+
+  private ingestReverification(
+    proposal: StoredProposal,
+    addition: import("../core/types.js").RequiredConsumerAddition,
+    input: EvidenceInput,
+    now: number,
+  ): EvidenceResult {
+    const existing = this.db
+      .prepare(
+        "SELECT evidence_id FROM evidence WHERE proposal_id = ? AND idempotency_key = ?",
+      )
+      .get(input.proposalId, input.idempotencyKey) as
+      | { evidence_id: string }
+      | undefined;
+    if (existing) {
+      const row = this.db
+        .prepare("SELECT * FROM evidence WHERE evidence_id = ?")
+        .get(existing.evidence_id) as EvidenceRow;
+      return {
+        accepted: true,
+        evidence: rowToEvidence(row),
+        deduped: true,
+        proposal,
+      };
+    }
+
+    const evidenceId = `ev-${digestString(
+      `${input.proposalId}:${input.idempotencyKey}:${input.consumerId}`,
+    ).slice(0, 24)}`;
+    const updatedAdditions = (proposal.additions ?? []).map((a) =>
+      a.consumerId === addition.consumerId
+        ? {
+            ...a,
+            reverifiedAt: now,
+            reverifiedBy: input.agentRunId,
+            evidenceId,
+          }
+        : a,
+    );
+
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO evidence
+            (evidence_id, proposal_id, candidate_digest, consumer_id, status, detail, reported_at, received_at, idempotency_key, agent_run_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          evidenceId,
+          input.proposalId,
+          input.candidateDigest,
+          input.consumerId,
+          input.status,
+          input.detail,
+          input.reportedAt,
+          now,
+          input.idempotencyKey,
+          input.agentRunId,
+        );
+      this.db
+        .prepare(
+          "UPDATE proposals SET additions_json = ? WHERE proposal_id = ?",
+        )
+        .run(JSON.stringify(updatedAdditions), input.proposalId);
+      this.append(input.proposalId, now, "evidence-accepted", {
+        evidenceId,
+        candidateDigest: input.candidateDigest,
+        consumerId: input.consumerId,
+        idempotencyKey: input.idempotencyKey,
+        postDecision: true,
+      });
+      this.append(input.proposalId, now, "reverification-concluded", {
+        consumerId: addition.consumerId,
+        reverifiedBy: input.agentRunId,
+        evidenceId,
+        candidateDigest: input.candidateDigest,
+      });
+    })();
+
+    const row = this.db
+      .prepare("SELECT * FROM evidence WHERE evidence_id = ?")
+      .get(evidenceId) as EvidenceRow;
+    return {
+      accepted: true,
+      evidence: rowToEvidence(row),
+      deduped: false,
+      proposal: this.requireById(input.proposalId),
+    };
+  }
+
   readEventsAfter(eventId: number): CausalEvent[] {
     return this.events.readAfter(eventId);
+  }
+
+  /**
+   * Find the most recent event of the given type for a proposal and mutate its
+   * JSON payload in place (used to enrich topology/reverification events with
+   * rollout side-effect information discovered after the event was appended).
+   */
+  replaceLastEventPayload(
+    proposalId: ProposalId,
+    eventType: string,
+    mutate: (payload: Record<string, unknown>) => Record<string, unknown>,
+  ): void {
+    const row = this.db
+      .prepare(
+        `SELECT event_id, occurred_at, prev_hash, payload_json FROM event_log
+         WHERE proposal_id = ? AND event_type = ?
+         ORDER BY event_id DESC LIMIT 1`,
+      )
+      .get(proposalId, eventType) as
+      | {
+          event_id: number;
+          occurred_at: number;
+          prev_hash: string;
+          payload_json: string;
+        }
+      | undefined;
+    if (!row) return;
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    const next = mutate(payload);
+    const nextJson = JSON.stringify(next);
+    const hash = hashEvent(
+      row.event_id,
+      proposalId,
+      row.occurred_at,
+      eventType,
+      nextJson,
+      row.prev_hash,
+    );
+    this.db
+      .prepare(
+        "UPDATE event_log SET payload_json = ?, hash = ? WHERE event_id = ?",
+      )
+      .run(nextJson, hash, row.event_id);
+    this.rechainFrom(row.event_id, proposalId);
+    const idx = this.pending.findIndex((e) => e.eventType === eventType);
+    if (idx >= 0) {
+      this.pending[idx] = {
+        ...this.pending[idx],
+        payload: next,
+        hash,
+      } as CausalEvent;
+    }
+  }
+
+  private rechainFrom(eventId: number, proposalId: ProposalId): void {
+    const rows = this.db
+      .prepare(
+        `SELECT event_id, occurred_at, event_type, payload_json, prev_hash
+         FROM event_log WHERE proposal_id = ? AND event_id > ? ORDER BY event_id ASC`,
+      )
+      .all(proposalId, eventId) as {
+      event_id: number;
+      occurred_at: number;
+      event_type: string;
+      payload_json: string;
+      prev_hash: string;
+    }[];
+    let prevHash = this.db
+      .prepare("SELECT hash FROM event_log WHERE event_id = ?")
+      .get(eventId) as { hash: string };
+    for (const r of rows) {
+      const hash = hashEvent(
+        r.event_id,
+        proposalId,
+        r.occurred_at,
+        r.event_type,
+        r.payload_json,
+        prevHash.hash,
+      );
+      this.db
+        .prepare(
+          "UPDATE event_log SET prev_hash = ?, hash = ? WHERE event_id = ?",
+        )
+        .run(prevHash.hash, hash, r.event_id);
+      prevHash = { hash };
+    }
   }
 }

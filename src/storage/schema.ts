@@ -138,6 +138,16 @@ function migrate(db: DB): void {
   ensureColumn(db, "proposals", "superseded_at", "INTEGER");
   ensureColumn(db, "proposals", "superseded_by", "TEXT");
   ensureColumn(db, "proposals", "lineage_note", "TEXT");
+
+  ensureColumn(db, "proposals", "additions_json", "TEXT NOT NULL DEFAULT '[]'");
+
+  ensureColumn(db, "rollouts", "pause_reason", "TEXT");
+  ensureColumn(
+    db,
+    "rollouts",
+    "gap_consumer_ids",
+    "TEXT NOT NULL DEFAULT '[]'",
+  );
 }
 
 function ensureColumn(
