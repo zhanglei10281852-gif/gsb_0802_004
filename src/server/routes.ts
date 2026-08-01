@@ -1,16 +1,19 @@
-import type { FastifyInstance } from 'fastify';
-import type { GateService } from '../service/gate-service.js';
-import type { EventHub } from './event-hub.js';
-import { DomainError } from '../core/errors.js';
-import type { EvidenceInput } from '../storage/repository.js';
-import type { DecisionKind } from '../core/types.js';
+import type { FastifyInstance } from "fastify";
+import type { GateService } from "../service/gate-service.js";
+import type { EventHub } from "./event-hub.js";
+import { DomainError } from "../core/errors.js";
+import type { EvidenceInput } from "../storage/repository.js";
+import type { DecisionKind } from "../core/types.js";
 
 interface RouteDeps {
   service: GateService;
   hub: EventHub;
 }
 
-export async function registerRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {
+export async function registerRoutes(
+  app: FastifyInstance,
+  deps: RouteDeps,
+): Promise<void> {
   const { service, hub } = deps;
 
   app.setErrorHandler((err, _req, reply) => {
@@ -23,50 +26,64 @@ export async function registerRoutes(app: FastifyInstance, deps: RouteDeps): Pro
       return;
     }
     app.log.error(err);
-    reply.status(500).send({ error: 'INTERNAL', message: err.message });
+    reply.status(500).send({ error: "INTERNAL", message: err.message });
   });
 
-  app.get('/api/health', async () => ({ ok: true, time: Date.now() }));
+  app.get("/api/health", async () => ({ ok: true, time: Date.now() }));
 
-  app.get('/api/proposals', async () => ({ proposals: service.listProposals() }));
+  app.get("/api/proposals", async () => ({
+    proposals: service.listProposals(),
+  }));
 
-  app.post<{ Body: Record<string, unknown> }>('/api/proposals', async (req, reply) => {
-    const body = req.body ?? {};
-    const result = service.submitProposal({
-      topic: String(body.topic ?? ''),
-      baseline: body.baseline as Record<string, unknown>,
-      candidate: body.candidate as Record<string, unknown>,
-      consumers: body.consumers as { consumerId: string; schema: Record<string, unknown> }[],
-      author: String(body.author ?? 'unknown'),
-      ttlMs: Number(body.ttlMs ?? 60000),
-    });
-    reply.status(201).send(result.proposal);
-  });
+  app.post<{ Body: Record<string, unknown> }>(
+    "/api/proposals",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const result = service.submitProposal({
+        topic: String(body.topic ?? ""),
+        baseline: body.baseline as Record<string, unknown>,
+        candidate: body.candidate as Record<string, unknown>,
+        consumers: body.consumers as {
+          consumerId: string;
+          schema: Record<string, unknown>;
+        }[],
+        author: String(body.author ?? "unknown"),
+        ttlMs: Number(body.ttlMs ?? 60000),
+      });
+      reply.status(201).send(result.proposal);
+    },
+  );
 
-  app.get<{ Params: { id: string } }>('/api/proposals/:id', async (req) => {
-    return service.getGateView(req.params.id);
-  });
+  app.get<{ Params: { id: string }; Querystring: { environment?: string } }>(
+    "/api/proposals/:id",
+    async (req) => {
+      return service.getGateView(req.params.id, req.query.environment);
+    },
+  );
 
   app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
-    '/api/proposals/:id/evidence',
+    "/api/proposals/:id/evidence",
     async (req, reply) => {
       const body = req.body ?? {};
       const idempotencyKey = String(
-        req.headers['idempotency-key'] ?? body.idempotencyKey ?? '',
+        req.headers["idempotency-key"] ?? body.idempotencyKey ?? "",
       );
       if (!idempotencyKey) {
-        reply.status(400).send({ error: 'IDEMPOTENCY_KEY_REQUIRED', message: 'provide Idempotency-Key header' });
+        reply.status(400).send({
+          error: "IDEMPOTENCY_KEY_REQUIRED",
+          message: "provide Idempotency-Key header",
+        });
         return;
       }
       const input: EvidenceInput = {
         proposalId: req.params.id,
-        candidateDigest: String(body.candidateDigest ?? ''),
-        consumerId: String(body.consumerId ?? ''),
-        status: body.status as EvidenceInput['status'],
-        detail: String(body.detail ?? ''),
+        candidateDigest: String(body.candidateDigest ?? ""),
+        consumerId: String(body.consumerId ?? ""),
+        status: body.status as EvidenceInput["status"],
+        detail: String(body.detail ?? ""),
         reportedAt: Number(body.reportedAt ?? Date.now()),
         idempotencyKey,
-        agentRunId: String(body.agentRunId ?? 'unknown'),
+        agentRunId: String(body.agentRunId ?? "unknown"),
       };
       const result = service.reportEvidence(input);
       reply.status(result.accepted ? 202 : 409).send({
@@ -79,30 +96,95 @@ export async function registerRoutes(app: FastifyInstance, deps: RouteDeps): Pro
   );
 
   app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
-    '/api/proposals/:id/decision',
+    "/api/proposals/:id/decision",
     async (req, reply) => {
       const body = req.body ?? {};
-      const kind = String(body.kind ?? '') as DecisionKind;
-      if (kind !== 'approve' && kind !== 'reject') {
-        reply.status(400).send({ error: 'INVALID_KIND', message: 'kind must be approve or reject' });
+      const kind = String(body.kind ?? "") as DecisionKind;
+      if (kind !== "approve" && kind !== "reject") {
+        reply.status(400).send({
+          error: "INVALID_KIND",
+          message: "kind must be approve or reject",
+        });
         return;
       }
       const result = service.decide({
         proposalId: req.params.id,
         kind,
-        decider: String(body.decider ?? 'release-manager'),
-        rationale: String(body.rationale ?? ''),
+        decider: String(body.decider ?? "release-manager"),
+        rationale: String(body.rationale ?? ""),
         expectedStatus: body.expectedStatus as string | undefined,
+        environment: body.environment ? String(body.environment) : undefined,
       });
       reply.status(200).send(result.proposal);
     },
   );
 
-  app.get<{ Querystring: { after?: string } }>('/api/events', (req, reply) => {
-    reply.raw.setHeader('Content-Type', 'text/event-stream');
-    reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
-    reply.raw.setHeader('Connection', 'keep-alive');
-    reply.raw.setHeader('X-Accel-Buffering', 'no');
+  app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
+    "/api/proposals/:id/exemptions",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const ttlMs = Number(body.ttlMs ?? 3600000);
+      const record = service.requestExemption({
+        proposalId: req.params.id,
+        consumerId: String(body.consumerId ?? ""),
+        environment: String(body.environment ?? "prod"),
+        direction: String(body.direction ?? "backward") as
+          | "backward"
+          | "forward"
+          | "both",
+        reason: String(body.reason ?? ""),
+        requestedBy: String(body.requestedBy ?? "unknown"),
+        ttlMs,
+      });
+      reply.status(201).send(record);
+    },
+  );
+
+  app.get<{ Params: { id: string } }>(
+    "/api/proposals/:id/exemptions",
+    async (req) => {
+      return { exemptions: service.listExemptions(req.params.id) };
+    },
+  );
+
+  app.post<{
+    Params: { id: string; exemptionId: string };
+    Body: Record<string, unknown>;
+  }>(
+    "/api/proposals/:id/exemptions/:exemptionId/review",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const approved = Boolean(body.approved);
+      const record = service.reviewExemption({
+        exemptionId: req.params.exemptionId,
+        reviewer: String(body.reviewer ?? "unknown"),
+        approved,
+        comment: String(body.comment ?? ""),
+      });
+      reply.status(200).send(record);
+    },
+  );
+
+  app.post<{
+    Params: { id: string; exemptionId: string };
+    Body: Record<string, unknown>;
+  }>(
+    "/api/proposals/:id/exemptions/:exemptionId/revoke",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const record = service.revokeExemption(
+        req.params.exemptionId,
+        String(body.revokedBy ?? "unknown"),
+      );
+      reply.status(200).send(record);
+    },
+  );
+
+  app.get<{ Querystring: { after?: string } }>("/api/events", (req, reply) => {
+    reply.raw.setHeader("Content-Type", "text/event-stream");
+    reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+    reply.raw.setHeader("Connection", "keep-alive");
+    reply.raw.setHeader("X-Accel-Buffering", "no");
     reply.raw.flushHeaders?.();
 
     const after = Number(req.query.after ?? 0);
@@ -116,10 +198,10 @@ export async function registerRoutes(app: FastifyInstance, deps: RouteDeps): Pro
     });
 
     const keepAlive = setInterval(() => {
-      reply.raw.write(': keepalive\n\n');
+      reply.raw.write(": keepalive\n\n");
     }, 15000);
 
-    req.raw.on('close', () => {
+    req.raw.on("close", () => {
       clearInterval(keepAlive);
       unsub();
     });
@@ -127,7 +209,7 @@ export async function registerRoutes(app: FastifyInstance, deps: RouteDeps): Pro
 }
 
 function writeSse(
-  raw: import('node:http').ServerResponse,
+  raw: import("node:http").ServerResponse,
   id: number,
   event: string,
   data: unknown,

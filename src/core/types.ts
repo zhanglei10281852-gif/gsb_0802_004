@@ -4,17 +4,17 @@ export type ConsumerId = string;
 export type ProposalId = string;
 export type EvidenceId = string;
 
-export type EvidenceStatus = 'pass' | 'fail' | 'error';
+export type EvidenceStatus = "pass" | "fail" | "error";
 
 export type ProposalStatus =
-  | 'open'
-  | 'collecting'
-  | 'ready'
-  | 'approved'
-  | 'rejected'
-  | 'superseded';
+  | "open"
+  | "collecting"
+  | "ready"
+  | "approved"
+  | "rejected"
+  | "superseded";
 
-export type DecisionKind = 'approve' | 'reject';
+export type DecisionKind = "approve" | "reject";
 
 export interface ConsumerRef {
   consumerId: ConsumerId;
@@ -50,16 +50,16 @@ export interface StoredProposal {
 export interface CompatibilityViolation {
   path: string;
   kind:
-    | 'required-property-removed'
-    | 'type-narrowed-incompatibly'
-    | 'enum-narrowed'
-    | 'property-added-required'
-    | 'format-removed'
-    | 'minimum-raised'
-    | 'maximum-lowered'
-    | 'min-length-raised'
-    | 'max-length-lowered'
-    | 'additional-properties-restricted';
+    | "required-property-removed"
+    | "type-narrowed-incompatibly"
+    | "enum-narrowed"
+    | "property-added-required"
+    | "format-removed"
+    | "minimum-raised"
+    | "maximum-lowered"
+    | "min-length-raised"
+    | "max-length-lowered"
+    | "additional-properties-restricted";
   message: string;
 }
 
@@ -84,6 +84,59 @@ export interface EvidenceRecord {
   agentRunId: string;
 }
 
+export type ExemptionId = string;
+export type ExemptionDirection = "backward" | "forward" | "both";
+export type ExemptionStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "revoked"
+  | "expired";
+
+export interface ExemptionRequest {
+  proposalId: ProposalId;
+  consumerId: ConsumerId;
+  environment: string;
+  direction: ExemptionDirection;
+  reason: string;
+  expiresAt: number;
+}
+
+export interface ExemptionReview {
+  reviewer: string;
+  reviewedAt: number;
+  approved: boolean;
+  comment: string;
+}
+
+export interface ExemptionRecord {
+  exemptionId: ExemptionId;
+  proposalId: ProposalId;
+  candidateDigest: string;
+  consumerId: ConsumerId;
+  environment: string;
+  direction: ExemptionDirection;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  expiresAt: number;
+  status: ExemptionStatus;
+  reviews: ExemptionReview[];
+  revokedAt: number | null;
+  revokedBy: string | null;
+}
+
+export interface AppliedExemption {
+  exemptionId: ExemptionId;
+  consumerId: ConsumerId;
+  environment: string;
+  direction: ExemptionDirection;
+  requestedBy: string;
+  reviewers: string[];
+  expiresAt: number;
+  reason: string;
+}
+
 export interface DecisionSnapshot {
   proposalId: ProposalId;
   candidateDigest: string;
@@ -97,6 +150,8 @@ export interface DecisionSnapshot {
   failCount: number;
   errorCount: number;
   compatibilityDigest: string;
+  appliedExemptions: AppliedExemption[];
+  exemptionsDigest: string;
   proposalSnapshot: {
     topic: string;
     baseline: JsonSchema;
@@ -113,23 +168,27 @@ export interface GateView {
   evidence: EvidenceRecord[];
   blockers: Blocker[];
   evidenceFreshness: Record<ConsumerId, FreshnessInfo>;
+  exemptions: ExemptionRecord[];
+  appliedExemptions: AppliedExemption[];
+  environment: string;
   eventLog: CausalEvent[];
 }
 
 export interface Blocker {
   code:
-    | 'incompatible-schema'
-    | 'missing-evidence'
-    | 'failing-evidence'
-    | 'stale-evidence'
-    | 'already-decided'
-    | 'candidate-mismatch';
+    | "incompatible-schema"
+    | "missing-evidence"
+    | "failing-evidence"
+    | "stale-evidence"
+    | "already-decided"
+    | "candidate-mismatch";
   message: string;
   consumerId?: ConsumerId;
+  exemptedBy?: ExemptionId;
 }
 
 export interface FreshnessInfo {
-  status: 'fresh' | 'stale' | 'missing';
+  status: "fresh" | "stale" | "missing";
   receivedAt: number | null;
   ageMs: number | null;
   ttlMs: number;
@@ -140,7 +199,11 @@ export type CausalEvent =
   | EvidenceAcceptedEvent
   | EvidenceRejectedEvent
   | GateAdvancedEvent
-  | DecisionRecordedEvent;
+  | DecisionRecordedEvent
+  | ExemptionRequestedEvent
+  | ExemptionApprovedEvent
+  | ExemptionRejectedEvent
+  | ExemptionRevokedEvent;
 
 export interface BaseEvent {
   eventId: number;
@@ -153,7 +216,7 @@ export interface BaseEvent {
 }
 
 export interface ProposalCreatedEvent extends BaseEvent {
-  eventType: 'proposal-created';
+  eventType: "proposal-created";
   payload: {
     topic: string;
     candidateDigest: string;
@@ -163,7 +226,7 @@ export interface ProposalCreatedEvent extends BaseEvent {
 }
 
 export interface EvidenceAcceptedEvent extends BaseEvent {
-  eventType: 'evidence-accepted';
+  eventType: "evidence-accepted";
   payload: {
     evidenceId: EvidenceId;
     candidateDigest: string;
@@ -174,14 +237,14 @@ export interface EvidenceAcceptedEvent extends BaseEvent {
 }
 
 export interface EvidenceRejectedEvent extends BaseEvent {
-  eventType: 'evidence-rejected';
+  eventType: "evidence-rejected";
   payload: {
     reason:
-      | 'duplicate-idempotency-key'
-      | 'candidate-mismatch'
-      | 'unknown-consumer'
-      | 'proposal-decided'
-      | 'invalid-payload';
+      | "duplicate-idempotency-key"
+      | "candidate-mismatch"
+      | "unknown-consumer"
+      | "proposal-decided"
+      | "invalid-payload";
     candidateDigest?: string;
     consumerId?: ConsumerId;
     idempotencyKey?: string;
@@ -189,7 +252,7 @@ export interface EvidenceRejectedEvent extends BaseEvent {
 }
 
 export interface GateAdvancedEvent extends BaseEvent {
-  eventType: 'gate-advanced';
+  eventType: "gate-advanced";
   payload: {
     fromStatus: ProposalStatus;
     toStatus: ProposalStatus;
@@ -198,11 +261,54 @@ export interface GateAdvancedEvent extends BaseEvent {
 }
 
 export interface DecisionRecordedEvent extends BaseEvent {
-  eventType: 'decision-recorded';
+  eventType: "decision-recorded";
   payload: {
     kind: DecisionKind;
     candidateDigest: string;
     decider: string;
     lastEventId: number;
+    appliedExemptionIds: ExemptionId[];
+  };
+}
+
+export interface ExemptionRequestedEvent extends BaseEvent {
+  eventType: "exemption-requested";
+  payload: {
+    exemptionId: ExemptionId;
+    candidateDigest: string;
+    consumerId: ConsumerId;
+    environment: string;
+    direction: ExemptionDirection;
+    requestedBy: string;
+    expiresAt: number;
+    reason: string;
+  };
+}
+
+export interface ExemptionApprovedEvent extends BaseEvent {
+  eventType: "exemption-approved";
+  payload: {
+    exemptionId: ExemptionId;
+    reviewer: string;
+    approvalCount: number;
+    requiredApprovals: number;
+    active: boolean;
+  };
+}
+
+export interface ExemptionRejectedEvent extends BaseEvent {
+  eventType: "exemption-rejected";
+  payload: {
+    exemptionId: ExemptionId;
+    reviewer: string;
+    comment: string;
+  };
+}
+
+export interface ExemptionRevokedEvent extends BaseEvent {
+  eventType: "exemption-revoked";
+  payload: {
+    exemptionId: ExemptionId;
+    revokedBy: string;
   };
 }

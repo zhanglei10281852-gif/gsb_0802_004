@@ -77,10 +77,13 @@ test('fail evidence blocks even when fresh', () => {
   assert.ok(blockers.some((b) => b.code === 'failing-evidence'));
 });
 
-test('incompatible schema blocks', () => {
+test('incompatible schema blocks when not all consumers verified or exempted', () => {
   const bad: CompatibilityReport = { ...compat, compatible: false, violations: [{ path: '', kind: 'minimum-raised', message: 'x' }] };
-  const blockers = computeBlockers(bad, proposal().consumers, [ev('a', 'pass', 900), ev('b', 'pass', 950)], 1000, clock, 'collecting');
-  assert.ok(blockers.some((b) => b.code === 'incompatible-schema'));
+  const withAllPassing = computeBlockers(bad, proposal().consumers, [ev('a', 'pass', 900), ev('b', 'pass', 950)], 1000, clock, 'collecting');
+  assert.equal(withAllPassing.some((b) => b.code === 'incompatible-schema'), false);
+
+  const oneMissing = computeBlockers(bad, proposal().consumers, [ev('a', 'pass', 900)], 1000, clock, 'collecting');
+  assert.ok(oneMissing.some((b) => b.code === 'incompatible-schema'));
 });
 
 test('already-decided proposals are terminal and block further', () => {

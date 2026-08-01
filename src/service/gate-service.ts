@@ -1,8 +1,27 @@
-import type { Clock } from '../core/clock.js';
-import type { DB } from '../storage/schema.js';
-import { ProposalRepository, type EvidenceInput, type DecisionInput } from '../storage/repository.js';
-import type { CausalEvent, GateView, ProposalInput, StoredProposal } from '../core/types.js';
-import { computeBlockers, computeFreshness } from '../core/gate.js';
+import type { Clock } from "../core/clock.js";
+import type { DB } from "../storage/schema.js";
+import {
+  ProposalRepository,
+  type EvidenceInput,
+  type DecisionInput,
+} from "../storage/repository.js";
+import {
+  ExemptionRepository,
+  type RequestExemptionInput,
+  type ReviewExemptionInput,
+} from "../storage/exemption-repository.js";
+import type {
+  CausalEvent,
+  ExemptionRecord,
+  GateView,
+  ProposalInput,
+  StoredProposal,
+} from "../core/types.js";
+import {
+  DEFAULT_ENVIRONMENT,
+  computeFreshness,
+  evaluateGate,
+} from "../core/gate.js";
 
 export interface FaultInjector {
   shouldCrashAfterWrite?(stage: string): boolean;
@@ -18,6 +37,7 @@ export type OnEvent = (event: CausalEvent) => void;
 
 export class GateService {
   readonly repo: ProposalRepository;
+  readonly exemptions: ExemptionRepository;
   constructor(
     private readonly db: DB,
     private readonly clock: Clock,
@@ -25,12 +45,22 @@ export class GateService {
     private readonly onEvent: OnEvent = () => {},
   ) {
     this.repo = new ProposalRepository(db, clock);
+    this.exemptions = new ExemptionRepository(db, clock, this.repo.events);
+    this.repo.setExemptionRepository(this.exemptions);
   }
 
-  submitProposal(input: ProposalInput): { proposal: StoredProposal; event: CausalEvent } {
+  private publishDrained(): void {
+    for (const e of this.repo.drainEvents()) this.onEvent(e);
+    for (const e of this.exemptions.drainEvents()) this.onEvent(e);
+  }
+
+  submitProposal(input: ProposalInput): {
+    proposal: StoredProposal;
+    event: CausalEvent;
+  } {
     const { proposal, event } = this.repo.create(input);
     this.repo.refreshGateStatus(proposal.proposalId);
-    for (const e of this.repo.drainEvents()) this.onEvent(e);
+    this.publishDrained();
     return { proposal: this.repo.requireById(proposal.proposalId), event };
   }
 
@@ -40,19 +70,24 @@ export class GateService {
     reason?: string;
     proposal: StoredProposal;
   } {
-    if (this.faults.shouldCrashAfterWrite?.('before-evidence-insert')) {
+    if (this.faults.shouldCrashAfterWrite?.("before-evidence-insert")) {
       this.simulateCrash();
     }
     const result = this.repo.ingestEvidence(input);
     if (!result.accepted) {
-      for (const e of this.repo.drainEvents()) this.onEvent(e);
-      return { accepted: false, deduped: false, reason: result.reason, proposal: this.repo.requireById(input.proposalId) };
+      this.publishDrained();
+      return {
+        accepted: false,
+        deduped: false,
+        reason: result.reason,
+        proposal: this.repo.requireById(input.proposalId),
+      };
     }
-    if (this.faults.shouldCrashAfterWrite?.('after-evidence-insert')) {
+    if (this.faults.shouldCrashAfterWrite?.("after-evidence-insert")) {
       this.simulateCrash();
     }
     this.repo.refreshGateStatus(input.proposalId);
-    for (const e of this.repo.drainEvents()) this.onEvent(e);
+    this.publishDrained();
     return {
       accepted: true,
       deduped: result.deduped,
@@ -61,34 +96,79 @@ export class GateService {
   }
 
   private simulateCrash(): never {
-    console.error('[fault] injected crash: process exit before response');
+    console.error("[fault] injected crash: process exit before response");
     process.exit(17);
   }
 
-  decide(input: DecisionInput): { proposal: StoredProposal; event: CausalEvent } {
+  decide(input: DecisionInput): {
+    proposal: StoredProposal;
+    event: CausalEvent;
+  } {
     const result = this.repo.decide(input);
-    for (const e of this.repo.drainEvents()) this.onEvent(e);
+    this.publishDrained();
     return { proposal: result.proposal, event: result.event };
   }
 
-  getGateView(proposalId: string): GateView {
+  requestExemption(input: RequestExemptionInput): ExemptionRecord {
+    const record = this.exemptions.request(input);
+    this.repo.refreshGateStatus(input.proposalId, input.environment);
+    this.publishDrained();
+    return record;
+  }
+
+  reviewExemption(input: ReviewExemptionInput): ExemptionRecord {
+    const record = this.exemptions.review(input);
+    this.repo.refreshGateStatus(record.proposalId, record.environment);
+    this.publishDrained();
+    return record;
+  }
+
+  revokeExemption(exemptionId: string, revokedBy: string): ExemptionRecord {
+    const record = this.exemptions.revoke(exemptionId, revokedBy);
+    this.repo.refreshGateStatus(record.proposalId, record.environment);
+    this.publishDrained();
+    return record;
+  }
+
+  listExemptions(proposalId: string): ExemptionRecord[] {
+    return this.exemptions.listForProposal(proposalId);
+  }
+
+  getGateView(
+    proposalId: string,
+    environment: string = DEFAULT_ENVIRONMENT,
+  ): GateView {
     const proposal = this.repo.requireById(proposalId);
     const evidence = this.repo.getEvidence(proposalId);
-    const blockers = computeBlockers(
-      proposal.compatibility,
-      proposal.consumers,
+    const exemptions = this.exemptions.listForProposal(proposalId);
+    const effectiveExemptions =
+      this.exemptions.listEffectiveForProposal(proposalId);
+    const evaluation = evaluateGate({
+      compatibility: proposal.compatibility,
+      consumers: proposal.consumers,
       evidence,
-      proposal.ttlMs,
-      this.clock,
-      proposal.status,
-    );
+      exemptions: effectiveExemptions,
+      ttlMs: proposal.ttlMs,
+      environment,
+      clock: this.clock,
+      currentStatus: proposal.status,
+    });
     const evidenceFreshness = computeFreshness(
       proposal.consumers,
       evidence,
       proposal.ttlMs,
       this.clock,
     );
-    return { proposal, evidence, blockers, evidenceFreshness, eventLog: this.repo.events.readForProposal(proposalId) };
+    return {
+      proposal,
+      evidence,
+      blockers: evaluation.blockers,
+      evidenceFreshness,
+      exemptions,
+      appliedExemptions: evaluation.appliedExemptions,
+      environment,
+      eventLog: this.repo.events.readForProposal(proposalId),
+    };
   }
 
   listProposals(): StoredProposal[] {

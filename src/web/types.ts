@@ -3,14 +3,14 @@ export interface JsonSchema {
 }
 
 export type ProposalStatus =
-  | 'open'
-  | 'collecting'
-  | 'ready'
-  | 'approved'
-  | 'rejected'
-  | 'superseded';
+  | "open"
+  | "collecting"
+  | "ready"
+  | "approved"
+  | "rejected"
+  | "superseded";
 
-export type EvidenceStatus = 'pass' | 'fail' | 'error';
+export type EvidenceStatus = "pass" | "fail" | "error";
 
 export interface CompatibilityViolation {
   path: string;
@@ -67,8 +67,51 @@ export interface Blocker {
   consumerId?: string;
 }
 
+export type ExemptionDirection = "backward" | "forward" | "both";
+export type ExemptionStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "revoked"
+  | "expired";
+
+export interface ExemptionReview {
+  reviewer: string;
+  reviewedAt: number;
+  approved: boolean;
+  comment: string;
+}
+
+export interface ExemptionRecord {
+  exemptionId: string;
+  proposalId: string;
+  candidateDigest: string;
+  consumerId: string;
+  environment: string;
+  direction: ExemptionDirection;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  expiresAt: number;
+  status: ExemptionStatus;
+  reviews: ExemptionReview[];
+  revokedAt: number | null;
+  revokedBy: string | null;
+}
+
+export interface AppliedExemption {
+  exemptionId: string;
+  consumerId: string;
+  environment: string;
+  direction: ExemptionDirection;
+  requestedBy: string;
+  reviewers: string[];
+  expiresAt: number;
+  reason: string;
+}
+
 export interface FreshnessInfo {
-  status: 'fresh' | 'stale' | 'missing';
+  status: "fresh" | "stale" | "missing";
   receivedAt: number | null;
   ageMs: number | null;
   ttlMs: number;
@@ -89,13 +132,16 @@ export interface GateView {
   evidence: EvidenceRecord[];
   blockers: Blocker[];
   evidenceFreshness: Record<string, FreshnessInfo>;
+  exemptions: ExemptionRecord[];
+  appliedExemptions: AppliedExemption[];
+  environment: string;
   eventLog: CausalEvent[];
 }
 
 export interface DecisionSnapshot {
   proposalId: string;
   candidateDigest: string;
-  kind: 'approve' | 'reject';
+  kind: "approve" | "reject";
   decidedAt: number;
   decider: string;
   rationale: string;
@@ -105,6 +151,8 @@ export interface DecisionSnapshot {
   failCount: number;
   errorCount: number;
   compatibilityDigest: string;
+  appliedExemptions: AppliedExemption[];
+  exemptionsDigest: string;
   proposalSnapshot: {
     topic: string;
     baseline: JsonSchema;

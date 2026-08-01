@@ -1,4 +1,4 @@
-import type { GateView, StoredProposal } from './types';
+import type { ExemptionRecord, GateView, StoredProposal } from "./types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -10,24 +10,76 @@ async function json<T>(res: Response): Promise<T> {
 
 export const api = {
   listProposals(): Promise<{ proposals: StoredProposal[] }> {
-    return fetch('/api/proposals').then((r) => json(r));
+    return fetch("/api/proposals").then((r) => json(r));
   },
-  getGateView(id: string): Promise<GateView> {
-    return fetch(`/api/proposals/${encodeURIComponent(id)}`).then((r) => json(r));
+  getGateView(id: string, environment?: string): Promise<GateView> {
+    const qs = environment
+      ? `?environment=${encodeURIComponent(environment)}`
+      : "";
+    return fetch(`/api/proposals/${encodeURIComponent(id)}${qs}`).then((r) =>
+      json(r),
+    );
   },
   createProposal(body: unknown): Promise<StoredProposal> {
-    return fetch('/api/proposals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    return fetch("/api/proposals", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then((r) => json(r));
   },
-  decide(id: string, kind: 'approve' | 'reject', decider: string, rationale: string): Promise<StoredProposal> {
+  decide(
+    id: string,
+    kind: "approve" | "reject",
+    decider: string,
+    rationale: string,
+    environment?: string,
+  ): Promise<StoredProposal> {
     return fetch(`/api/proposals/${encodeURIComponent(id)}/decision`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind, decider, rationale }),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind, decider, rationale, environment }),
     }).then((r) => json(r));
+  },
+  requestExemption(
+    proposalId: string,
+    body: unknown,
+  ): Promise<ExemptionRecord> {
+    return fetch(
+      `/api/proposals/${encodeURIComponent(proposalId)}/exemptions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ).then((r) => json(r));
+  },
+  reviewExemption(
+    proposalId: string,
+    exemptionId: string,
+    body: { reviewer: string; approved: boolean; comment: string },
+  ): Promise<ExemptionRecord> {
+    return fetch(
+      `/api/proposals/${encodeURIComponent(proposalId)}/exemptions/${encodeURIComponent(exemptionId)}/review`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ).then((r) => json(r));
+  },
+  revokeExemption(
+    proposalId: string,
+    exemptionId: string,
+    revokedBy: string,
+  ): Promise<ExemptionRecord> {
+    return fetch(
+      `/api/proposals/${encodeURIComponent(proposalId)}/exemptions/${encodeURIComponent(exemptionId)}/revoke`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revokedBy }),
+      },
+    ).then((r) => json(r));
   },
 };
 
@@ -45,22 +97,22 @@ export function connectEvents(
     if (stopped) return;
     const url = `/api/events?after=${currentId}`;
     es = new EventSource(url);
-    onStateChange('connecting');
+    onStateChange("connecting");
 
-    es.onopen = () => onStateChange('open');
+    es.onopen = () => onStateChange("open");
     es.onmessage = (ev) => {
       const id = Number(ev.lastEventId);
       if (!Number.isNaN(id)) currentId = id;
-      onEvent({ id, type: 'message', data: safeParse(ev.data) });
+      onEvent({ id, type: "message", data: safeParse(ev.data) });
     };
-    es.addEventListener('proposal-created', handler('proposal-created'));
-    es.addEventListener('evidence-accepted', handler('evidence-accepted'));
-    es.addEventListener('evidence-rejected', handler('evidence-rejected'));
-    es.addEventListener('gate-advanced', handler('gate-advanced'));
-    es.addEventListener('decision-recorded', handler('decision-recorded'));
+    es.addEventListener("proposal-created", handler("proposal-created"));
+    es.addEventListener("evidence-accepted", handler("evidence-accepted"));
+    es.addEventListener("evidence-rejected", handler("evidence-rejected"));
+    es.addEventListener("gate-advanced", handler("gate-advanced"));
+    es.addEventListener("decision-recorded", handler("decision-recorded"));
 
     es.onerror = () => {
-      onStateChange('reconnecting');
+      onStateChange("reconnecting");
       es?.close();
       es = null;
       retryTimer = setTimeout(connect, 1500);
@@ -84,7 +136,15 @@ export function connectEvents(
 }
 
 function safeParse(s: string): unknown {
-  try { return JSON.parse(s); } catch { return s; }
+  try {
+    return JSON.parse(s);
+  } catch {
+    return s;
+  }
 }
 
-export type EventSourceState = 'connecting' | 'open' | 'reconnecting' | 'closed';
+export type EventSourceState =
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "closed";

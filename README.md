@@ -37,7 +37,7 @@ A proposal moves `open → collecting → ready → approved/rejected`. It is **
 - every report is **fresh** (age ≤ `ttlMs`, measured against the server clock).
 
 Each blocker carries a machine code (`incompatible-schema`, `missing-evidence`, `failing-evidence`,
-`stale-evidence`) so the workbench can explain *why* a release is blocked.
+`stale-evidence`) so the workbench can explain _why_ a release is blocked.
 
 ### 4. Idempotent evidence ingestion
 
@@ -70,26 +70,55 @@ receives a `409 CONFLICT`. The database is the single source of truth, not in-pr
 ### 8. Causal, hash-chained event log
 
 Every state change (`proposal-created`, `evidence-accepted`, `evidence-rejected`, `gate-advanced`,
-`decision-recorded`) is appended to an append-only `event_log`. Each event's hash commits to the
+`decision-recorded`, `exemption-requested`, `exemption-approved`, `exemption-rejected`,
+`exemption-revoked`) is appended to an append-only `event_log`. Each event's hash commits to the
 previous event's hash (`prev_hash`), forming a tamper-evident chain. The chain can be verified with
 `EventLog.verifyChain(proposalId)`.
+
+### 9. Time-boxed, two-reviewer exemptions (豁免)
+
+A consumer that is temporarily offline during a release window can be covered by a **time-limited
+exemption** instead of blocking the release. Exemptions are deliberately narrow:
+
+- **Exact scope only** — an exemption is bound to one `candidateDigest`, one `consumerId`, one
+  `environment` (e.g. `prod`) and one compatibility `direction` (`backward` | `forward` | `both`).
+  It cannot match a different candidate, consumer or environment.
+- **Two different reviewers must approve** (`REQUIRED_EXEMPTION_APPROVALS = 2`). The requester cannot
+  review their own request, and the same reviewer cannot approve twice. A single rejection makes the
+  exemption `rejected` and final.
+- **Expires or is revoked** — an exemption has an `expiresAt`. Expiry is evaluated against the
+  server clock; expired exemptions no longer contribute to _new_ decisions. An approved exemption can
+  also be explicitly revoked. Expired/rejected/revoked exemptions remain in the audit log.
+- **Never dilutes the candidate digest** — requesting or granting an exemption does not change the
+  baseline/candidate digests or the compatibility report.
+- **Frozen into the decision snapshot** — the set of exemptions _actually applied_ at decision time
+  is stored inside the immutable `DecisionSnapshot.appliedExemptions` (plus an `exemptionsDigest`).
+  An exemption that expires or is revoked **after** a decision cannot retroactively alter that
+  historical snapshot. Revocation after a decision is rejected so the record stays stable.
+
+The workbench shows pending/approved/rejected/revoked/expired exemptions, the two-review workflow, and
+which exemptions were frozen into each decision.
 
 ---
 
 ## Failure & Recovery Boundaries
 
-| Failure | Behavior |
-|---|---|
-| Agent retries a report (duplicate) | Idempotency key → original result, no duplicate row. |
+| Failure                                                  | Behavior                                                                                                                                                                           |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent retries a report (duplicate)                       | Idempotency key → original result, no duplicate row.                                                                                                                               |
 | Server writes evidence, then crashes **before replying** | Write is committed in a SQLite transaction; on restart the evidence is present. Agent retry is deduped. The `crash-after-write` e2e scenario exercises this with a real hard-kill. |
-| Response lost / out-of-order delivery | Idempotency keys + server-assigned `receivedAt` make ordering safe; only the latest evidence per consumer matters, and wrong digests are rejected. |
-| Late report for an old candidate | `candidate-mismatch`, ignored. |
-| Unknown consumer reports | `unknown-consumer`, ignored. |
-| Evidence arrives after a decision | `proposal-decided`, ignored; snapshot is untouched. |
-| Two release managers approve concurrently | Compare-and-swap in SQLite → exactly one wins, other gets 409. |
-| Process restart | All proposals, evidence, decisions and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`. |
-| Clock skew / real-time waiting in tests | The clock is injectable. With `VIRTUAL_CLOCK=1` the server uses a manual clock advanced over `POST /api/debug/clock/advance`, so freshness scenarios run instantly. |
-| Tampering with the event log | Hash chain verification fails. |
+| Response lost / out-of-order delivery                    | Idempotency keys + server-assigned `receivedAt` make ordering safe; only the latest evidence per consumer matters, and wrong digests are rejected.                                 |
+| Late report for an old candidate                         | `candidate-mismatch`, ignored.                                                                                                                                                     |
+| Unknown consumer reports                                 | `unknown-consumer`, ignored.                                                                                                                                                       |
+| Evidence arrives after a decision                        | `proposal-decided`, ignored; snapshot is untouched.                                                                                                                                |
+| Two release managers approve concurrently                | Compare-and-swap in SQLite → exactly one wins, other gets 409.                                                                                                                     |
+| Exemption TTL passes                                     | It is reported as `expired` at read time; it stops gating new decisions but remains in the audit chain.                                                                            |
+| Exemption revoked                                        | Status becomes `revoked`; it stops gating immediately. Revocation after a decision is rejected so the snapshot stays stable.                                                       |
+| Exemption requested for wrong scope/env/candidate        | It stays active in its own scope but never applies to another environment/consumer/candidate.                                                                                      |
+| Same reviewer reviews twice / requester self-reviews     | Rejected with 409; only two _distinct_ approvals count.                                                                                                                            |
+| Process restart                                          | All proposals, evidence, decisions, exemptions and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`.   |
+| Clock skew / real-time waiting in tests                  | The clock is injectable. With `VIRTUAL_CLOCK=1` the server uses a manual clock advanced over `POST /api/debug/clock/advance`, so freshness scenarios run instantly.                |
+| Tampering with the event log                             | Hash chain verification fails.                                                                                                                                                     |
 
 **Transaction boundary:** evidence insert + its event append happen in one SQLite transaction;
 status transition + its event append happen in one transaction; decision row update + its event
@@ -156,14 +185,18 @@ npx vite             # UI on :5173, proxies /api and /events to :3000
 
 ## HTTP API
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/proposals` | Submit baseline + candidate + consumers; returns digest + compatibility. |
-| `GET` | `/api/proposals` | List proposals. |
-| `GET` | `/api/proposals/:id` | Full gate view: proposal, evidence, blockers, freshness, event log. |
-| `POST` | `/api/proposals/:id/evidence` | Agent reports evidence (requires `Idempotency-Key`). |
-| `POST` | `/api/proposals/:id/decision` | `{kind: approve\|reject, decider, rationale}`. Approve requires zero blockers. |
-| `GET` | `/api/events?after=N` | Server-Sent Events; replays events after id `N`, then streams live. |
+| Method | Path                                                | Purpose                                                                                                                                |
+| ------ | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/proposals`                                    | Submit baseline + candidate + consumers; returns digest + compatibility.                                                               |
+| `GET`  | `/api/proposals`                                    | List proposals.                                                                                                                        |
+| `GET`  | `/api/proposals/:id?environment=prod`               | Full gate view: proposal, evidence, blockers, freshness, applied exemptions, event log.                                                |
+| `POST` | `/api/proposals/:id/evidence`                       | Agent reports evidence (requires `Idempotency-Key`).                                                                                   |
+| `POST` | `/api/proposals/:id/decision`                       | `{kind: approve\|reject, decider, rationale, environment?}`. Approve requires zero blockers (exemptions applied for that environment). |
+| `POST` | `/api/proposals/:id/exemptions`                     | Request a scoped, time-boxed exemption (`consumerId, environment, direction, reason, requestedBy, ttlMs`).                             |
+| `GET`  | `/api/proposals/:id/exemptions`                     | List exemptions for a proposal.                                                                                                        |
+| `POST` | `/api/proposals/:id/exemptions/:exemptionId/review` | `{reviewer, approved, comment}`; needs two distinct approvals; requester cannot review.                                                |
+| `POST` | `/api/proposals/:id/exemptions/:exemptionId/revoke` | `{revokedBy}`; revokes an active/pending exemption.                                                                                    |
+| `GET`  | `/api/events?after=N`                               | Server-Sent Events; replays events after id `N`, then streams live.                                                                    |
 
 The web workbench connects to `/api/events`, and on any (re)connect first fetches the authoritative
 `GET /api/proposals/:id` snapshot, then resumes streaming from the last event id — so a reconnect

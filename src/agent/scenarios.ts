@@ -150,6 +150,151 @@ export function unknownConsumerScenario(): Scenario {
   };
 }
 
+export function exemptionApprovedScenario(): Scenario {
+  return {
+    name: 'exemption-approved',
+    topic: 'order.events',
+    baseline,
+    candidate,
+    consumers: [
+      { consumerId: 'billing', schema: consumerSchema },
+      { consumerId: 'payments', schema: consumerSchema },
+    ],
+    ttlMs: 60000,
+    steps: [
+      { action: 'report', consumerId: 'billing', result: 'pass' },
+      { action: 'expect-blockers', minBlockers: 1 },
+      {
+        action: 'request-exemption',
+        consumerId: 'payments',
+        environment: 'prod',
+        direction: 'backward',
+        requestedBy: 'alice',
+        ttlMs: 3600000,
+        captureExemptionAs: 'ex1',
+      },
+      { action: 'expect-blockers', minBlockers: 1 },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'bob', approved: true, comment: 'lgtm' },
+      { action: 'expect-blockers', minBlockers: 1 },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'carol', approved: true, comment: 'agreed' },
+      { action: 'expect-blockers', minBlockers: 0, expectAppliedExemptions: 1 },
+      { action: 'decide', kind: 'approve', decider: 'release-mgr' },
+    ],
+  };
+}
+
+export function exemptionExpiryScenario(): Scenario {
+  return {
+    name: 'exemption-expiry',
+    topic: 'order.events',
+    baseline,
+    candidate,
+    consumers: [{ consumerId: 'billing', schema: consumerSchema }],
+    ttlMs: 60000,
+    steps: [
+      {
+        action: 'request-exemption',
+        consumerId: 'billing',
+        environment: 'prod',
+        direction: 'backward',
+        requestedBy: 'alice',
+        ttlMs: 30000,
+        captureExemptionAs: 'ex1',
+      },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'bob', approved: true },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'carol', approved: true },
+      { action: 'expect-blockers', minBlockers: 0, expectAppliedExemptions: 1 },
+      { action: 'advance-clock', ms: 31000 },
+      { action: 'expect-blockers', minBlockers: 1, expectAppliedExemptions: 0 },
+      { action: 'decide', kind: 'approve', decider: 'release-mgr', expectBlocked: true },
+    ],
+  };
+}
+
+export function exemptionRevokedScenario(): Scenario {
+  return {
+    name: 'exemption-revoked',
+    topic: 'order.events',
+    baseline,
+    candidate,
+    consumers: [{ consumerId: 'billing', schema: consumerSchema }],
+    ttlMs: 60000,
+    steps: [
+      {
+        action: 'request-exemption',
+        consumerId: 'billing',
+        environment: 'prod',
+        direction: 'backward',
+        requestedBy: 'alice',
+        ttlMs: 3600000,
+        captureExemptionAs: 'ex1',
+      },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'bob', approved: true },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'carol', approved: true },
+      { action: 'expect-blockers', minBlockers: 0, expectAppliedExemptions: 1 },
+      { action: 'revoke-exemption', exemptionId: 'ex1', revokedBy: 'bob' },
+      { action: 'expect-blockers', minBlockers: 1, expectAppliedExemptions: 0 },
+      { action: 'decide', kind: 'approve', decider: 'release-mgr', expectBlocked: true },
+    ],
+  };
+}
+
+export function exemptionRejectedScenario(): Scenario {
+  return {
+    name: 'exemption-rejected',
+    topic: 'order.events',
+    baseline,
+    candidate,
+    consumers: [{ consumerId: 'billing', schema: consumerSchema }],
+    ttlMs: 60000,
+    steps: [
+      {
+        action: 'request-exemption',
+        consumerId: 'billing',
+        environment: 'prod',
+        direction: 'backward',
+        requestedBy: 'alice',
+        ttlMs: 3600000,
+        captureExemptionAs: 'ex1',
+      },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'bob', approved: true },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'carol', approved: false, comment: 'risk too high' },
+      { action: 'expect-blockers', minBlockers: 1, expectAppliedExemptions: 0 },
+      { action: 'decide', kind: 'approve', decider: 'release-mgr', expectBlocked: true },
+    ],
+  };
+}
+
+export function exemptionScopeMismatchScenario(): Scenario {
+  return {
+    name: 'exemption-scope-mismatch',
+    topic: 'order.events',
+    baseline,
+    candidate,
+    consumers: [
+      { consumerId: 'billing', schema: consumerSchema },
+      { consumerId: 'payments', schema: consumerSchema },
+    ],
+    ttlMs: 60000,
+    steps: [
+      {
+        action: 'request-exemption',
+        consumerId: 'billing',
+        environment: 'staging',
+        direction: 'backward',
+        requestedBy: 'alice',
+        ttlMs: 3600000,
+        captureExemptionAs: 'ex1',
+      },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'bob', approved: true },
+      { action: 'review-exemption', exemptionId: 'ex1', reviewer: 'carol', approved: true },
+      { action: 'expect-blockers', minBlockers: 2, environment: 'prod', expectAppliedExemptions: 0 },
+      { action: 'report', consumerId: 'payments', result: 'pass' },
+      { action: 'expect-blockers', minBlockers: 1, environment: 'prod', expectAppliedExemptions: 0 },
+    ],
+  };
+}
+
 export const scenarios: Record<string, () => Scenario> = {
   'happy-path': happyPathScenario,
   'duplicate-evidence': duplicateEvidenceScenario,
@@ -157,4 +302,9 @@ export const scenarios: Record<string, () => Scenario> = {
   'crash-after-write': crashAfterWriteScenario,
   'wrong-digest': wrongDigestScenario,
   'unknown-consumer': unknownConsumerScenario,
+  'exemption-approved': exemptionApprovedScenario,
+  'exemption-expiry': exemptionExpiryScenario,
+  'exemption-revoked': exemptionRevokedScenario,
+  'exemption-rejected': exemptionRejectedScenario,
+  'exemption-scope-mismatch': exemptionScopeMismatchScenario,
 };

@@ -1,17 +1,17 @@
-import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export type DB = Database.Database;
 
 export function openDatabase(path: string): DB {
-  if (path !== ':memory:') {
+  if (path !== ":memory:") {
     mkdirSync(dirname(path), { recursive: true });
   }
   const db = new Database(path);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('synchronous = FULL');
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  db.pragma("synchronous = FULL");
   migrate(db);
   return db;
 }
@@ -69,5 +69,24 @@ function migrate(db: DB): void {
       response_json TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS exemptions (
+      exemption_id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL REFERENCES proposals(proposal_id),
+      candidate_digest TEXT NOT NULL,
+      consumer_id TEXT NOT NULL,
+      environment TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      requested_by TEXT NOT NULL,
+      requested_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      reviews_json TEXT NOT NULL,
+      revoked_at INTEGER,
+      revoked_by TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_exemptions_proposal ON exemptions(proposal_id);
+    CREATE INDEX IF NOT EXISTS idx_exemptions_scope ON exemptions(candidate_digest, consumer_id, environment, direction, status);
   `);
 }
