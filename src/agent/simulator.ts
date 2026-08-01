@@ -137,18 +137,34 @@ export class AgentSimulator {
     this.logger.log(
       `created proposal ${proposal.proposalId} status=${proposal.status} compatible=${proposal.compatibility.compatible}`,
     );
-    const proposalId = proposal.proposalId;
+    const capturedProposals = new Map<string, string>();
+    capturedProposals.set("root", proposal.proposalId);
+    let activeProposalId = proposal.proposalId;
+    let activeCandidateDigest = proposal.candidateDigest;
 
     let runCounter = 0;
     const captured = new Map<string, string>();
+
+    const resolveTarget = (step: { targetProposal?: string }): string => {
+      if (step.targetProposal) {
+        return (
+          capturedProposals.get(step.targetProposal) ?? step.targetProposal
+        );
+      }
+      return activeProposalId;
+    };
+
     for (const step of scenario.steps) {
       switch (step.action) {
         case "report": {
           runCounter++;
-          const key = `${step.consumerId}-${proposalId}-run${runCounter}`;
+          const targetId = resolveTarget(step);
+          const key = `${step.consumerId}-${targetId}-run${runCounter}`;
           const digest = step.wrongDigest
             ? "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-            : proposal.candidateDigest;
+            : step.targetProposal === "root"
+              ? proposal.candidateDigest
+              : activeCandidateDigest;
           const consumer = step.unknownConsumer
             ? `${step.consumerId}-unknown`
             : step.consumerId!;
@@ -159,7 +175,7 @@ export class AgentSimulator {
             );
             try {
               await this.client.reportEvidence({
-                proposalId,
+                proposalId: targetId,
                 candidateDigest: digest,
                 consumerId: consumer!,
                 status: step.result ?? "pass",
@@ -176,10 +192,10 @@ export class AgentSimulator {
             this.proc = null;
           } else {
             this.logger.log(
-              `reporting ${step.result} from ${consumer} key=${key}${step.duplicate ? " (will duplicate)" : ""}`,
+              `reporting ${step.result} from ${consumer} key=${key} target=${targetId}${step.duplicate ? " (will duplicate)" : ""}`,
             );
-            await this.client.reportEvidence({
-              proposalId,
+            const rep = await this.client.reportEvidence({
+              proposalId: targetId,
               candidateDigest: digest,
               consumerId: consumer!,
               status: step.result ?? "pass",
@@ -188,9 +204,22 @@ export class AgentSimulator {
               idempotencyKey: key,
               agentRunId: `run-${runCounter}`,
             });
+            if (!rep.accepted) {
+              this.logger.log(
+                `evidence rejected: reason=${rep.reason} (attributed to ${targetId})`,
+              );
+              if (
+                step.expectRejectedReason &&
+                rep.reason !== step.expectRejectedReason
+              ) {
+                throw new Error(
+                  `expected rejection reason ${step.expectRejectedReason}, got ${rep.reason}`,
+                );
+              }
+            }
             if (step.duplicate) {
               const dup = await this.client.reportEvidence({
-                proposalId,
+                proposalId: targetId,
                 candidateDigest: digest,
                 consumerId: consumer!,
                 status: step.result ?? "pass",
@@ -203,6 +232,86 @@ export class AgentSimulator {
                 `duplicate accepted=${dup.accepted} deduped=${dup.deduped}`,
               );
             }
+          }
+          break;
+        }
+        case "create-successor": {
+          const candidate = step.candidate ?? scenario.candidate;
+          const { predecessor, successor } = await this.client.createSuccessor(
+            activeProposalId,
+            {
+              candidate,
+              author: step.author ?? "upstream-author",
+              note: step.note,
+              ttlMs: step.ttlMs,
+            },
+          );
+          if (step.captureProposalAs)
+            capturedProposals.set(step.captureProposalAs, successor.proposalId);
+          activeProposalId = successor.proposalId;
+          activeCandidateDigest = successor.candidateDigest;
+          this.logger.log(
+            `created successor ${successor.proposalId} (digest ${successor.candidateDigest.slice(0, 12)}…); predecessor ${predecessor.proposalId} -> ${predecessor.status}`,
+          );
+          if (predecessor.status !== "superseded") {
+            throw new Error(
+              `expected predecessor to be superseded, got ${predecessor.status}`,
+            );
+          }
+          break;
+        }
+        case "report-to-predecessor": {
+          runCounter++;
+          const predecessorId =
+            (await this.client
+              .getGateView(activeProposalId)
+              .then((v) => v.proposal.lineage.predecessorId)) ??
+            proposal.proposalId;
+          const key = `late-${step.consumerId}-${predecessorId}-run${runCounter}`;
+          this.logger.log(
+            `late report ${step.result} from ${step.consumerId} to PREDECESSOR ${predecessorId}`,
+          );
+          const rep = await this.client.reportEvidence({
+            proposalId: predecessorId,
+            candidateDigest: proposal.candidateDigest,
+            consumerId: step.consumerId!,
+            status: step.result ?? "pass",
+            detail: step.detail ?? "late result for old candidate",
+            reportedAt: Date.now(),
+            idempotencyKey: key,
+            agentRunId: `late-run-${runCounter}`,
+          });
+          this.logger.log(
+            `late report accepted=${rep.accepted} reason=${rep.reason ?? "n/a"}`,
+          );
+          if (rep.accepted) {
+            throw new Error(
+              "expected late evidence to predecessor to be rejected as proposal-superseded",
+            );
+          }
+          if (
+            step.expectRejectedReason &&
+            rep.reason !== step.expectRejectedReason
+          ) {
+            throw new Error(
+              `expected rejection reason ${step.expectRejectedReason}, got ${rep.reason}`,
+            );
+          }
+          break;
+        }
+        case "expect-status": {
+          const targetId = resolveTarget(step);
+          const view = await this.client.getGateView(
+            targetId,
+            step.environment,
+          );
+          this.logger.log(
+            `status of ${targetId}=${view.proposal.status} expected=${step.expectedStatus}`,
+          );
+          if (view.proposal.status !== step.expectedStatus) {
+            throw new Error(
+              `expected status ${step.expectedStatus}, got ${view.proposal.status}`,
+            );
           }
           break;
         }
@@ -227,23 +336,34 @@ export class AgentSimulator {
           this.logger.log("server restarted from SQLite");
           break;
         case "expect-blockers": {
+          const targetId = resolveTarget(step);
           const view = await this.client.getGateView(
-            proposalId,
+            targetId,
             step.environment,
           );
           this.logger.log(
-            `blockers=${view.blockers.length} expected>=${step.minBlockers ?? 0}`,
+            `blockers=${view.blockers.length} expected>=${step.minBlockers ?? 0} on ${targetId}`,
           );
           if (view.blockers.length < (step.minBlockers ?? 0)) {
             throw new Error(
               `expected >=${step.minBlockers} blockers, got ${view.blockers.length}: ${view.blockers.map((b) => b.message).join("; ")}`,
             );
           }
+          if (
+            step.maxBlockers !== undefined &&
+            view.blockers.length > step.maxBlockers
+          ) {
+            throw new Error(
+              `expected <=${step.maxBlockers} blockers, got ${view.blockers.length}`,
+            );
+          }
           if (step.expectAppliedExemptions !== undefined) {
             this.logger.log(
               `applied exemptions=${view.appliedExemptions.length} expected=${step.expectAppliedExemptions}`,
             );
-            if (view.appliedExemptions.length !== step.expectAppliedExemptions) {
+            if (
+              view.appliedExemptions.length !== step.expectAppliedExemptions
+            ) {
               throw new Error(
                 `expected ${step.expectAppliedExemptions} applied exemptions, got ${view.appliedExemptions.length}`,
               );
@@ -252,15 +372,16 @@ export class AgentSimulator {
           break;
         }
         case "decide": {
+          const targetId = resolveTarget(step);
           try {
             const result = await this.client.decide(
-              proposalId,
+              targetId,
               step.kind ?? "approve",
               step.decider ?? "sim",
               "automated",
               step.environment,
             );
-            this.logger.log(`decision ${result.status}`);
+            this.logger.log(`decision ${result.status} on ${targetId}`);
             if (step.expectBlocked) {
               throw new Error(
                 `expected decision to be blocked but it succeeded (${result.status})`,
@@ -274,7 +395,8 @@ export class AgentSimulator {
           break;
         }
         case "request-exemption": {
-          const rec = await this.client.requestExemption(proposalId, {
+          const targetId = resolveTarget(step);
+          const rec = await this.client.requestExemption(targetId, {
             consumerId: step.consumerId!,
             environment: step.environment ?? "prod",
             direction: step.direction ?? "backward",
@@ -285,7 +407,7 @@ export class AgentSimulator {
           if (step.captureExemptionAs)
             captured.set(step.captureExemptionAs, rec.exemptionId);
           this.logger.log(
-            `requested exemption ${rec.exemptionId} status=${rec.status}`,
+            `requested exemption ${rec.exemptionId} status=${rec.status} on ${targetId}`,
           );
           break;
         }
@@ -293,11 +415,15 @@ export class AgentSimulator {
           const exId = step.exemptionId
             ? (captured.get(step.exemptionId) ?? step.exemptionId)
             : (captured.values().next().value as string);
-          const rec = await this.client.reviewExemption(proposalId, exId, {
-            reviewer: step.reviewer ?? "reviewer",
-            approved: step.approved ?? true,
-            comment: step.comment ?? "",
-          });
+          const rec = await this.client.reviewExemption(
+            activeProposalId,
+            exId,
+            {
+              reviewer: step.reviewer ?? "reviewer",
+              approved: step.approved ?? true,
+              comment: step.comment ?? "",
+            },
+          );
           this.logger.log(
             `review by ${step.reviewer} -> status=${rec.status} approvals=${rec.reviews.filter((r) => r.approved).length}`,
           );
@@ -308,7 +434,7 @@ export class AgentSimulator {
             ? (captured.get(step.exemptionId) ?? step.exemptionId)
             : (captured.values().next().value as string);
           const rec = await this.client.revokeExemption(
-            proposalId,
+            activeProposalId,
             exId,
             step.revokedBy ?? step.reviewer ?? "reviewer",
           );
@@ -318,8 +444,8 @@ export class AgentSimulator {
       }
     }
 
-    const finalView = await this.client.getGateView(proposalId);
-    return { proposalId, finalView };
+    const finalView = await this.client.getGateView(activeProposalId);
+    return { proposalId: activeProposalId, finalView };
   }
 }
 

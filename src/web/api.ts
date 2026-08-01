@@ -27,6 +27,24 @@ export const api = {
       body: JSON.stringify(body),
     }).then((r) => json(r));
   },
+  createSuccessor(
+    predecessorId: string,
+    body: {
+      candidate: unknown;
+      author: string;
+      ttlMs?: number;
+      note?: string;
+    },
+  ): Promise<{ predecessor: StoredProposal; successor: StoredProposal }> {
+    return fetch(
+      `/api/proposals/${encodeURIComponent(predecessorId)}/successor`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ).then((r) => json(r));
+  },
   decide(
     id: string,
     kind: "approve" | "reject",
@@ -110,6 +128,11 @@ export function connectEvents(
     es.addEventListener("evidence-rejected", handler("evidence-rejected"));
     es.addEventListener("gate-advanced", handler("gate-advanced"));
     es.addEventListener("decision-recorded", handler("decision-recorded"));
+    es.addEventListener("proposal-superseded", handler("proposal-superseded"));
+    es.addEventListener("exemption-requested", handler("exemption-requested"));
+    es.addEventListener("exemption-approved", handler("exemption-approved"));
+    es.addEventListener("exemption-rejected", handler("exemption-rejected"));
+    es.addEventListener("exemption-revoked", handler("exemption-revoked"));
 
     es.onerror = () => {
       onStateChange("reconnecting");

@@ -255,12 +255,51 @@ export class ExemptionRepository {
     }
 
     this.db.transaction(() => {
-      this.db
-        .prepare('UPDATE exemptions SET status = ?, revoked_at = ?, revoked_by = ? WHERE exemption_id = ?')
-        .run('revoked', now, revokedBy, exemptionId);
-      this.append(row.proposal_id, now, 'exemption-revoked', { exemptionId, revokedBy });
+      this.revokeRow(row, now, revokedBy, 'manual-revocation');
     })();
     return this.getById(exemptionId)!;
+  }
+
+  revokeAllForProposal(
+    proposalId: string,
+    revokedBy: string,
+    reason: string,
+    now: number = this.clock.now(),
+  ): ExemptionRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM exemptions
+         WHERE proposal_id = ? AND status IN ('pending','approved')`,
+      )
+      .all(proposalId) as ExemptionRow[];
+    if (rows.length === 0) return [];
+    const revoked: ExemptionRecord[] = [];
+    this.db.transaction(() => {
+      for (const row of rows) {
+        this.revokeRow(row, now, revokedBy, reason);
+        const rec = this.getById(row.exemption_id);
+        if (rec) revoked.push(rec);
+      }
+    })();
+    return revoked;
+  }
+
+  private revokeRow(
+    row: ExemptionRow,
+    now: number,
+    revokedBy: string,
+    reason: string,
+  ): void {
+    this.db
+      .prepare(
+        'UPDATE exemptions SET status = ?, revoked_at = ?, revoked_by = ? WHERE exemption_id = ?',
+      )
+      .run('revoked', now, revokedBy, row.exemption_id);
+    this.append(row.proposal_id, now, 'exemption-revoked', {
+      exemptionId: row.exemption_id,
+      revokedBy,
+      reason,
+    });
   }
 
   getById(exemptionId: string): ExemptionRecord | null {

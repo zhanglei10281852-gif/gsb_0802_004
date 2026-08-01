@@ -23,6 +23,22 @@ export class GateClient {
     return this.request("POST", "/api/proposals", body);
   }
 
+  async createSuccessor(
+    predecessorId: string,
+    body: {
+      candidate: unknown;
+      author: string;
+      ttlMs?: number;
+      note?: string;
+    },
+  ): Promise<{ predecessor: StoredProposal; successor: StoredProposal }> {
+    return this.request(
+      "POST",
+      `/api/proposals/${encodeURIComponent(predecessorId)}/successor`,
+      body,
+    );
+  }
+
   async getGateView(
     proposalId: string,
     environment?: string,

@@ -20,6 +20,7 @@ import type {
   ProposalId,
   ProposalInput,
   StoredProposal,
+  SuccessorInput,
 } from "../core/types.js";
 import { checkCompatibility } from "../core/compatibility.js";
 import {
@@ -82,6 +83,11 @@ interface ProposalRow {
   decided_at: number | null;
   decision_json: string | null;
   expected_version: number;
+  predecessor_id: string | null;
+  successor_id: string | null;
+  superseded_at: number | null;
+  superseded_by: string | null;
+  lineage_note: string | null;
 }
 
 interface EvidenceRow {
@@ -116,6 +122,13 @@ function rowToProposal(row: ProposalRow): StoredProposal {
     ttlMs: row.ttl_ms,
     decidedAt: row.decided_at,
     decision,
+    lineage: {
+      predecessorId: row.predecessor_id,
+      successorId: row.successor_id,
+      supersededAt: row.superseded_at,
+      supersededBy: row.superseded_by,
+      note: row.lineage_note,
+    },
   };
 }
 
@@ -248,6 +261,113 @@ export class ProposalRepository {
     return tx();
   }
 
+  createSuccessor(
+    predecessorId: ProposalId,
+    input: SuccessorInput,
+  ): {
+    predecessor: StoredProposal;
+    successor: StoredProposal;
+    events: CausalEvent[];
+  } {
+    const predecessor = this.requireById(predecessorId);
+    if (
+      predecessor.status === "approved" ||
+      predecessor.status === "rejected"
+    ) {
+      throw new ProposalAlreadyDecidedError(predecessorId);
+    }
+    if (predecessor.status === "superseded") {
+      throw new ConflictError(
+        `proposal ${predecessorId} is already superseded by ${predecessor.lineage.successorId}`,
+      );
+    }
+
+    const compatibility = checkCompatibility(
+      predecessor.baseline,
+      input.candidate,
+      this.clock,
+    );
+    const now = this.clock.now();
+    const ttlMs = input.ttlMs ?? predecessor.ttlMs;
+    const successorId = `${predecessor.topic}-${shortDigest(input.candidate)}-${shortDigest(
+      { t: now, a: input.author, p: predecessorId },
+    )}`;
+
+    const events: CausalEvent[] = [];
+    const tx = this.db.transaction((): StoredProposal => {
+      this.db
+        .prepare(
+          `INSERT INTO proposals
+            (proposal_id, topic, baseline_json, candidate_json, candidate_digest, baseline_digest,
+             compatibility_json, consumers_json, author, status, created_at, ttl_ms,
+             decided_at, decision_json, predecessor_id, successor_id, superseded_at, superseded_by, lineage_note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?)`,
+        )
+        .run(
+          successorId,
+          predecessor.topic,
+          JSON.stringify(predecessor.baseline),
+          JSON.stringify(input.candidate),
+          compatibility.candidateDigest,
+          compatibility.baselineDigest,
+          JSON.stringify(compatibility),
+          JSON.stringify(predecessor.consumers),
+          input.author,
+          now,
+          ttlMs,
+          predecessorId,
+          input.note ?? null,
+        );
+
+      const updated = this.db
+        .prepare(
+          `UPDATE proposals
+             SET status = 'superseded', successor_id = ?, superseded_at = ?, superseded_by = ?
+           WHERE proposal_id = ? AND status NOT IN ('approved','rejected','superseded')`,
+        )
+        .run(successorId, now, input.author, predecessorId);
+      if (updated.changes === 0) {
+        throw new ConflictError(
+          "concurrent lineage change: predecessor was already decided or superseded",
+        );
+      }
+
+      this.exemptions?.revokeAllForProposal(
+        predecessorId,
+        input.author,
+        "proposal-superseded",
+        now,
+      );
+
+      const createdEvent = this.append(successorId, now, "proposal-created", {
+        topic: predecessor.topic,
+        candidateDigest: compatibility.candidateDigest,
+        baselineDigest: compatibility.baselineDigest,
+        author: input.author,
+      });
+      events.push(createdEvent);
+
+      const supersededEvent = this.append(
+        predecessorId,
+        now,
+        "proposal-superseded",
+        {
+          predecessorId,
+          successorId,
+          candidateDigest: compatibility.candidateDigest,
+          supersededBy: input.author,
+          note: input.note ?? null,
+        },
+      );
+      events.push(supersededEvent);
+
+      return this.getById(successorId)!;
+    });
+
+    const successor = tx();
+    return { predecessor: this.requireById(predecessorId), successor, events };
+  }
+
   getById(proposalId: ProposalId): StoredProposal | null {
     const row = this.db
       .prepare("SELECT * FROM proposals WHERE proposal_id = ?")
@@ -289,6 +409,17 @@ export class ProposalRepository {
         idempotencyKey: input.idempotencyKey,
       });
       return { accepted: false, reason: "proposal-decided" };
+    }
+
+    if (proposal.status === "superseded") {
+      this.append(input.proposalId, now, "evidence-rejected", {
+        reason: "proposal-superseded",
+        candidateDigest: input.candidateDigest,
+        consumerId: input.consumerId,
+        idempotencyKey: input.idempotencyKey,
+        successorId: proposal.lineage.successorId,
+      });
+      return { accepted: false, reason: "proposal-superseded" };
     }
 
     if (input.candidateDigest !== proposal.candidateDigest) {
@@ -403,6 +534,26 @@ export class ProposalRepository {
     blockers: ReturnType<typeof computeBlockers>;
   } {
     const proposal = this.requireById(proposalId);
+    if (
+      proposal.status === "approved" ||
+      proposal.status === "rejected" ||
+      proposal.status === "superseded"
+    ) {
+      return {
+        proposal,
+        changed: false,
+        blockers: computeBlockers(
+          proposal.compatibility,
+          proposal.consumers,
+          this.getEvidence(proposalId),
+          proposal.ttlMs,
+          this.clock,
+          proposal.status,
+          this.getExemptions(proposalId),
+          environment,
+        ),
+      };
+    }
     const evidence = this.getEvidence(proposalId);
     const exemptions = this.getExemptions(proposalId);
     const blockers = computeBlockers(
@@ -454,6 +605,11 @@ export class ProposalRepository {
 
     if (proposal.status === "approved" || proposal.status === "rejected") {
       throw new ProposalAlreadyDecidedError(input.proposalId);
+    }
+    if (proposal.status === "superseded") {
+      throw new ConflictError(
+        `proposal ${input.proposalId} was superseded by ${proposal.lineage.successorId} and can no longer be decided`,
+      );
     }
 
     const environment = input.environment ?? DEFAULT_ENVIRONMENT;

@@ -70,10 +70,10 @@ receives a `409 CONFLICT`. The database is the single source of truth, not in-pr
 ### 8. Causal, hash-chained event log
 
 Every state change (`proposal-created`, `evidence-accepted`, `evidence-rejected`, `gate-advanced`,
-`decision-recorded`, `exemption-requested`, `exemption-approved`, `exemption-rejected`,
-`exemption-revoked`) is appended to an append-only `event_log`. Each event's hash commits to the
-previous event's hash (`prev_hash`), forming a tamper-evident chain. The chain can be verified with
-`EventLog.verifyChain(proposalId)`.
+`decision-recorded`, `proposal-superseded`, `exemption-requested`, `exemption-approved`,
+`exemption-rejected`, `exemption-revoked`) is appended to an append-only `event_log`. Each event's hash
+commits to the previous event's hash (`prev_hash`), forming a tamper-evident chain. The chain can be
+verified with `EventLog.verifyChain(proposalId)`.
 
 ### 9. Time-boxed, two-reviewer exemptions (豁免)
 
@@ -99,26 +99,63 @@ exemption** instead of blocking the release. Exemptions are deliberately narrow:
 The workbench shows pending/approved/rejected/revoked/expired exemptions, the two-review workflow, and
 which exemptions were frozen into each decision.
 
+### 10. Proposal lineage & successors
+
+While a proposal waits for verification, upstream may revise the candidate. Instead of mutating the
+open proposal (which would invalidate its evidence under a new digest), the operator creates a
+**successor** from the current proposal:
+
+`POST /api/proposals/:id/successor` with `{ candidate, author, ttlMs?, note? }`.
+
+The operation runs in **one SQLite transaction** and produces a clear lineage:
+
+- **New candidate digest** — the successor recomputes the digest from the revised schema, so it is a
+  distinct candidate even if the topic and consumer names are identical.
+- **No evidence or exemptions carry over** — evidence and exemptions are keyed by `proposal_id`; the
+  successor gets a brand-new id, so its evidence and exemption sets start empty. A matching consumer
+  **name** is never enough to inherit a prior result.
+- **Predecessor is atomically superseded** — the old proposal becomes `superseded` (a compare-and-swap
+  guards against a concurrent decision), linked to the successor via `successor_id` / `predecessor_id`,
+  with `superseded_at`, `superseded_by` and a `note`.
+- **Prior exemptions are revoked by their exact scope** — all `pending`/`approved` exemptions on the
+  predecessor are revoked (`exemption-revoked`, reason `proposal-superseded`). They were bound to the
+  old candidate digest, so they cannot apply to the successor; revoking them closes them on the old
+  proposal and keeps the audit chain explicit.
+- **Late/old results stay with the original** — a build result that arrives for the old proposal after
+  supersession is rejected with `proposal-superseded` and recorded as an `evidence-rejected` event on
+  that **predecessor** (the payload carries `successorId`). It is never written to, and can never
+  release, the successor. The successor remains blocked until its **own** evidence arrives.
+- A `proposal-superseded` event records the causal replacement on the predecessor's chain; the
+  successor's chain opens with `proposal-created`. Both chains verify independently.
+
+A `superseded` proposal is terminal: it cannot be decided or superseded again, and an
+`approved`/`rejected` predecessor cannot be superseded (its immutable snapshot is preserved). The
+workbench shows predecessor/successor navigation, a superseded banner explaining the isolation rules,
+and a "create successor" form pre-filled with the current candidate.
+
 ---
 
 ## Failure & Recovery Boundaries
 
-| Failure                                                  | Behavior                                                                                                                                                                           |
-| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent retries a report (duplicate)                       | Idempotency key → original result, no duplicate row.                                                                                                                               |
-| Server writes evidence, then crashes **before replying** | Write is committed in a SQLite transaction; on restart the evidence is present. Agent retry is deduped. The `crash-after-write` e2e scenario exercises this with a real hard-kill. |
-| Response lost / out-of-order delivery                    | Idempotency keys + server-assigned `receivedAt` make ordering safe; only the latest evidence per consumer matters, and wrong digests are rejected.                                 |
-| Late report for an old candidate                         | `candidate-mismatch`, ignored.                                                                                                                                                     |
-| Unknown consumer reports                                 | `unknown-consumer`, ignored.                                                                                                                                                       |
-| Evidence arrives after a decision                        | `proposal-decided`, ignored; snapshot is untouched.                                                                                                                                |
-| Two release managers approve concurrently                | Compare-and-swap in SQLite → exactly one wins, other gets 409.                                                                                                                     |
-| Exemption TTL passes                                     | It is reported as `expired` at read time; it stops gating new decisions but remains in the audit chain.                                                                            |
-| Exemption revoked                                        | Status becomes `revoked`; it stops gating immediately. Revocation after a decision is rejected so the snapshot stays stable.                                                       |
-| Exemption requested for wrong scope/env/candidate        | It stays active in its own scope but never applies to another environment/consumer/candidate.                                                                                      |
-| Same reviewer reviews twice / requester self-reviews     | Rejected with 409; only two _distinct_ approvals count.                                                                                                                            |
-| Process restart                                          | All proposals, evidence, decisions, exemptions and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`.   |
-| Clock skew / real-time waiting in tests                  | The clock is injectable. With `VIRTUAL_CLOCK=1` the server uses a manual clock advanced over `POST /api/debug/clock/advance`, so freshness scenarios run instantly.                |
-| Tampering with the event log                             | Hash chain verification fails.                                                                                                                                                     |
+| Failure                                                  | Behavior                                                                                                                                                                                                    |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent retries a report (duplicate)                       | Idempotency key → original result, no duplicate row.                                                                                                                                                        |
+| Server writes evidence, then crashes **before replying** | Write is committed in a SQLite transaction; on restart the evidence is present. Agent retry is deduped. The `crash-after-write` e2e scenario exercises this with a real hard-kill.                          |
+| Response lost / out-of-order delivery                    | Idempotency keys + server-assigned `receivedAt` make ordering safe; only the latest evidence per consumer matters, and wrong digests are rejected.                                                          |
+| Late report for an old candidate                         | `candidate-mismatch`, ignored.                                                                                                                                                                              |
+| Unknown consumer reports                                 | `unknown-consumer`, ignored.                                                                                                                                                                                |
+| Evidence arrives after a decision                        | `proposal-decided`, ignored; snapshot is untouched.                                                                                                                                                         |
+| Candidate revised while waiting                          | Create a successor (`POST /api/proposals/:id/successor`); old proposal is atomically `superseded`, its exemptions revoked, and the successor starts with a new digest and no inherited evidence/exemptions. |
+| Late/old build result arrives after supersession         | `proposal-superseded`, recorded on the **predecessor** (with `successorId`); it is never written to and cannot release the successor.                                                                       |
+| Concurrently deciding and superseding a proposal         | Compare-and-swap: either the decision wins (then supersession is rejected as already-decided) or supersession wins (then deciding the old proposal is rejected as `superseded`) — never both.               |
+| Two release managers approve concurrently                | Compare-and-swap in SQLite → exactly one wins, other gets 409.                                                                                                                                              |
+| Exemption TTL passes                                     | It is reported as `expired` at read time; it stops gating new decisions but remains in the audit chain.                                                                                                     |
+| Exemption revoked                                        | Status becomes `revoked`; it stops gating immediately. Revocation after a decision is rejected so the snapshot stays stable.                                                                                |
+| Exemption requested for wrong scope/env/candidate        | It stays active in its own scope but never applies to another environment/consumer/candidate.                                                                                                               |
+| Same reviewer reviews twice / requester self-reviews     | Rejected with 409; only two _distinct_ approvals count.                                                                                                                                                     |
+| Process restart                                          | All proposals, evidence, decisions, exemptions and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`.                            |
+| Clock skew / real-time waiting in tests                  | The clock is injectable. With `VIRTUAL_CLOCK=1` the server uses a manual clock advanced over `POST /api/debug/clock/advance`, so freshness scenarios run instantly.                                         |
+| Tampering with the event log                             | Hash chain verification fails.                                                                                                                                                                              |
 
 **Transaction boundary:** evidence insert + its event append happen in one SQLite transaction;
 status transition + its event append happen in one transaction; decision row update + its event
@@ -162,9 +199,12 @@ Environment variables: `PORT` (default 3000), `HOST` (default 127.0.0.1), `DB_PA
 npm run e2e
 ```
 
-This runs six real-subprocess scenarios: `happy-path`, `duplicate-evidence`, `stale-evidence`,
-`crash-after-write`, `wrong-digest`, `unknown-consumer`. Each boots the compiled `dist/server/main.js`
-with a virtual clock and drives it over real HTTP.
+This runs thirteen real-subprocess scenarios covering the happy path, duplicate/stale/wrong-digest/
+unknown-consumer evidence, crash-after-write recovery, the two-reviewer exemption lifecycle (approval,
+expiry, revocation, rejection, scope mismatch), and proposal lineage (`lineage-successor` proves
+isolation and late-evidence attribution; `lineage-recovery` proves lineage survives a hard crash and
+restart). Each boots the compiled `dist/server/main.js` with a virtual clock and drives it over real
+HTTP.
 
 ### Run a single simulator scenario manually
 
@@ -185,18 +225,19 @@ npx vite             # UI on :5173, proxies /api and /events to :3000
 
 ## HTTP API
 
-| Method | Path                                                | Purpose                                                                                                                                |
-| ------ | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/api/proposals`                                    | Submit baseline + candidate + consumers; returns digest + compatibility.                                                               |
-| `GET`  | `/api/proposals`                                    | List proposals.                                                                                                                        |
-| `GET`  | `/api/proposals/:id?environment=prod`               | Full gate view: proposal, evidence, blockers, freshness, applied exemptions, event log.                                                |
-| `POST` | `/api/proposals/:id/evidence`                       | Agent reports evidence (requires `Idempotency-Key`).                                                                                   |
-| `POST` | `/api/proposals/:id/decision`                       | `{kind: approve\|reject, decider, rationale, environment?}`. Approve requires zero blockers (exemptions applied for that environment). |
-| `POST` | `/api/proposals/:id/exemptions`                     | Request a scoped, time-boxed exemption (`consumerId, environment, direction, reason, requestedBy, ttlMs`).                             |
-| `GET`  | `/api/proposals/:id/exemptions`                     | List exemptions for a proposal.                                                                                                        |
-| `POST` | `/api/proposals/:id/exemptions/:exemptionId/review` | `{reviewer, approved, comment}`; needs two distinct approvals; requester cannot review.                                                |
-| `POST` | `/api/proposals/:id/exemptions/:exemptionId/revoke` | `{revokedBy}`; revokes an active/pending exemption.                                                                                    |
-| `GET`  | `/api/events?after=N`                               | Server-Sent Events; replays events after id `N`, then streams live.                                                                    |
+| Method | Path                                                | Purpose                                                                                                                                  |
+| ------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/proposals`                                    | Submit baseline + candidate + consumers; returns digest + compatibility.                                                                 |
+| `GET`  | `/api/proposals`                                    | List proposals.                                                                                                                          |
+| `GET`  | `/api/proposals/:id?environment=prod`               | Full gate view: proposal, evidence, blockers, freshness, applied exemptions, event log.                                                  |
+| `POST` | `/api/proposals/:id/successor`                      | Create a successor from a revised `{candidate, author, ttlMs?, note?}`; predecessor is atomically superseded and its exemptions revoked. |
+| `POST` | `/api/proposals/:id/evidence`                       | Agent reports evidence (requires `Idempotency-Key`).                                                                                     |
+| `POST` | `/api/proposals/:id/decision`                       | `{kind: approve\|reject, decider, rationale, environment?}`. Approve requires zero blockers (exemptions applied for that environment).   |
+| `POST` | `/api/proposals/:id/exemptions`                     | Request a scoped, time-boxed exemption (`consumerId, environment, direction, reason, requestedBy, ttlMs`).                               |
+| `GET`  | `/api/proposals/:id/exemptions`                     | List exemptions for a proposal.                                                                                                          |
+| `POST` | `/api/proposals/:id/exemptions/:exemptionId/review` | `{reviewer, approved, comment}`; needs two distinct approvals; requester cannot review.                                                  |
+| `POST` | `/api/proposals/:id/exemptions/:exemptionId/revoke` | `{revokedBy}`; revokes an active/pending exemption.                                                                                      |
+| `GET`  | `/api/events?after=N`                               | Server-Sent Events; replays events after id `N`, then streams live.                                                                      |
 
 The web workbench connects to `/api/events`, and on any (re)connect first fetches the authoritative
 `GET /api/proposals/:id` snapshot, then resumes streaming from the last event id — so a reconnect

@@ -33,7 +33,12 @@ function migrate(db: DB): void {
       ttl_ms INTEGER NOT NULL,
       decided_at INTEGER,
       decision_json TEXT,
-      expected_version INTEGER NOT NULL DEFAULT 0
+      expected_version INTEGER NOT NULL DEFAULT 0,
+      predecessor_id TEXT,
+      successor_id TEXT,
+      superseded_at INTEGER,
+      superseded_by TEXT,
+      lineage_note TEXT
     );
 
     CREATE TABLE IF NOT EXISTS evidence (
@@ -89,4 +94,24 @@ function migrate(db: DB): void {
     CREATE INDEX IF NOT EXISTS idx_exemptions_proposal ON exemptions(proposal_id);
     CREATE INDEX IF NOT EXISTS idx_exemptions_scope ON exemptions(candidate_digest, consumer_id, environment, direction, status);
   `);
+
+  ensureColumn(db, "proposals", "predecessor_id", "TEXT");
+  ensureColumn(db, "proposals", "successor_id", "TEXT");
+  ensureColumn(db, "proposals", "superseded_at", "INTEGER");
+  ensureColumn(db, "proposals", "superseded_by", "TEXT");
+  ensureColumn(db, "proposals", "lineage_note", "TEXT");
+}
+
+function ensureColumn(
+  db: DB,
+  table: string,
+  column: string,
+  type: string,
+): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
+    name: string;
+  }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
 }

@@ -62,6 +62,28 @@ export async function registerRoutes(
   );
 
   app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
+    "/api/proposals/:id/successor",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const candidate = body.candidate;
+      if (!candidate || typeof candidate !== "object") {
+        reply.status(400).send({
+          error: "INVALID_CANDIDATE",
+          message: "a candidate JSON Schema object is required",
+        });
+        return;
+      }
+      const { predecessor, successor } = service.createSuccessor(req.params.id, {
+        candidate: candidate as Record<string, unknown>,
+        author: String(body.author ?? "unknown"),
+        ttlMs: body.ttlMs ? Number(body.ttlMs) : undefined,
+        note: body.note ? String(body.note) : undefined,
+      });
+      reply.status(201).send({ predecessor, successor });
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
     "/api/proposals/:id/evidence",
     async (req, reply) => {
       const body = req.body ?? {};

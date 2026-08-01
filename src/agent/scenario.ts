@@ -25,7 +25,10 @@ export interface ScenarioStep {
     | "sleep-real"
     | "request-exemption"
     | "review-exemption"
-    | "revoke-exemption";
+    | "revoke-exemption"
+    | "create-successor"
+    | "report-to-predecessor"
+    | "expect-status";
   consumerId?: string;
   result?: EvidenceStatus;
   detail?: string;
@@ -36,6 +39,7 @@ export interface ScenarioStep {
   crashAfterWrite?: boolean;
   ms?: number;
   minBlockers?: number;
+  maxBlockers?: number;
   kind?: "approve" | "reject";
   decider?: string;
   expectBlocked?: boolean;
@@ -52,6 +56,13 @@ export interface ScenarioStep {
   captureExemptionAs?: string;
   useExemption?: string;
   expectAppliedExemptions?: number;
+  candidate?: JsonSchema;
+  note?: string;
+  author?: string;
+  captureProposalAs?: string;
+  targetProposal?: string;
+  expectedStatus?: string;
+  expectRejectedReason?: string;
 }
 
 export interface Scenario {

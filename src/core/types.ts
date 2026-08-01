@@ -30,6 +30,21 @@ export interface ProposalInput {
   ttlMs: number;
 }
 
+export interface SuccessorInput {
+  candidate: JsonSchema;
+  author: string;
+  ttlMs?: number;
+  note?: string;
+}
+
+export interface LineageLink {
+  predecessorId: ProposalId | null;
+  successorId: ProposalId | null;
+  supersededAt: number | null;
+  supersededBy: string | null;
+  note: string | null;
+}
+
 export interface StoredProposal {
   proposalId: ProposalId;
   topic: string;
@@ -45,6 +60,7 @@ export interface StoredProposal {
   ttlMs: number;
   decidedAt: number | null;
   decision: DecisionSnapshot | null;
+  lineage: LineageLink;
 }
 
 export interface CompatibilityViolation {
@@ -200,6 +216,7 @@ export type CausalEvent =
   | EvidenceRejectedEvent
   | GateAdvancedEvent
   | DecisionRecordedEvent
+  | ProposalSupersededEvent
   | ExemptionRequestedEvent
   | ExemptionApprovedEvent
   | ExemptionRejectedEvent
@@ -244,10 +261,12 @@ export interface EvidenceRejectedEvent extends BaseEvent {
       | "candidate-mismatch"
       | "unknown-consumer"
       | "proposal-decided"
+      | "proposal-superseded"
       | "invalid-payload";
     candidateDigest?: string;
     consumerId?: ConsumerId;
     idempotencyKey?: string;
+    successorId?: ProposalId;
   };
 }
 
@@ -268,6 +287,17 @@ export interface DecisionRecordedEvent extends BaseEvent {
     decider: string;
     lastEventId: number;
     appliedExemptionIds: ExemptionId[];
+  };
+}
+
+export interface ProposalSupersededEvent extends BaseEvent {
+  eventType: "proposal-superseded";
+  payload: {
+    predecessorId: ProposalId;
+    successorId: ProposalId;
+    candidateDigest: string;
+    supersededBy: string;
+    note: string | null;
   };
 }
 
@@ -310,5 +340,6 @@ export interface ExemptionRevokedEvent extends BaseEvent {
   payload: {
     exemptionId: ExemptionId;
     revokedBy: string;
+    reason: string;
   };
 }

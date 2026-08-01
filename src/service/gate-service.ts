@@ -16,6 +16,7 @@ import type {
   GateView,
   ProposalInput,
   StoredProposal,
+  SuccessorInput,
 } from "../core/types.js";
 import {
   DEFAULT_ENVIRONMENT,
@@ -62,6 +63,22 @@ export class GateService {
     this.repo.refreshGateStatus(proposal.proposalId);
     this.publishDrained();
     return { proposal: this.repo.requireById(proposal.proposalId), event };
+  }
+
+  createSuccessor(
+    predecessorId: string,
+    input: SuccessorInput,
+  ): {
+    predecessor: StoredProposal;
+    successor: StoredProposal;
+  } {
+    const result = this.repo.createSuccessor(predecessorId, input);
+    this.repo.refreshGateStatus(result.successor.proposalId);
+    this.publishDrained();
+    return {
+      predecessor: this.repo.requireById(predecessorId),
+      successor: this.repo.requireById(result.successor.proposalId),
+    };
   }
 
   reportEvidence(input: EvidenceInput): {

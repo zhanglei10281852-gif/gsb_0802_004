@@ -25,6 +25,8 @@ const scenarios = [
   "exemption-revoked",
   "exemption-rejected",
   "exemption-scope-mismatch",
+  "lineage-successor",
+  "lineage-recovery",
 ];
 
 function runScenario(name: string, port: number): Promise<ScenarioResult> {

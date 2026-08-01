@@ -152,6 +152,8 @@ function App(): React.ReactElement {
             <GateDetail
               gate={gate}
               onDecision={() => selectedId && refreshGate(selectedId)}
+              onNavigate={(id) => setSelectedId(id)}
+              onCreated={() => refreshList()}
             />
           ) : (
             <div className="panel empty">
@@ -266,9 +268,13 @@ function CreateForm({
 function GateDetail({
   gate,
   onDecision,
+  onNavigate,
+  onCreated,
 }: {
   gate: GateView;
   onDecision: () => void;
+  onNavigate: (id: string) => void;
+  onCreated: () => void;
 }): React.ReactElement {
   const {
     proposal,
@@ -333,6 +339,13 @@ function GateDetail({
         </div>
         <span className={`badge ${proposal.status}`}>{proposal.status}</span>
       </div>
+
+      <LineageBanner
+        proposal={proposal}
+        onNavigate={onNavigate}
+        onCreated={onCreated}
+        onChange={onDecision}
+      />
 
       {proposal.decision && (
         <div className={`decision-banner ${proposal.decision.kind}`}>
@@ -615,6 +628,166 @@ function GateDetail({
               available.
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LineageBanner({
+  proposal,
+  onNavigate,
+  onCreated,
+  onChange,
+}: {
+  proposal: StoredProposal;
+  onNavigate: (id: string) => void;
+  onCreated: () => void;
+  onChange: () => void;
+}): React.ReactElement {
+  const { lineage } = proposal;
+  const [showForm, setShowForm] = useState(false);
+  const [author, setAuthor] = useState(proposal.author);
+  const [note, setNote] = useState("");
+  const [candidate, setCandidate] = useState(
+    JSON.stringify(proposal.candidate, null, 2),
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const isSuperseded = proposal.status === "superseded";
+  const isClosed =
+    proposal.status === "approved" ||
+    proposal.status === "rejected" ||
+    isSuperseded;
+
+  async function createSuccessor(): Promise<void> {
+    setBusy(true);
+    setError("");
+    try {
+      const parsed = JSON.parse(candidate) as Record<string, unknown>;
+      const { successor } = await api.createSuccessor(proposal.proposalId, {
+        candidate: parsed,
+        author,
+        note: note || undefined,
+      });
+      setShowForm(false);
+      onCreated();
+      onChange();
+      onNavigate(successor.proposalId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="panel"
+      style={{
+        background: isSuperseded ? "#2a1a10" : "var(--panel-2)",
+        border: `1px solid ${isSuperseded ? "var(--amber)" : "var(--border)"}`,
+        margin: "12px 0",
+        padding: 12,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        {lineage.predecessorId && (
+          <button
+            className="secondary"
+            onClick={() => onNavigate(lineage.predecessorId!)}
+          >
+            ← predecessor {lineage.predecessorId.slice(0, 18)}…
+          </button>
+        )}
+        <strong>Lineage</strong>
+        {lineage.successorId ? (
+          <button
+            className="secondary"
+            onClick={() => onNavigate(lineage.successorId!)}
+          >
+            successor {lineage.successorId.slice(0, 18)}… →
+          </button>
+        ) : isClosed ? (
+          <span style={{ color: "var(--muted)", fontSize: 12 }}>
+            {isSuperseded
+              ? `superseded${lineage.supersededBy ? ` by ${lineage.supersededBy}` : ""} — closed, no further successor can be created`
+              : "closed proposal"}
+          </span>
+        ) : (
+          <button className="secondary" onClick={() => setShowForm((v) => !v)}>
+            {showForm ? "Cancel" : "Create successor from revised candidate"}
+          </button>
+        )}
+      </div>
+
+      {isSuperseded && (
+        <div style={{ marginTop: 8, fontSize: 12, color: "var(--amber)" }}>
+          This proposal is superseded and closed. Late verification results
+          that arrive here are recorded as <code>proposal-superseded</code> on
+          this proposal and cannot release the successor. The successor starts
+          with a fresh candidate digest and carries over no evidence or
+          exemptions.
+          {lineage.note && (
+            <div style={{ marginTop: 4, color: "var(--muted)" }}>
+              note: {lineage.note}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showForm && !isClosed && (
+        <div style={{ marginTop: 12 }}>
+          <p style={{ color: "var(--muted)", fontSize: 12, marginTop: 0 }}>
+            A successor recomputes the candidate digest from the revised schema.
+            Existing evidence and exemptions stay with this proposal (their
+            exact scope) and are <strong>not</strong> inherited — even if the
+            consumer names match.
+          </p>
+          <div className="form-row">
+            <div className="field">
+              <label>Author</label>
+              <input
+                value={author}
+                onChange={(e) => setAuthor(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>Note (optional)</label>
+              <input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="why a revised candidate?"
+              />
+            </div>
+          </div>
+          <div className="field">
+            <label>Revised candidate JSON Schema (2020-12)</label>
+            <textarea
+              rows={10}
+              value={candidate}
+              onChange={(e) => setCandidate(e.target.value)}
+            />
+          </div>
+          {error && (
+            <div className="blocker">
+              <span className="code">ERROR</span>
+              {error}
+            </div>
+          )}
+          <div className="actions">
+            <button disabled={busy} onClick={() => void createSuccessor()}>
+              {busy ? "Creating…" : "Create successor & supersede this proposal"}
+            </button>
+          </div>
         </div>
       )}
     </div>

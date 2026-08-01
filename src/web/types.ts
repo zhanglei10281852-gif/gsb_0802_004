@@ -31,6 +31,14 @@ export interface ConsumerRef {
   schema: JsonSchema;
 }
 
+export interface LineageLink {
+  predecessorId: string | null;
+  successorId: string | null;
+  supersededAt: number | null;
+  supersededBy: string | null;
+  note: string | null;
+}
+
 export interface StoredProposal {
   proposalId: string;
   topic: string;
@@ -46,6 +54,7 @@ export interface StoredProposal {
   ttlMs: number;
   decidedAt: number | null;
   decision: DecisionSnapshot | null;
+  lineage: LineageLink;
 }
 
 export interface EvidenceRecord {
