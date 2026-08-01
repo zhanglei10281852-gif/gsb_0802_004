@@ -512,6 +512,64 @@ async function main(): Promise<void> {
     const badRollback = await req('POST', `${BASE}/api/rollouts/${ro7.id}/rollback`, { toWaveOrdinal: 0, by: 'ops' });
     check(badRollback.status === 409, '不能重复回退');
 
+    // ---- 阶段 H：发布期间依赖拓扑变化（覆盖缺口 / 再验证 / 确定结果） ----
+    console.log('[e2e] 阶段 H：依赖拓扑变化链路');
+    const created8 = await req('POST', `${BASE}/api/proposals`, {
+      title: 'order-events v8（拓扑变化）',
+      baseline: BASELINE,
+      candidate: COMPATIBLE_CANDIDATE,
+      consumers: ['billing', 'search'],
+      evidenceTtlMs: TTL_MS,
+    });
+    const p8 = created8.body;
+    for (const c of ['billing', 'search']) {
+      await req('POST', `${BASE}/api/proposals/${p8.id}/evidence`, {
+        consumerId: c, candidateDigest: p8.candidateDigest, verdict: 'pass', runId: `run-${c}-p8`, idempotencyKey: `k8-${c}`,
+      });
+    }
+    const p8Ready = (await req('GET', `${BASE}/api/proposals/${p8.id}`)).body;
+    const dec8 = await req('POST', `${BASE}/api/proposals/${p8.id}/decisions`, {
+      action: 'approve', decidedBy: 'lead-a', expectedVersion: p8Ready.version,
+    });
+    check(dec8.status === 201, 'P8 批准');
+    const snapshotP8 = JSON.stringify(dec8.body.decision.snapshot);
+    const scenarioC = {
+      server: BASE,
+      steps: [
+        { do: 'rollout', proposalId: p8.id, as: 'ro8', by: 'release-lead', waves: [
+          { name: 'w1-预发', environment: 'staging' },
+          { name: 'w2-灰度', environment: 'prod' },
+          { name: 'w3-全量', environment: 'prod' },
+        ] },
+        { do: 'receipt', rollout: 'ro8', wave: 1, result: 'success', key: 'rc8-w1', expectOutcome: 'applied' },
+        { do: 'dependency', proposalId: p8.id, consumer: 'fraud', by: 'arch', reason: '风控接入成为必需依赖' },
+        { do: 'receipt', rollout: 'ro8', wave: 2, result: 'success', key: 'rc8-w2', expectOutcome: 'applied' },
+        { do: 'rolloutControl', rollout: 'ro8', action: 'resume', by: 'ops', expectStatus: 422 },
+        { do: 'revalidate', consumer: 'fraud', verdict: 'pass', key: 'rk8-fraud', loseResponse: true, repeat: 2 },
+        { do: 'rolloutControl', rollout: 'ro8', action: 'resume', by: 'ops', expectStatus: 200 },
+        { do: 'receipt', rollout: 'ro8', wave: 3, result: 'success', key: 'rc8-w3', expectOutcome: 'applied' },
+      ],
+    };
+    const scenarioCPath = path.join(dir, 'scenarioC.json');
+    writeFileSync(scenarioCPath, JSON.stringify(scenarioC, null, 2));
+    check((await runSimulator(scenarioCPath)) === 0, '拓扑变化场景（模拟器）断言通过');
+    const p8After = (await req('GET', `${BASE}/api/proposals/${p8.id}`)).body;
+    check(p8After.consumers.includes('fraud'), 'P8 依赖清单含新消费方');
+    check(p8After.revalidations.length === 1 && p8After.revalidations[0].status === 'passed', '再验证结论在同一提案谱系上可追溯');
+    check(p8After.rollout.status === 'completed' && p8After.rollout.waves.every((w: any) => w.status === 'succeeded'), '缺口关闭后发布完成');
+    check(p8After.rollout.waves[2].startedAt !== null && p8After.rollout.receipts.filter((r: any) => r.receiptKey === 'rk8-fraud').length === 0, '波次边界正确（w3 恢复后启动）');
+    check(JSON.stringify(p8After.decision.snapshot) === snapshotP8, '拓扑变化不改写历史决策快照');
+    const p8EventTypes = p8After.events.map((e: any) => e.type);
+    check(
+      ['DEPENDENCY_ADDED', 'REVALIDATION_REQUIRED', 'REVALIDATION_CONCLUDED', 'WAVE_START_BLOCKED', 'ROLLOUT_PAUSED'].every((t) => p8EventTypes.includes(t)),
+      '拓扑变化因果链事件齐全',
+      p8EventTypes,
+    );
+    check(
+      p8After.events.some((e: any) => e.type === 'ROLLOUT_PAUSED' && e.payload.reason === 'coverage_gap'),
+      '工作台可解释的暂停因果依据（coverage_gap）',
+    );
+
     // ---- 阶段 D：重启恢复与 SSE 重放 ----
     console.log('[e2e] 阶段 D：重启恢复');
     const before = (await req('GET', `${BASE}/api/snapshot`)).body;
@@ -520,7 +578,7 @@ async function main(): Promise<void> {
     server = startServer(dbPath);
     await waitHealthy();
     const after = (await req('GET', `${BASE}/api/snapshot`)).body;
-    check(after.proposals.length === 7, '重启后提案数量完整');
+    check(after.proposals.length === 8, '重启后提案数量完整');
     const p1r = after.proposals.find((p: any) => p.id === p1.id);
     const p2r = after.proposals.find((p: any) => p.id === p2.id);
     const p3r = after.proposals.find((p: any) => p.id === p3.id);
@@ -540,6 +598,9 @@ async function main(): Promise<void> {
     check(p6r?.rollout?.status === 'completed' && p6r?.rollout?.receipts?.length === 6, 'P6 发布完成状态与回执在重启后保留');
     check(p7r?.rollout?.status === 'rolled_back' && p7r?.rollout?.rolledBackTo === 1, 'P7 回退状态在重启后保留');
     check(p7r?.rollout?.receipts?.some((r: any) => r.outcome === 'paused'), '暂停期回执隔离记录在重启后保留');
+    const p8r = after.proposals.find((p: any) => p.id === p8.id);
+    check(p8r?.rollout?.status === 'completed' && p8r?.revalidations[0]?.status === 'passed', 'P8 拓扑变化与再验证结论在重启后保留');
+    check(JSON.stringify(p8r?.decision?.snapshot) === snapshotP8, 'P8 决策快照在重启后一致');
     check(after.eventCursor >= before.eventCursor, '事件游标连续（重启不丢事件）', { before: before.eventCursor, after: after.eventCursor });
     check(p1r.events.length === p1.events.length + 3, '因果事件记录完整（迟到证据 + 迟到隔离 + 替代事件）');
 

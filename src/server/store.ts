@@ -16,10 +16,12 @@ import type {
   Exemption,
   ExemptionDirection,
   ExemptionView,
+  PauseReason,
   ProposalDetail,
   Receipt,
   ReceiptOutcome,
   ReceiptResult,
+  Revalidation,
   Rollout,
   RolloutDetail,
   Wave,
@@ -163,6 +165,7 @@ interface RolloutRow {
   candidate_digest: string;
   status: 'active' | 'paused' | 'completed' | 'rolled_back';
   current_ordinal: number;
+  paused_reason: PauseReason | null;
   created_by: string;
   created_at: number;
   updated_at: number;
@@ -195,6 +198,20 @@ interface ReceiptRow {
   received_at: number;
   applied: number;
   outcome: string;
+}
+
+interface RevalidationRow {
+  id: string;
+  proposal_id: string;
+  candidate_digest: string;
+  consumer_id: string;
+  status: 'pending' | 'passed' | 'failed';
+  reason: string | null;
+  added_by: string;
+  added_at: number;
+  concluded_at: number | null;
+  verdict: 'pass' | 'fail' | null;
+  evidence_key: string | null;
 }
 
 export class Store {
@@ -834,7 +851,32 @@ export class Store {
         const next = this.db
           .prepare('SELECT * FROM waves WHERE rollout_id = ? AND ordinal = ?')
           .get(rolloutId, wave.ordinal + 1) as WaveRow | undefined;
-        if (next) {
+        // 覆盖缺口未关闭：在途波次可以完成，但尚未开始的波次不得启动，发布保持暂停。
+        const gapConsumers = this.openGapConsumers(rollout.proposal_id, rollout.candidate_digest);
+        if (gapConsumers.length > 0) {
+          if (rollout.status !== 'paused' || rollout.paused_reason !== 'coverage_gap') {
+            this.db.prepare(`UPDATE rollouts SET status = 'paused', paused_reason = 'coverage_gap', updated_at = ? WHERE id = ?`).run(now, rolloutId);
+            events.push(
+              this.appendEvent(rollout.proposal_id, 'ROLLOUT_PAUSED', {
+                rolloutId,
+                reason: 'coverage_gap',
+                gapConsumers,
+                waveOrdinal: wave.ordinal,
+              }),
+            );
+          }
+          if (next) {
+            this.db.prepare(`UPDATE rollouts SET current_ordinal = ?, updated_at = ? WHERE id = ?`).run(next.ordinal, now, rolloutId);
+          }
+          events.push(
+            this.appendEvent(rollout.proposal_id, 'WAVE_START_BLOCKED', {
+              rolloutId,
+              waveOrdinal: next ? next.ordinal : null,
+              reason: `覆盖缺口：必需消费方 ${gapConsumers.join('、')} 缺少再验证结论，${next ? `波次 ${next.ordinal} 暂不启动` : '发布暂不完成'}`,
+              gapConsumers,
+            }),
+          );
+        } else if (next) {
           this.db.prepare(`UPDATE waves SET status = 'deploying', started_at = ? WHERE id = ?`).run(now, next.id);
           this.db.prepare(`UPDATE rollouts SET current_ordinal = ?, updated_at = ? WHERE id = ?`).run(wave.ordinal + 1, now, rolloutId);
           events.push(
@@ -852,11 +894,14 @@ export class Store {
         }
       } else {
         // 失败或未知：自动暂停，等待人工重试或回退。
-        this.db.prepare(`UPDATE rollouts SET status = 'paused', updated_at = ? WHERE id = ?`).run(now, rolloutId);
+        this.db
+          .prepare(`UPDATE rollouts SET status = 'paused', paused_reason = ?, updated_at = ? WHERE id = ?`)
+          .run(waveStatus === 'failed' ? 'wave_failed' : 'wave_unknown', now, rolloutId);
         events.push(
           this.appendEvent(rollout.proposal_id, 'ROLLOUT_PAUSED', {
             rolloutId,
-            reason: waveStatus === 'failed' ? `波次 ${wave.ordinal} 部署失败` : `波次 ${wave.ordinal} 结果未知`,
+            reason: waveStatus === 'failed' ? 'wave_failed' : 'wave_unknown',
+            detail: waveStatus === 'failed' ? `波次 ${wave.ordinal} 部署失败` : `波次 ${wave.ordinal} 结果未知`,
             waveOrdinal: wave.ordinal,
           }),
         );
@@ -873,22 +918,59 @@ export class Store {
     const tx = this.db.transaction(() => {
       const r = this.mustGetRolloutRow(id);
       if (r.status !== 'active') throw new StoreError('ROLLOUT_STATE', 409, `发布状态为 ${r.status}，不能暂停`);
-      this.db.prepare(`UPDATE rollouts SET status = 'paused', updated_at = ? WHERE id = ?`).run(this.clock.now(), id);
-      events = [this.appendEvent(r.proposal_id, 'ROLLOUT_PAUSED', { rolloutId: id, by, reason: '人工暂停' })];
+      this.db.prepare(`UPDATE rollouts SET status = 'paused', paused_reason = 'manual', updated_at = ? WHERE id = ?`).run(this.clock.now(), id);
+      events = [this.appendEvent(r.proposal_id, 'ROLLOUT_PAUSED', { rolloutId: id, by, reason: 'manual' })];
     });
     tx();
     this.emit(events);
     return this.getRollout(id)!;
   }
 
+  /**
+   * 恢复发布。覆盖缺口（存在未通过的再验证）未关闭时禁止恢复（422 COVERAGE_GAP）。
+   * 缺口路径下恢复时：全部波次已成功则完成发布；否则启动当前待启动波次。
+   */
   resumeRollout(id: string, by: string): RolloutDetail {
     if (!by) throw new StoreError('BAD_REQUEST', 400, '操作人 by 不能为空');
     let events: DomainEvent[] = [];
     const tx = this.db.transaction(() => {
       const r = this.mustGetRolloutRow(id);
       if (r.status !== 'paused') throw new StoreError('ROLLOUT_STATE', 409, `发布状态为 ${r.status}，不能恢复`);
-      this.db.prepare(`UPDATE rollouts SET status = 'active', updated_at = ? WHERE id = ?`).run(this.clock.now(), id);
-      events = [this.appendEvent(r.proposal_id, 'ROLLOUT_RESUMED', { rolloutId: id, by })];
+      const gapConsumers = this.openGapConsumers(r.proposal_id, r.candidate_digest);
+      if (gapConsumers.length > 0) {
+        throw new StoreError('COVERAGE_GAP', 422, `覆盖缺口未关闭：必需消费方 ${gapConsumers.join('、')} 缺少再验证通过结论`, {
+          revalidations: this.openGapRevalidations(r.proposal_id, r.candidate_digest).map((g) => ({
+            consumerId: g.consumer_id,
+            status: g.status,
+          })),
+        });
+      }
+      const now = this.clock.now();
+      const waves = this.waveRowsFor(id);
+      const allSucceeded = waves.every((w) => w.status === 'succeeded' || w.status === 'rolled_back');
+      if (allSucceeded) {
+        this.db.prepare(`UPDATE rollouts SET status = 'completed', paused_reason = NULL, updated_at = ? WHERE id = ?`).run(now, id);
+        events = [
+          this.appendEvent(r.proposal_id, 'ROLLOUT_RESUMED', { rolloutId: id, by }),
+          this.appendEvent(r.proposal_id, 'ROLLOUT_COMPLETED', { rolloutId: id, waves: waves.length }),
+        ];
+      } else {
+        this.db.prepare(`UPDATE rollouts SET status = 'active', paused_reason = NULL, updated_at = ? WHERE id = ?`).run(now, id);
+        events = [this.appendEvent(r.proposal_id, 'ROLLOUT_RESUMED', { rolloutId: id, by })];
+        const current = waves.find((w) => w.ordinal === r.current_ordinal);
+        if (current && current.status === 'pending') {
+          this.db.prepare(`UPDATE waves SET status = 'deploying', started_at = ? WHERE id = ?`).run(now, current.id);
+          events.push(
+            this.appendEvent(r.proposal_id, 'WAVE_DEPLOYING', {
+              rolloutId: id,
+              waveOrdinal: current.ordinal,
+              name: current.name,
+              environment: current.environment,
+              retry: 0,
+            }),
+          );
+        }
+      }
     });
     tx();
     this.emit(events);
@@ -975,6 +1057,183 @@ export class Store {
     return row ? this.assembleRollout(row) : null;
   }
 
+  // ---- 依赖拓扑变化与再验证 ----
+
+  /**
+   * 声明新的必需消费方（拓扑变化）。
+   * - 历史决策快照不可修改：只更新提案的依赖清单，不触碰 decisions。
+   * - 已批准提案生成待验证的再验证记录（同一提案谱系上可追溯）。
+   * - 若发布仍有尚未开始的波次，则因覆盖缺口自动暂停；在途波次允许完成。
+   */
+  addDependency(proposalId: string, input: { consumerId: string; by: string; reason?: string }): ProposalDetail {
+    this.sweepExpiredExemptions();
+    if (!input.consumerId?.trim()) throw new StoreError('BAD_REQUEST', 400, 'consumerId 不能为空');
+    if (!input.by) throw new StoreError('BAD_REQUEST', 400, '操作人 by 不能为空');
+    const consumerId = input.consumerId.trim();
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const p = this.mustGetRow(proposalId);
+      // 开放提案一旦被替代即封闭，不能再改拓扑；已批准（含已有后继的）提案
+      // 发布可能仍在进行，允许拓扑变化，但只扩展依赖清单，不触碰决策快照。
+      if (p.superseded_by_id !== null && p.status === 'open') {
+        throw new StoreError('PROPOSAL_SUPERSEDED', 409, `提案已被后继 ${p.superseded_by_id} 替代，不能修改依赖拓扑`);
+      }
+      const consumers = JSON.parse(p.consumers_json) as string[];
+      if (consumers.includes(consumerId)) {
+        throw new StoreError('DUPLICATE_CONSUMER', 422, `消费方 ${consumerId} 已是必需依赖`);
+      }
+      const now = this.clock.now();
+      consumers.push(consumerId);
+      this.db.prepare('UPDATE proposals SET consumers_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(consumers), now, proposalId);
+      events = [
+        this.appendEvent(proposalId, 'DEPENDENCY_ADDED', {
+          consumerId,
+          by: input.by,
+          reason: input.reason ?? null,
+          candidateDigest: p.candidate_digest,
+        }),
+      ];
+      if (p.status === 'approved') {
+        const rid = `rv_${randomUUID()}`;
+        this.db
+          .prepare(
+            `INSERT INTO revalidations (id, proposal_id, candidate_digest, consumer_id, status, reason, added_by, added_at,
+               concluded_at, verdict, evidence_key)
+             VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, NULL, NULL, NULL)`,
+          )
+          .run(rid, proposalId, p.candidate_digest, consumerId, input.reason ?? null, input.by, now);
+        events.push(
+          this.appendEvent(proposalId, 'REVALIDATION_REQUIRED', {
+            revalidationId: rid,
+            consumerId,
+            candidateDigest: p.candidate_digest,
+            reason: input.reason ?? null,
+          }),
+        );
+        const rollout = this.db.prepare('SELECT * FROM rollouts WHERE proposal_id = ?').get(proposalId) as RolloutRow | undefined;
+        if (rollout && rollout.status === 'active') {
+          const pendingWaves = this.waveRowsFor(rollout.id).filter((w) => w.status === 'pending');
+          if (pendingWaves.length > 0) {
+            this.db
+              .prepare(`UPDATE rollouts SET status = 'paused', paused_reason = 'coverage_gap', updated_at = ? WHERE id = ?`)
+              .run(now, rollout.id);
+            events.push(
+              this.appendEvent(proposalId, 'ROLLOUT_PAUSED', {
+                rolloutId: rollout.id,
+                reason: 'coverage_gap',
+                consumerId,
+                pendingWaves: pendingWaves.map((w) => w.ordinal),
+                detail: `新必需消费方 ${consumerId} 缺少再验证结论，尚未开始的波次自动暂停`,
+              }),
+            );
+          }
+        }
+      }
+    });
+    tx();
+    this.emit(events);
+    return this.getProposal(proposalId)!;
+  }
+
+  /**
+   * 报送再验证结论（构建代理针对新必需消费方与当前候选）。
+   * 幂等键去重；已有结论后的迟到报送被隔离（closed），结论一旦形成不可改。
+   */
+  concludeRevalidation(
+    id: string,
+    input: { verdict: 'pass' | 'fail'; runId: string; idempotencyKey: string; by?: string },
+  ): { outcome: 'concluded' | 'duplicate' | 'closed'; revalidation: Revalidation } {
+    if (input.verdict !== 'pass' && input.verdict !== 'fail') {
+      throw new StoreError('BAD_REQUEST', 400, 'verdict 必须是 pass 或 fail');
+    }
+    if (!input.runId) throw new StoreError('BAD_REQUEST', 400, 'runId 不能为空');
+    if (!input.idempotencyKey) throw new StoreError('BAD_REQUEST', 400, 'idempotencyKey 不能为空');
+    let result!: { outcome: 'concluded' | 'duplicate' | 'closed'; revalidation: Revalidation };
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const row = this.mustGetRevalidationRow(id);
+      const dup = this.db.prepare('SELECT * FROM revalidations WHERE evidence_key = ?').get(input.idempotencyKey) as
+        | RevalidationRow
+        | undefined;
+      if (dup) {
+        if (dup.id !== id) {
+          throw new StoreError('IDEMPOTENCY_CONFLICT', 409, `幂等键 ${input.idempotencyKey} 已被其他再验证占用`);
+        }
+        result = { outcome: 'duplicate', revalidation: this.mapRevalidation(dup) };
+        return;
+      }
+      const now = this.clock.now();
+      if (row.status !== 'pending') {
+        result = { outcome: 'closed', revalidation: this.mapRevalidation(row) };
+        events = [
+          this.appendEvent(row.proposal_id, 'REVALIDATION_LATE', {
+            revalidationId: id,
+            consumerId: row.consumer_id,
+            verdict: input.verdict,
+            reason: '再验证已有结论，迟到报送被隔离，结论不可改',
+          }),
+        ];
+        return;
+      }
+      const status = input.verdict === 'pass' ? 'passed' : 'failed';
+      this.db
+        .prepare('UPDATE revalidations SET status = ?, concluded_at = ?, verdict = ?, evidence_key = ? WHERE id = ?')
+        .run(status, now, input.verdict, input.idempotencyKey, id);
+      result = { outcome: 'concluded', revalidation: this.mapRevalidation(this.mustGetRevalidationRow(id)) };
+      events = [
+        this.appendEvent(row.proposal_id, 'REVALIDATION_CONCLUDED', {
+          revalidationId: id,
+          consumerId: row.consumer_id,
+          candidateDigest: row.candidate_digest,
+          verdict: input.verdict,
+          conclusion: status,
+          runId: input.runId,
+          by: input.by ?? null,
+        }),
+      ];
+    });
+    tx();
+    this.emit(events);
+    return result;
+  }
+
+  private mustGetRevalidationRow(id: string): RevalidationRow {
+    const row = this.db.prepare('SELECT * FROM revalidations WHERE id = ?').get(id) as RevalidationRow | undefined;
+    if (!row) throw new StoreError('NOT_FOUND', 404, `再验证 ${id} 不存在`);
+    return row;
+  }
+
+  private revalidationRowsFor(proposalId: string): RevalidationRow[] {
+    return this.db.prepare('SELECT * FROM revalidations WHERE proposal_id = ? ORDER BY added_at, id').all(proposalId) as RevalidationRow[];
+  }
+
+  /** 覆盖缺口：该提案该候选下，尚未通过的再验证（pending / failed）。 */
+  private openGapRevalidations(proposalId: string, candidateDigest: string): RevalidationRow[] {
+    return this.db
+      .prepare(`SELECT * FROM revalidations WHERE proposal_id = ? AND candidate_digest = ? AND status != 'passed' ORDER BY added_at, id`)
+      .all(proposalId, candidateDigest) as RevalidationRow[];
+  }
+
+  private openGapConsumers(proposalId: string, candidateDigest: string): string[] {
+    return this.openGapRevalidations(proposalId, candidateDigest).map((r) => r.consumer_id);
+  }
+
+  private mapRevalidation(r: RevalidationRow): Revalidation {
+    return {
+      id: r.id,
+      proposalId: r.proposal_id,
+      candidateDigest: r.candidate_digest,
+      consumerId: r.consumer_id,
+      status: r.status,
+      reason: r.reason,
+      addedBy: r.added_by,
+      addedAt: r.added_at,
+      concludedAt: r.concluded_at,
+      verdict: r.verdict,
+      evidenceKey: r.evidence_key,
+    };
+  }
+
   private mustGetRolloutRow(id: string): RolloutRow {
     const row = this.db.prepare('SELECT * FROM rollouts WHERE id = ?').get(id) as RolloutRow | undefined;
     if (!row) throw new StoreError('NOT_FOUND', 404, `发布 ${id} 不存在`);
@@ -993,6 +1252,7 @@ export class Store {
       candidateDigest: r.candidate_digest,
       status: r.status,
       currentOrdinal: r.current_ordinal,
+      pausedReason: r.paused_reason,
       createdBy: r.created_by,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
@@ -1317,6 +1577,7 @@ export class Store {
         const ro = this.db.prepare('SELECT * FROM rollouts WHERE proposal_id = ?').get(row.id) as RolloutRow | undefined;
         return ro ? this.assembleRollout(ro) : null;
       })(),
+      revalidations: this.revalidationRowsFor(row.id).map((r) => this.mapRevalidation(r)),
       decision,
       events: this.eventsSinceFor(row.id),
     };

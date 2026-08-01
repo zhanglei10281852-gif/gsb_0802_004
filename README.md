@@ -63,6 +63,14 @@ examples/      演示场景
 - **暂停/恢复**：人工暂停期间回执不推进（恢复后需适配器重发）。**重试**：仅失败/结果未知的当前波次可重试（retryCount 递增，发布回到进行中）。**回退**：目标必须是已知版本（已成功的波次，或 0 表示发布前），后续波次标记 `rolled_back`；回退**只改发布/波次状态**——不改写原契约决策快照，也不触碰任何豁免（已失效豁免不会被复活）。
 - 适配器模拟器步骤：`rollout`（创建发布）、`receipt`（回执，支持 `loseResponse` 回执丢失重发、`decision:'stale'` 伪造旧决策、`expectOutcome` 断言）、`rolloutControl`（pause/resume/retry/rollback）。e2e 覆盖回执丢失、乱序隔离与**进程重启后从 SQLite 恢复发布状态**。
 
+**发布期间的依赖拓扑变化**（新消费方成为必需依赖）：
+
+- `POST /api/proposals/:id/dependencies` 声明新的必需消费方：只扩展提案的依赖清单，**历史决策快照不可修改**；已批准提案同时生成待验证的**再验证记录**（绑定当前候选摘要，在同一提案谱系上可追溯）。
+- **覆盖缺口自动暂停**：发布仍有尚未开始的波次时，发布立即以 `pausedReason='coverage_gap'` 自动暂停；已开始的在途波次允许完成，但未开始的波次绝不启动（事件 `WAVE_START_BLOCKED` 说明因果依据）。
+- **确定性并发**：回执与拓扑变更都经 SQLite 事务串行化，提交顺序即确定结果——先落盘的回执效果成立（在途波次可推进），先落盘的拓扑变更则确定性隔离后续回执（`paused`，不损坏状态，恢复后重放即可）。两种顺序共有的内核（已落盘效果成立 + 未开始波次受阻）由单测断言。
+- **再验证结论**：构建代理通过 `POST /api/revalidations/:id/conclude` 报送该消费方针对当前候选的结论；幂等键去重（`duplicate`），已有结论后的迟到报送被隔离（`closed`），结论一旦形成不可改。恢复发布要求全部再验证通过，否则 422 `COVERAGE_GAP`（附待验证/未通过清单）；工作台在发布头部展示暂停的因果依据（覆盖缺口 / 人工 / 波次失败 / 结果未知）。
+- 前四轮边界保持一致：拓扑变化不改变候选/基线摘要、不新增或复活豁免、不影响谱系链接与已决策状态、不越波次边界（单测逐项断言）。
+
 **决策**：`POST /api/proposals/:id/decisions` 携带 `expectedVersion` 做乐观并发控制。门禁评估、版本 CAS、快照落库在同一 SQLite 事务内完成；并发审批恰好一个生效，其余收到 409。决策快照逐条拷贝当时采用的证据、兼容性结论与门禁结果，落库后无任何更新路径——提案已关闭后到达的证据标记为 `closed`、旧候选证据标记为 `stale_candidate`，都会被记录审计但永远不参与门禁。
 
 ## 故障恢复边界
@@ -125,6 +133,8 @@ examples/      演示场景
 | `POST /api/rollouts/:id/waves/:waveId/retry` | 重试失败/结果未知的当前波次 |
 | `POST /api/rollouts/:id/rollback` | 回退到已知版本（已成功波次或 0=发布前；不改决策、不复活豁免） |
 | `GET /api/rollouts/:id` | 发布详情（波次、回执、状态） |
+| `POST /api/proposals/:id/dependencies` | 声明新必需消费方（生成再验证；未开始波次因覆盖缺口自动暂停） |
+| `POST /api/revalidations/:id/conclude` | 报送再验证结论（幂等去重；结论不可改） |
 | `GET /api/proposals[/:id]` | 列表 / 详情（含证据、阻塞原因、决策快照、事件） |
 | `GET /api/snapshot` | 一致快照（单事务），供网页重连恢复 |
 | `GET /api/events?since=` | SSE：先重放 SQLite 历史事件再实时推送 |

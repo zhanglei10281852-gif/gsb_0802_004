@@ -93,6 +93,7 @@ export interface DomainEvent {
 }
 
 export type RolloutStatus = 'active' | 'paused' | 'completed' | 'rolled_back';
+export type PauseReason = 'manual' | 'wave_failed' | 'wave_unknown' | 'coverage_gap';
 export type WaveStatus = 'pending' | 'deploying' | 'succeeded' | 'failed' | 'unknown' | 'rolled_back';
 export type ReceiptResult = 'success' | 'failure' | 'unknown';
 export type ReceiptOutcome = 'applied' | 'duplicate' | 'stale_decision' | 'stale_wave' | 'paused' | 'closed';
@@ -128,6 +129,7 @@ export interface RolloutDetail {
   decisionId: string;
   candidateDigest: string;
   status: RolloutStatus;
+  pausedReason: PauseReason | null;
   currentOrdinal: number;
   createdBy: string;
   createdAt: number;
@@ -138,6 +140,27 @@ export interface RolloutDetail {
   rolledBackAt: number | null;
   waves: Wave[];
   receipts: Receipt[];
+}
+
+export type RevalidationStatus = 'pending' | 'passed' | 'failed';
+
+export interface Revalidation {
+  id: string;
+  proposalId: string;
+  candidateDigest: string;
+  consumerId: string;
+  status: RevalidationStatus;
+  reason: string | null;
+  addedBy: string;
+  addedAt: number;
+  concludedAt: number | null;
+  verdict: Verdict | null;
+  evidenceKey: string | null;
+}
+
+export interface CoverageGapRevalidation {
+  consumerId: string;
+  status: RevalidationStatus;
 }
 
 export interface ProposalDetail {
@@ -162,6 +185,7 @@ export interface ProposalDetail {
   exemptions: ExemptionView[];
   decision: Decision | null;
   rollout: RolloutDetail | null;
+  revalidations: Revalidation[];
   events: DomainEvent[];
 }
 
@@ -255,11 +279,31 @@ export interface RecordReceiptResponse {
   receipt: Receipt;
 }
 
+export interface AddDependencyBody {
+  consumerId: string;
+  by: string;
+  reason?: string;
+}
+
+export type RevalidationOutcome = 'concluded' | 'duplicate' | 'closed';
+
+export interface ConcludeRevalidationBody {
+  verdict: Verdict;
+  runId: string;
+  idempotencyKey: string;
+  by?: string;
+}
+
+export interface ConcludeRevalidationResponse {
+  outcome: RevalidationOutcome;
+  revalidation: Revalidation;
+}
+
 interface ApiErrorShape {
   error?: {
     code?: string;
     message?: string;
-    details?: { blockers?: Blocker[] };
+    details?: { blockers?: Blocker[]; revalidations?: CoverageGapRevalidation[] };
   };
 }
 
@@ -288,6 +332,12 @@ export class ApiError extends Error {
     const shape = this.body as ApiErrorShape | null;
     const blockers = shape && shape.error && shape.error.details ? shape.error.details.blockers : undefined;
     return Array.isArray(blockers) ? blockers : [];
+  }
+
+  get coverageGapRevalidations(): CoverageGapRevalidation[] {
+    const shape = this.body as ApiErrorShape | null;
+    const list = shape && shape.error && shape.error.details ? shape.error.details.revalidations : undefined;
+    return Array.isArray(list) ? list : [];
   }
 }
 
@@ -335,6 +385,23 @@ export function submitDecision(id: string, body: SubmitDecisionBody): Promise<{ 
 
 export function createSuccessor(id: string, body: CreateSuccessorBody): Promise<ProposalDetail> {
   return request<ProposalDetail>(`/api/proposals/${encodeURIComponent(id)}/successors`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function addDependency(proposalId: string, body: AddDependencyBody): Promise<ProposalDetail> {
+  return request<ProposalDetail>(`/api/proposals/${encodeURIComponent(proposalId)}/dependencies`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function concludeRevalidation(
+  id: string,
+  body: ConcludeRevalidationBody,
+): Promise<ConcludeRevalidationResponse> {
+  return request<ConcludeRevalidationResponse>(`/api/revalidations/${encodeURIComponent(id)}/conclude`, {
     method: 'POST',
     body: JSON.stringify(body),
   });

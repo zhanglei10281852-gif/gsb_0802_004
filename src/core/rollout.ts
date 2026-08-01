@@ -5,6 +5,10 @@ import type { ReceiptOutcome, ReceiptResult, Rollout, Wave, WaveStatus } from '.
  * 只有绑定同一决策快照、且指向当前波次（部署中）的回执返回 applied；
  * 其余（决策快照不匹配、非当前/非部署中波次、发布暂停、发布已关闭）都被隔离。
  * 幂等去重在存储层按 receiptKey 完成（duplicate）。
+ *
+ * 覆盖缺口语义：因拓扑变化（coverage_gap）暂停时，已经开始部署的当前波次
+ * 允许完成（回执 applied），但尚未开始的波次不会启动——保证落盘回执与
+ * 拓扑变更按任意到达顺序都得到确定结果。
  */
 export function classifyReceipt(
   rollout: Rollout,
@@ -13,7 +17,17 @@ export function classifyReceipt(
 ): ReceiptOutcome {
   if (receiptDecisionId !== rollout.decisionId) return 'stale_decision';
   if (rollout.status === 'completed' || rollout.status === 'rolled_back') return 'closed';
-  if (rollout.status === 'paused') return 'paused';
+  if (rollout.status === 'paused') {
+    // 覆盖缺口暂停：仅放行在途的当前部署波次，其余原因暂停一律不推进。
+    if (
+      rollout.pausedReason === 'coverage_gap' &&
+      wave.ordinal === rollout.currentOrdinal &&
+      wave.status === 'deploying'
+    ) {
+      return 'applied';
+    }
+    return 'paused';
+  }
   if (wave.ordinal !== rollout.currentOrdinal || wave.status !== 'deploying') return 'stale_wave';
   return 'applied';
 }

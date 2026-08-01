@@ -3,8 +3,10 @@ import type { FormEvent } from 'react';
 import { ApiError, createRollout, pauseRollout, resumeRollout, retryWave, rollbackRollout } from '../api';
 import type { ProposalDetail, RolloutDetail } from '../api';
 import {
+  PAUSE_REASON_LABEL,
   RECEIPT_OUTCOME_LABEL,
   RECEIPT_RESULT_LABEL,
+  REVALIDATION_STATUS_LABEL,
   ROLLOUT_STATUS_LABEL,
   WAVE_STATUS_LABEL,
   formatTime,
@@ -23,6 +25,18 @@ interface WaveRow {
 
 function errorText(err: unknown, fallback: string): string {
   return err instanceof ApiError && err.errorMessage ? err.errorMessage : fallback;
+}
+
+function resumeErrorText(err: unknown): string {
+  if (err instanceof ApiError && err.status === 422 && err.errorCode === 'COVERAGE_GAP') {
+    const gaps = err.coverageGapRevalidations;
+    if (gaps.length > 0) {
+      const detail = gaps.map((g) => `${g.consumerId}=${REVALIDATION_STATUS_LABEL[g.status]}`).join('、');
+      return `覆盖缺口未关闭：${detail}`;
+    }
+    return err.errorMessage ?? '覆盖缺口未关闭，恢复被阻止。';
+  }
+  return errorText(err, '操作失败，请稍后重试。');
 }
 
 function RolloutCreateForm({ proposal, onRefresh }: RolloutSectionProps) {
@@ -142,14 +156,14 @@ function RolloutDetailPanel({ rollout, onRefresh }: { rollout: RolloutDetail; on
   const showOpBy = rollout.status === 'active' || rollout.status === 'paused' || canRetry;
   const succeededWaves = waves.filter((w) => w.status === 'succeeded');
 
-  async function runAction(action: () => Promise<unknown>) {
+  async function runAction(action: () => Promise<unknown>, mapError?: (err: unknown) => string) {
     setOpBusy(true);
     try {
       await action();
       setOpError(null);
       await onRefresh();
     } catch (err) {
-      setOpError(errorText(err, '操作失败，请稍后重试。'));
+      setOpError(mapError ? mapError(err) : errorText(err, '操作失败，请稍后重试。'));
     } finally {
       setOpBusy(false);
     }
@@ -165,7 +179,7 @@ function RolloutDetailPanel({ rollout, onRefresh }: { rollout: RolloutDetail; on
     if (kind === 'pause') {
       await runAction(() => pauseRollout(rollout.id, { by }));
     } else if (kind === 'resume') {
-      await runAction(() => resumeRollout(rollout.id, { by }));
+      await runAction(() => resumeRollout(rollout.id, { by }), resumeErrorText);
     } else if (currentWave) {
       await runAction(() => retryWave(rollout.id, currentWave.id, { by }));
     }
@@ -196,6 +210,11 @@ function RolloutDetailPanel({ rollout, onRefresh }: { rollout: RolloutDetail; on
 
   return (
     <div className="rollout-detail">
+      {rollout.status === 'paused' && (
+        <div className="alert alert-warning rollout-pause-alert">
+          {rollout.pausedReason !== null ? PAUSE_REASON_LABEL[rollout.pausedReason] : ROLLOUT_STATUS_LABEL.paused}
+        </div>
+      )}
       <dl className="summary-grid">
         <div>
           <dt>发布状态</dt>

@@ -4,9 +4,11 @@ import type {
   Decision,
   ExemptionDirection,
   ExemptionStatus,
+  PauseReason,
   ProposalDetail,
   ReceiptOutcome,
   ReceiptResult,
+  RevalidationStatus,
   RolloutStatus,
   WaveStatus,
 } from './api';
@@ -63,6 +65,19 @@ export const ROLLOUT_STATUS_LABEL: Record<RolloutStatus, string> = {
   rolled_back: '已回退',
 };
 
+export const PAUSE_REASON_LABEL: Record<PauseReason, string> = {
+  manual: '人工暂停',
+  wave_failed: '波次失败自动暂停',
+  wave_unknown: '波次结果未知自动暂停',
+  coverage_gap: '自动暂停：覆盖缺口（新必需消费方缺少再验证结论）',
+};
+
+export const REVALIDATION_STATUS_LABEL: Record<RevalidationStatus, string> = {
+  pending: '待验证',
+  passed: '已通过',
+  failed: '未通过',
+};
+
 export const WAVE_STATUS_LABEL: Record<WaveStatus, string> = {
   pending: '待启动',
   deploying: '部署中',
@@ -107,4 +122,9 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   ROLLOUT_ROLLED_BACK: '发布回退',
   RECEIPT_RECORDED: '回执记录',
   RECEIPT_LATE: '迟到回执被隔离',
+  DEPENDENCY_ADDED: '必需依赖新增',
+  REVALIDATION_REQUIRED: '再验证要求',
+  REVALIDATION_CONCLUDED: '再验证结论',
+  REVALIDATION_LATE: '再验证迟到报送',
+  WAVE_START_BLOCKED: '波次启动受阻（覆盖缺口）',
 };

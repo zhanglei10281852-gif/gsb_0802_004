@@ -246,6 +246,34 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     });
   });
 
+  // ---- 依赖拓扑变化与再验证 ----
+
+  /** 声明新的必需消费方：已批准提案生成再验证记录，未开始波次因覆盖缺口自动暂停。 */
+  app.post('/api/proposals/:id/dependencies', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body)) throw new StoreError('BAD_REQUEST', 400, '请求体必须是 JSON 对象');
+    const detail = store.addDependency(id, {
+      consumerId: String(body.consumerId ?? ''),
+      by: String(body.by ?? ''),
+      reason: typeof body.reason === 'string' ? body.reason : undefined,
+    });
+    return reply.status(201).send(detail);
+  });
+
+  /** 报送再验证结论：幂等键去重，结论一旦形成不可改。 */
+  app.post('/api/revalidations/:id/conclude', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body)) throw new StoreError('BAD_REQUEST', 400, '请求体必须是 JSON 对象');
+    return store.concludeRevalidation(id, {
+      verdict: body.verdict as 'pass' | 'fail',
+      runId: String(body.runId ?? ''),
+      idempotencyKey: String(body.idempotencyKey ?? ''),
+      by: typeof body.by === 'string' ? body.by : undefined,
+    });
+  });
+
   /** 一致快照：网页重连后以此为准，而不是依赖进程内事件。 */
   app.get('/api/snapshot', async () => store.snapshot());
 

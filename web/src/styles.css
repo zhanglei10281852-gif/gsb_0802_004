@@ -409,6 +409,12 @@ textarea {
   color: var(--accent);
 }
 
+.alert-warning {
+  background: rgba(217, 160, 63, 0.12);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+}
+
 /* 摘要栅格 */
 .summary-grid {
   display: grid;
@@ -576,6 +582,72 @@ textarea {
   gap: 0 16px;
 }
 
+/* 依赖拓扑与再验证 */
+.dependency-consumer-list {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.badge-consumer {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(79, 156, 249, 0.12);
+}
+
+.revalidation-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.revalidation-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.revalidation-card-head {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.revalidation-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.badge-revalidation-pending {
+  color: var(--amber);
+  border-color: var(--amber);
+  background: rgba(217, 160, 63, 0.12);
+}
+
+.badge-revalidation-passed {
+  color: var(--green);
+  border-color: var(--green);
+  background: rgba(63, 178, 127, 0.12);
+}
+
+.badge-revalidation-failed {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(224, 108, 117, 0.12);
+}
+
 /* 详情头部 */
 .detail-header {
   display: flex;
@@ -623,6 +695,11 @@ textarea {
 .rollout-detail {
   display: flex;
   flex-direction: column;
+}
+
+.rollout-pause-alert {
+  margin: 0 0 10px;
+  font-weight: 600;
 }
 
 .badge-rollout-active,

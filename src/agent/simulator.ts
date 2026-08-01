@@ -22,6 +22,7 @@ interface Ctx {
   realTime: boolean;
   proposals: Record<string, { id: string; candidateDigest: string; version: number }>;
   rollouts: Record<string, { id: string; decisionId: string; waves: { id: string; ordinal: number }[] }>;
+  revalidations: Record<string, string>;
   failed: number;
 }
 
@@ -276,6 +277,47 @@ async function runStep(step: Step, ctx: Ctx): Promise<void> {
       }
       return;
     }
+    case 'dependency': {
+      const p = step.proposalId
+        ? { id: String(step.proposalId) }
+        : await getProposal(ctx, String(step.proposal));
+      const res = await req('POST', `${ctx.base}/api/proposals/${p.id}/dependencies`, {
+        consumerId: String(step.consumer),
+        by: String(step.by ?? 'simulator'),
+        reason: step.reason,
+      });
+      const body = res.body as { revalidations?: { id: string; consumerId: string }[] };
+      log({ step: 'dependency', consumer: step.consumer, status: res.status });
+      if (step.expectStatus !== undefined) expect(res.status === Number(step.expectStatus), `期望状态 ${String(step.expectStatus)}，实际 ${res.status}`, ctx);
+      else expect(res.status === 201, `添加依赖失败: ${JSON.stringify(res.body)}`, ctx);
+      const rv = (body.revalidations ?? []).find((r) => r.consumerId === step.consumer);
+      if (rv) ctx.revalidations[String(step.consumer)] = rv.id;
+      return;
+    }
+    case 'revalidate': {
+      const rvId = step.revalidationId ? String(step.revalidationId) : ctx.revalidations[String(step.consumer)];
+      if (!rvId) throw new Error(`未知再验证（consumer=${String(step.consumer)}）`);
+      const payload = {
+        verdict: step.verdict === 'fail' ? 'fail' : 'pass',
+        runId: String(step.runId ?? `run_${randomUUID()}`),
+        idempotencyKey: String(step.key ?? randomUUID()),
+        by: step.by,
+      };
+      const repeat = Number(step.repeat ?? 1);
+      for (let i = 0; i < repeat; i++) {
+        const url = `${ctx.base}/api/revalidations/${rvId}/conclude`;
+        if (step.loseResponse === true && i === 0) {
+          await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }).catch(() => undefined);
+          log({ step: 'revalidate', consumer: step.consumer, key: payload.idempotencyKey, note: '响应丢失（模拟崩溃），将重发' });
+          continue;
+        }
+        const res = await req('POST', url, payload);
+        const body = res.body as { outcome?: string };
+        log({ step: 'revalidate', consumer: step.consumer, key: payload.idempotencyKey, attempt: i + 1, status: res.status, outcome: body.outcome });
+        if (step.expectOutcome !== undefined) expect(body.outcome === step.expectOutcome, `期望 outcome ${String(step.expectOutcome)}，实际 ${String(body.outcome)}`, ctx);
+      }
+      return;
+    }
     case 'rolloutControl': {
       const ro = ctx.rollouts[String(step.rollout)];
       if (!ro) throw new Error(`未知发布别名 ${String(step.rollout)}`);
@@ -321,6 +363,7 @@ async function main(): Promise<void> {
     realTime: args.includes('--real-time'),
     proposals: {},
     rollouts: {},
+    revalidations: {},
     failed: 0,
   };
   log({ step: 'start', server: ctx.base, steps: scenario.steps.length, realTime: ctx.realTime });

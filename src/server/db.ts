@@ -113,6 +113,21 @@ CREATE TABLE IF NOT EXISTS receipts (
   outcome      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON receipts(rollout_id);
+CREATE TABLE IF NOT EXISTS revalidations (
+  id               TEXT PRIMARY KEY,
+  proposal_id      TEXT NOT NULL REFERENCES proposals(id),
+  candidate_digest TEXT NOT NULL,
+  consumer_id      TEXT NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('pending','passed','failed')),
+  reason           TEXT,
+  added_by         TEXT NOT NULL,
+  added_at         INTEGER NOT NULL,
+  concluded_at     INTEGER,
+  verdict          TEXT,
+  evidence_key     TEXT UNIQUE,
+  UNIQUE(proposal_id, consumer_id, candidate_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_revalidations_proposal ON revalidations(proposal_id);
 CREATE TABLE IF NOT EXISTS events (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           INTEGER NOT NULL,
@@ -133,6 +148,10 @@ CREATE INDEX IF NOT EXISTS idx_events_proposal ON events(proposal_id);
   }
   if (!cols.some((c) => c.name === 'superseded_by_id')) {
     db.exec(`ALTER TABLE proposals ADD COLUMN superseded_by_id TEXT`);
+  }
+  const rolloutCols = db.prepare(`PRAGMA table_info(rollouts)`).all() as { name: string }[];
+  if (!rolloutCols.some((c) => c.name === 'paused_reason')) {
+    db.exec(`ALTER TABLE rollouts ADD COLUMN paused_reason TEXT`);
   }
   return db;
 }

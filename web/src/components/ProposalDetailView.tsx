@@ -12,6 +12,7 @@ import {
   shortDigest,
 } from '../format';
 import { ExemptionSection } from './ExemptionSection';
+import { DependencySection } from './DependencySection';
 import { RolloutSection } from './RolloutSection';
 
 interface ProposalDetailViewProps {
@@ -446,6 +447,8 @@ export function ProposalDetailView({ proposal, proposals, serverTime, onRefresh,
       )}
 
       <ExemptionSection proposal={proposal} serverTime={serverTime} onRefresh={onRefresh} />
+
+      <DependencySection proposal={proposal} onRefresh={onRefresh} />
 
       {isOpen && (
         <section className="panel">

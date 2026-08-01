@@ -110,6 +110,30 @@ export type ReceiptResult = 'success' | 'failure' | 'unknown';
 /** 回执处理结果：只有 applied 推进了波次，其余均被幂等/隔离。 */
 export type ReceiptOutcome = 'applied' | 'duplicate' | 'stale_decision' | 'stale_wave' | 'paused' | 'closed';
 
+/** 暂停原因（因果依据）：人工 / 波次失败 / 结果未知 / 覆盖缺口（拓扑变化）。 */
+export type PauseReason = 'manual' | 'wave_failed' | 'wave_unknown' | 'coverage_gap';
+
+export type RevalidationStatus = 'pending' | 'passed' | 'failed';
+
+/**
+ * 再验证记录：拓扑变化引入新必需消费方时生成，
+ * 结论（该消费方针对当前候选的验证结果）在同一提案谱系上可追溯。
+ */
+export interface Revalidation {
+  id: string;
+  proposalId: string;
+  candidateDigest: string;
+  consumerId: string;
+  status: RevalidationStatus;
+  reason: string | null;
+  addedBy: string;
+  addedAt: number;
+  concludedAt: number | null;
+  verdict: 'pass' | 'fail' | null;
+  /** 结论报送的幂等键。 */
+  evidenceKey: string | null;
+}
+
 export interface Wave {
   id: string;
   rolloutId: string;
@@ -144,6 +168,8 @@ export interface Rollout {
   candidateDigest: string;
   status: RolloutStatus;
   currentOrdinal: number;
+  /** 暂停原因（仅 status 为 paused 时非空），用于解释暂停的因果依据。 */
+  pausedReason: PauseReason | null;
   createdBy: string;
   createdAt: number;
   updatedAt: number;
@@ -220,6 +246,8 @@ export interface ProposalDetail {
   supersededById: string | null;
   /** 分阶段发布（每个提案至多一个发布）。 */
   rollout: RolloutDetail | null;
+  /** 拓扑变化引入的再验证记录。 */
+  revalidations: Revalidation[];
   decision: Decision | null;
   events: DomainEvent[];
 }
