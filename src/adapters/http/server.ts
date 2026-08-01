@@ -113,6 +113,7 @@ export async function buildServer(opts: BuildServerOptions): Promise<FastifyInst
       proposalId,
       expectedDigest: String(body.expectedDigest),
       expectedFingerprint: body.expectedFingerprint ? String(body.expectedFingerprint) : undefined,
+      environment: body.environment ? String(body.environment) : undefined,
       type: body.type === 'REJECT' ? 'REJECT' : 'APPROVE',
       decidedBy: String(body.decidedBy ?? 'unknown'),
       note: body.note ? String(body.note) : undefined
@@ -122,15 +123,63 @@ export async function buildServer(opts: BuildServerOptions): Promise<FastifyInst
     return reply.status(code).send(outcome);
   });
 
+  // --- waivers ---
+  app.post('/api/waivers', async (req, reply) => {
+    const body = req.body as any;
+    const outcome = service.requestWaiver({
+      subjectId: String(body.subjectId),
+      candidateDigest: String(body.candidateDigest),
+      consumerId: String(body.consumerId),
+      environment: body.environment ? String(body.environment) : undefined,
+      compatDirection: body.compatDirection,
+      reason: String(body.reason ?? ''),
+      requestedBy: String(body.requestedBy ?? 'unknown'),
+      ttlMs: Number(body.ttlMs)
+    });
+    return reply.status(outcome.status === 'REQUESTED' ? 201 : 422).send(outcome);
+  });
+
+  app.post('/api/waivers/:waiverId/confirm', async (req, reply) => {
+    const { waiverId } = req.params as { waiverId: string };
+    const body = req.body as any;
+    const outcome = service.confirmWaiver(waiverId, String(body.confirmedBy ?? 'unknown'));
+    return reply.status(outcome.status === 'CONFIRMED' ? 201 : 422).send(outcome);
+  });
+
+  app.post('/api/waivers/:waiverId/reject', async (req, reply) => {
+    const { waiverId } = req.params as { waiverId: string };
+    const body = req.body as any;
+    const outcome = service.rejectWaiver(waiverId, String(body.rejectedBy ?? 'unknown'), String(body.reason ?? ''));
+    return reply.status(outcome.status === 'REJECTED' ? 201 : 422).send(outcome);
+  });
+
+  app.post('/api/waivers/:waiverId/revoke', async (req, reply) => {
+    const { waiverId } = req.params as { waiverId: string };
+    const body = req.body as any;
+    const outcome = service.revokeWaiver(waiverId, String(body.revokedBy ?? 'unknown'), String(body.reason ?? ''));
+    return reply.status(outcome.status === 'REVOKED' ? 201 : 422).send(outcome);
+  });
+
+  app.get('/api/waivers/:waiverId', async (req, reply) => {
+    const { waiverId } = req.params as { waiverId: string };
+    const waiver = service.getWaiver(waiverId);
+    if (!waiver) return reply.status(404).send({ error: 'NOT_FOUND' });
+    return waiver;
+  });
+
   // --- read models ---
   app.get('/api/proposals/:proposalId', async (req, reply) => {
     const { proposalId } = req.params as { proposalId: string };
-    const view = service.getProposalView(proposalId);
+    const q = req.query as { environment?: string };
+    const view = service.getProposalView(proposalId, q.environment);
     if (!view) return reply.status(404).send({ error: 'NOT_FOUND' });
     return view;
   });
 
-  app.get('/api/snapshot', async () => service.snapshot());
+  app.get('/api/snapshot', async (req) => {
+    const q = req.query as { environment?: string };
+    return service.snapshot(q.environment);
+  });
 
   app.get('/api/events', async (req) => {
     const q = req.query as { since?: string };

@@ -53,7 +53,7 @@ export class ControlCenterClient {
 
   decide(
     proposalId: string,
-    input: { expectedDigest: string; expectedFingerprint?: string; type: 'APPROVE' | 'REJECT'; decidedBy: string; note?: string }
+    input: { expectedDigest: string; expectedFingerprint?: string; environment?: string; type: 'APPROVE' | 'REJECT'; decidedBy: string; note?: string }
   ) {
     return this.req<{ status: string; reason?: string; decision?: any }>(
       'POST',
@@ -64,6 +64,48 @@ export class ControlCenterClient {
 
   getProposal(proposalId: string) {
     return this.req<any>('GET', `/api/proposals/${encodeURIComponent(proposalId)}`);
+  }
+
+  // --- waivers ---
+  requestWaiver(input: {
+    subjectId: string;
+    candidateDigest: string;
+    consumerId: string;
+    environment?: string;
+    compatDirection: 'COMPATIBLE' | 'BREAKING' | 'UNKNOWN';
+    reason: string;
+    requestedBy: string;
+    ttlMs: number;
+  }) {
+    return this.req<{ status: string; reason?: string; waiver?: any }>('POST', '/api/waivers', input);
+  }
+
+  confirmWaiver(waiverId: string, confirmedBy: string) {
+    return this.req<{ status: string; reason?: string; waiver?: any }>(
+      'POST',
+      `/api/waivers/${encodeURIComponent(waiverId)}/confirm`,
+      { confirmedBy }
+    );
+  }
+
+  rejectWaiver(waiverId: string, rejectedBy: string, reason: string) {
+    return this.req<{ status: string; reason?: string; waiver?: any }>(
+      'POST',
+      `/api/waivers/${encodeURIComponent(waiverId)}/reject`,
+      { rejectedBy, reason }
+    );
+  }
+
+  revokeWaiver(waiverId: string, revokedBy: string, reason: string) {
+    return this.req<{ status: string; reason?: string; waiver?: any }>(
+      'POST',
+      `/api/waivers/${encodeURIComponent(waiverId)}/revoke`,
+      { revokedBy, reason }
+    );
+  }
+
+  getWaiver(waiverId: string) {
+    return this.req<any>('GET', `/api/waivers/${encodeURIComponent(waiverId)}`);
   }
 
   snapshot() {

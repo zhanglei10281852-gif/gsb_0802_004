@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type {
+  ActiveWaiver,
   AppliedEvidence,
   ConsumerReadiness,
   ConsumerStatus,
@@ -12,14 +13,14 @@ import type {
  * Pure gate evaluation and decision-eligibility state machine.
  *
  * Given the set of required consumers, the evidence currently applied to a
- * candidate, the static compatibility report, and a clock reading, this
- * function derives:
+ * candidate, the static compatibility report, a clock reading, and any active
+ * waivers, this function derives:
  *
- *   - per-consumer readiness (MISSING / STALE / PASS / FAIL),
+ *   - per-consumer readiness (MISSING / STALE / PASS / FAIL / WAIVED),
  *   - an overall gate status (COLLECTING / BLOCKED / READY),
  *   - whether an APPROVE decision is permitted right now, and
- *   - an evidence fingerprint that binds a decision to the exact evidence it
- *     was based on.
+ *   - an evidence fingerprint that binds a decision to the exact evidence and
+ *     waivers it was based on.
  *
  * The function is pure: it does not read the clock, touch storage, or mutate
  * its inputs. `now` and the freshness window are passed in so timelines are
@@ -33,10 +34,25 @@ import type {
  *  - Evidence older than the freshness window relative to `now` is STALE and
  *    does not count toward readiness.
  *  - A FAIL from any required consumer blocks approval regardless of others.
- *  - Approval requires every required consumer to be fresh + PASS.
+ *  - Approval requires every required consumer to be fresh + PASS, OR covered
+ *    by a matching active waiver (see below).
+ *
+ * Waiver rules (time-limited exemptions for consumers temporarily offline in a
+ * release window):
+ *  - A waiver may only cover a consumer that is MISSING or STALE — i.e. the
+ *    "temporarily offline / no fresh evidence" case. A real FAIL is a genuine
+ *    incompatibility signal and is NEVER masked by a waiver.
+ *  - A waiver applies only when its scope names EXACTLY this candidate digest,
+ *    this consumer, this environment, and the candidate's actual compatibility
+ *    direction. Any mismatch means the waiver does not apply here.
+ *  - A waiver must be unexpired relative to `now`. Expired waivers do not
+ *    participate; they only produce an explanatory advisory.
+ *  The caller is responsible for passing only ACTIVE (dual-confirmed) waivers;
+ *  the gate re-checks scope + expiry defensively.
  */
 export function evaluateGate(input: GateInput): GateEvaluation {
-  const { requiredConsumers, appliedEvidence, compat, now, freshnessWindowMs } = input;
+  const { requiredConsumers, appliedEvidence, compat, now, freshnessWindowMs, candidateDigest, environment, waivers } =
+    input;
 
   // Keep only the most authoritative report per consumer: newest producedAt,
   // ties broken by newest receivedAt. Reports for consumers not in the
@@ -51,58 +67,84 @@ export function evaluateGate(input: GateInput): GateEvaluation {
 
   const consumers: ConsumerReadiness[] = [];
   const blockingReasons: string[] = [];
+  const advisories: string[] = [];
+  const appliedWaivers: ActiveWaiver[] = [];
   let anyFail = false;
-  let anyMissingOrStale = false;
+  let anyUnsatisfied = false;
 
   for (const consumerId of requiredConsumers) {
     const ev = latestByConsumer.get(consumerId);
-    if (!ev) {
-      consumers.push({ consumerId, status: 'MISSING' });
-      anyMissingOrStale = true;
-      blockingReasons.push(`consumer "${consumerId}" has no evidence for this candidate`);
+
+    // FAIL dominates everything and can never be waived.
+    if (ev && ev.verdict === 'FAIL') {
+      anyFail = true;
+      blockingReasons.push(
+        `consumer "${consumerId}" reported FAIL (report ${ev.reportId}${ev.detail ? `: ${ev.detail}` : ''}); a FAIL cannot be waived`
+      );
+      consumers.push({ consumerId, status: 'FAIL', reportId: ev.reportId, producedAt: ev.producedAt, ageMs: now - ev.producedAt, detail: ev.detail });
       continue;
     }
 
-    const ageMs = now - ev.producedAt;
-    const isStale = ageMs > freshnessWindowMs;
+    const missing = !ev;
+    const ageMs = ev ? now - ev.producedAt : undefined;
+    const isStale = ev ? ageMs! > freshnessWindowMs : false;
 
-    let status: ConsumerStatus;
-    if (ev.verdict === 'FAIL') {
-      status = 'FAIL';
-      anyFail = true;
-      blockingReasons.push(
-        `consumer "${consumerId}" reported FAIL (report ${ev.reportId}${ev.detail ? `: ${ev.detail}` : ''})`
-      );
-    } else if (isStale) {
-      status = 'STALE';
-      anyMissingOrStale = true;
-      blockingReasons.push(
-        `consumer "${consumerId}" evidence is stale (age ${ageMs}ms > ${freshnessWindowMs}ms window)`
-      );
-    } else {
-      status = 'PASS';
+    if (ev && !isStale) {
+      // Fresh PASS — no waiver needed.
+      consumers.push({ consumerId, status: 'PASS', reportId: ev.reportId, producedAt: ev.producedAt, ageMs, detail: ev.detail });
+      continue;
     }
 
-    consumers.push({
-      consumerId,
-      status,
-      reportId: ev.reportId,
-      producedAt: ev.producedAt,
-      ageMs,
-      detail: ev.detail
-    });
+    // Consumer is MISSING or STALE. See if a matching, unexpired waiver covers
+    // it. Among candidates, prefer the one expiring latest (most grace).
+    const waiver = pickWaiver(waivers, candidateDigest, consumerId, environment, compat.result, now);
+    if (waiver) {
+      appliedWaivers.push(waiver);
+      consumers.push({
+        consumerId,
+        status: 'WAIVED',
+        reportId: ev?.reportId,
+        producedAt: ev?.producedAt,
+        ageMs,
+        detail: ev?.detail,
+        waiverId: waiver.waiverId,
+        waiverExpiresAt: waiver.expiresAt
+      });
+      advisories.push(
+        `consumer "${consumerId}" is ${missing ? 'MISSING' : 'STALE'} but covered by waiver ${waiver.waiverId} (expires t=${waiver.expiresAt}, env=${environment}, dir=${compat.result})`
+      );
+      continue;
+    }
+
+    // No coverage — unsatisfied.
+    anyUnsatisfied = true;
+    if (missing) {
+      consumers.push({ consumerId, status: 'MISSING' });
+      blockingReasons.push(`consumer "${consumerId}" has no evidence for this candidate`);
+    } else {
+      consumers.push({ consumerId, status: 'STALE', reportId: ev!.reportId, producedAt: ev!.producedAt, ageMs, detail: ev!.detail });
+      blockingReasons.push(`consumer "${consumerId}" evidence is stale (age ${ageMs}ms > ${freshnessWindowMs}ms window)`);
+    }
+
+    // Explain a waiver that *would* have matched but has expired, so the
+    // reason a previously-covered consumer is blocking again is legible.
+    const expired = findExpiredWaiver(waivers, candidateDigest, consumerId, environment, compat.result, now);
+    if (expired) {
+      advisories.push(
+        `waiver ${expired.waiverId} for consumer "${consumerId}" expired at t=${expired.expiresAt}; no longer participating`
+      );
+    }
   }
 
   let status: GateStatus;
   if (anyFail) {
     status = 'BLOCKED';
-  } else if (anyMissingOrStale) {
+  } else if (anyUnsatisfied) {
     status = 'COLLECTING';
   } else {
     status = 'READY';
   }
 
-  const advisories: string[] = [];
   if (compat.result === 'BREAKING') {
     advisories.push('static analysis flagged BREAKING changes; approval relies on consumer evidence');
   } else if (compat.result === 'UNKNOWN') {
@@ -117,8 +159,58 @@ export function evaluateGate(input: GateInput): GateEvaluation {
     consumers,
     blockingReasons,
     advisories,
-    evidenceFingerprint: fingerprint(requiredConsumers, latestByConsumer, compat.result)
+    environment,
+    appliedWaivers,
+    evidenceFingerprint: fingerprint(requiredConsumers, latestByConsumer, compat.result, environment, appliedWaivers)
   };
+}
+
+/** Does a waiver's scope exactly match this consumer's situation? */
+function scopeMatches(
+  w: ActiveWaiver,
+  candidateDigest: string,
+  consumerId: string,
+  environment: string,
+  compatDirection: string
+): boolean {
+  return (
+    w.scope.candidateDigest === candidateDigest &&
+    w.scope.consumerId === consumerId &&
+    w.scope.environment === environment &&
+    w.scope.compatDirection === compatDirection
+  );
+}
+
+function pickWaiver(
+  waivers: readonly ActiveWaiver[],
+  candidateDigest: string,
+  consumerId: string,
+  environment: string,
+  compatDirection: string,
+  now: number
+): ActiveWaiver | undefined {
+  let best: ActiveWaiver | undefined;
+  for (const w of waivers) {
+    if (!scopeMatches(w, candidateDigest, consumerId, environment, compatDirection)) continue;
+    if (now >= w.expiresAt) continue; // expired
+    if (!best || w.expiresAt > best.expiresAt || (w.expiresAt === best.expiresAt && w.waiverId > best.waiverId)) {
+      best = w;
+    }
+  }
+  return best;
+}
+
+function findExpiredWaiver(
+  waivers: readonly ActiveWaiver[],
+  candidateDigest: string,
+  consumerId: string,
+  environment: string,
+  compatDirection: string,
+  now: number
+): ActiveWaiver | undefined {
+  return waivers.find(
+    (w) => scopeMatches(w, candidateDigest, consumerId, environment, compatDirection) && now >= w.expiresAt
+  );
 }
 
 function isNewer(a: AppliedEvidence, b: AppliedEvidence): boolean {
@@ -130,17 +222,20 @@ function isNewer(a: AppliedEvidence, b: AppliedEvidence): boolean {
 
 /**
  * Fingerprint the decision-relevant evidence set. Two evaluations with the
- * same required consumers, the same winning report per consumer, and the same
- * compatibility verdict produce the same fingerprint. A decision stores this
- * value; later-arriving evidence changes the *live* evaluation but cannot
- * retroactively alter what a stored decision was based on.
+ * same required consumers, the same winning report per consumer, the same
+ * compatibility verdict, the same environment, and the same set of applied
+ * waivers produce the same fingerprint. A decision stores this value;
+ * later-arriving evidence or waiver expiry changes the *live* evaluation but
+ * cannot retroactively alter what a stored decision was based on.
  */
 function fingerprint(
   requiredConsumers: readonly string[],
   latestByConsumer: Map<string, AppliedEvidence>,
-  compat: string
+  compat: string,
+  environment: string,
+  appliedWaivers: readonly ActiveWaiver[]
 ): string {
-  const parts: string[] = [`compat:${compat}`];
+  const parts: string[] = [`compat:${compat}`, `env:${environment}`];
   for (const consumerId of [...requiredConsumers].sort()) {
     const ev = latestByConsumer.get(consumerId);
     if (ev) {
@@ -148,6 +243,9 @@ function fingerprint(
     } else {
       parts.push(`${consumerId}=<none>`);
     }
+  }
+  for (const w of [...appliedWaivers].sort((a, b) => a.waiverId.localeCompare(b.waiverId))) {
+    parts.push(`waiver:${w.waiverId}:${w.scope.consumerId}:${w.expiresAt}`);
   }
   const hash = createHash('sha256').update(parts.join('|'), 'utf8').digest('hex');
   return `sha256:${hash}`;

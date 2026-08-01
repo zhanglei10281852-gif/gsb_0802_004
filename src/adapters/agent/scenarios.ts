@@ -188,6 +188,99 @@ export function buildScenarios(): Scenario[] {
           check: (ctx) => expectSnapshotGate(ctx, 'accounts', (g) => g.status === 'READY', 'crash retry')
         }
       ]
+    },
+
+    // 7) Time-limited, dual-controlled waiver for an offline consumer, driven
+    //    entirely on the logical clock: request -> confirm -> READY via WAIVED
+    //    -> approve -> the waiver later expires but the frozen decision stands.
+    {
+      name: 'dual-controlled-waiver-covers-offline-consumer-then-expires',
+      steps: [
+        { kind: 'registerSubject', subjectId: 'billing-svc', requiredConsumers: ['gateway', 'reporting'], freshnessWindowMs: 10_000 },
+        { kind: 'submitCandidate', subjectId: 'billing-svc', baselineSchema: baseline, candidateSchema: compatibleCandidate, submittedBy: 'dev', as: 'w1' },
+        // Only one consumer reports; 'reporting' is temporarily offline.
+        { kind: 'report', reportId: 'r-gw-1', subjectId: 'billing-svc', targetRef: 'w1', consumerId: 'gateway', verdict: 'PASS', producedAt: 0 },
+        {
+          kind: 'expect',
+          description: 'blocked: reporting is MISSING',
+          check: (ctx) => expectSnapshotGate(ctx, 'billing-svc', (g) => g.status === 'COLLECTING' && !g.canApprove, 'pre-waiver')
+        },
+        // One reviewer applies for a scoped, 5s waiver.
+        {
+          kind: 'requestWaiver', as: 'wv', subjectId: 'billing-svc', candidateRef: 'w1',
+          consumerId: 'reporting', compatDirection: 'COMPATIBLE', reason: 'reporting offline in window',
+          requestedBy: 'alice', ttlMs: 5_000
+        },
+        {
+          kind: 'expect',
+          description: 'still blocked while waiver only REQUESTED',
+          check: (ctx) => expectSnapshotGate(ctx, 'billing-svc', (g) => g.status === 'COLLECTING', 'requested-not-active')
+        },
+        // Same reviewer cannot confirm — dual control (expect DENIED).
+        { kind: 'confirmWaiver', waiverRef: 'wv', confirmedBy: 'alice' },
+        // A distinct reviewer confirms -> ACTIVE.
+        { kind: 'confirmWaiver', waiverRef: 'wv', confirmedBy: 'bob' },
+        {
+          kind: 'expect',
+          description: 'READY: reporting is WAIVED',
+          check: (ctx) =>
+            expectSnapshotGate(
+              ctx,
+              'billing-svc',
+              (g) => g.status === 'READY' && g.canApprove && g.consumers.find((c: any) => c.consumerId === 'reporting')?.status === 'WAIVED',
+              'active-waiver'
+            )
+        },
+        { kind: 'decide', proposalRef: 'w1', expectedDigestRef: 'w1', useCurrentFingerprint: true, type: 'APPROVE', decidedBy: 'release-mgr' },
+        {
+          kind: 'expect',
+          description: 'approved, snapshot records the applied waiver',
+          check: async (ctx) => {
+            const c = ctx.candidates.get('w1')!;
+            const view = await ctx.client.getProposal(c.proposalId);
+            if (view.body.proposal.state !== 'APPROVED') throw new Error('expected APPROVED');
+            const applied = view.body.decision?.gateSnapshot?.appliedWaivers ?? [];
+            if (applied.length !== 1) throw new Error('decision snapshot should record the applied waiver');
+          }
+        },
+        // Advance past the TTL: the waiver expires, but the decision is frozen.
+        { kind: 'advanceClock', deltaMs: 6_000 },
+        {
+          kind: 'expect',
+          description: 'waiver expired but historical decision unchanged',
+          check: async (ctx) => {
+            const c = ctx.candidates.get('w1')!;
+            const view = await ctx.client.getProposal(c.proposalId);
+            if (view.body.proposal.state !== 'APPROVED') throw new Error('decision must remain APPROVED');
+            const applied = view.body.decision?.gateSnapshot?.appliedWaivers ?? [];
+            if (applied.length !== 1) throw new Error('frozen snapshot must still list the waiver it relied on');
+            const wv = ctx.waivers.get('wv')!;
+            const w = await ctx.client.getWaiver(wv);
+            if (w.body.status !== 'EXPIRED') throw new Error(`waiver should be EXPIRED, was ${w.body.status}`);
+          }
+        }
+      ]
+    },
+
+    // 8) A waiver can never mask a real FAIL.
+    {
+      name: 'waiver-cannot-mask-a-fail',
+      steps: [
+        { kind: 'registerSubject', subjectId: 'risk-svc', requiredConsumers: ['scorer'], freshnessWindowMs: 10_000 },
+        { kind: 'submitCandidate', subjectId: 'risk-svc', baselineSchema: baseline, candidateSchema: compatibleCandidate, submittedBy: 'dev', as: 'f1' },
+        { kind: 'report', reportId: 'r-scorer-1', subjectId: 'risk-svc', targetRef: 'f1', consumerId: 'scorer', verdict: 'FAIL', producedAt: 0, detail: 'schema breaks parser' },
+        {
+          kind: 'requestWaiver', as: 'fw', subjectId: 'risk-svc', candidateRef: 'f1',
+          consumerId: 'scorer', compatDirection: 'COMPATIBLE', reason: 'attempt to bypass fail',
+          requestedBy: 'alice', ttlMs: 5_000
+        },
+        { kind: 'confirmWaiver', waiverRef: 'fw', confirmedBy: 'bob' },
+        {
+          kind: 'expect',
+          description: 'still BLOCKED — a FAIL is never waived',
+          check: (ctx) => expectSnapshotGate(ctx, 'risk-svc', (g) => g.status === 'BLOCKED' && !g.canApprove, 'fail-not-waived')
+        }
+      ]
     }
   ];
 }

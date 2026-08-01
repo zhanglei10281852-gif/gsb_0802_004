@@ -46,6 +46,7 @@ export type Step =
       proposalId?: string;
       expectedDigestRef?: string;
       expectedDigest?: string;
+      environment?: string;
       useCurrentFingerprint?: boolean;
       type: 'APPROVE' | 'REJECT';
       decidedBy: string;
@@ -54,6 +55,24 @@ export type Step =
       // Fire two decide calls "concurrently" to test CAS conflict handling.
       concurrentWith?: { decidedBy: string; type: 'APPROVE' | 'REJECT' };
     }
+  | {
+      // Apply for a time-limited waiver against a candidate; store its id under
+      // `as` for later confirm/reject/revoke steps.
+      kind: 'requestWaiver';
+      as: string;
+      subjectRef?: string;
+      subjectId?: string;
+      candidateRef: string;
+      consumerId: string;
+      environment?: string;
+      compatDirection: 'COMPATIBLE' | 'BREAKING' | 'UNKNOWN';
+      reason: string;
+      requestedBy: string;
+      ttlMs: number;
+    }
+  | { kind: 'confirmWaiver'; waiverRef: string; confirmedBy: string }
+  | { kind: 'rejectWaiver'; waiverRef: string; rejectedBy: string; reason: string }
+  | { kind: 'revokeWaiver'; waiverRef: string; revokedBy: string; reason: string }
   | { kind: 'expect'; description: string; check: (ctx: ScenarioContext) => Promise<void> | void }
   | { kind: 'log'; message: string };
 
@@ -67,6 +86,8 @@ export interface ScenarioContext {
   client: ControlCenterClient;
   /** alias -> { proposalId, digest } for candidates submitted with `as`. */
   candidates: Map<string, { proposalId: string; digest: string }>;
+  /** alias -> waiverId for waivers requested with `as`. */
+  waivers: Map<string, string>;
   /** free-form record of step outcomes for assertions. */
   outcomes: Array<{ step: string; result: unknown }>;
 }
@@ -81,7 +102,7 @@ export class AgentSimulator {
   constructor(private readonly client: ControlCenterClient) {}
 
   async run(scenario: Scenario): Promise<RunResult> {
-    const ctx: ScenarioContext = { client: this.client, candidates: new Map(), outcomes: [] };
+    const ctx: ScenarioContext = { client: this.client, candidates: new Map(), waivers: new Map(), outcomes: [] };
     const steps: RunResult['steps'] = [];
     let passed = true;
 
@@ -205,6 +226,7 @@ export class AgentSimulator {
         const r = await this.client.decide(proposalId, {
           expectedDigest,
           expectedFingerprint: fingerprint,
+          environment: step.environment,
           type: step.type,
           decidedBy: step.decidedBy,
           note: step.note
@@ -213,11 +235,64 @@ export class AgentSimulator {
         return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
       }
 
+      case 'requestWaiver': {
+        const subjectId = step.subjectId ?? this.resolveSubjectId(step.subjectRef, ctx);
+        const digest = this.resolveDigestRef(step.candidateRef, ctx);
+        const r = await this.client.requestWaiver({
+          subjectId,
+          candidateDigest: digest,
+          consumerId: step.consumerId,
+          environment: step.environment,
+          compatDirection: step.compatDirection,
+          reason: step.reason,
+          requestedBy: step.requestedBy,
+          ttlMs: step.ttlMs
+        });
+        if (r.body?.waiver?.waiverId) ctx.waivers.set(step.as, r.body.waiver.waiverId);
+        ctx.outcomes.push({ step: `requestWaiver ${step.as}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'confirmWaiver': {
+        const id = this.resolveWaiverId(step.waiverRef, ctx);
+        const r = await this.client.confirmWaiver(id, step.confirmedBy);
+        ctx.outcomes.push({ step: `confirmWaiver ${step.waiverRef}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'rejectWaiver': {
+        const id = this.resolveWaiverId(step.waiverRef, ctx);
+        const r = await this.client.rejectWaiver(id, step.rejectedBy, step.reason);
+        ctx.outcomes.push({ step: `rejectWaiver ${step.waiverRef}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'revokeWaiver': {
+        const id = this.resolveWaiverId(step.waiverRef, ctx);
+        const r = await this.client.revokeWaiver(id, step.revokedBy, step.reason);
+        ctx.outcomes.push({ step: `revokeWaiver ${step.waiverRef}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
       case 'expect': {
         await step.check(ctx);
         return step.description;
       }
     }
+  }
+
+  private resolveSubjectId(ref: string | undefined, ctx: ScenarioContext): string {
+    if (!ref) throw new Error('step needs subjectId or subjectRef');
+    const c = ctx.candidates.get(ref);
+    // subjectRef reuses a candidate alias only if the caller stored one; else
+    // treat the ref itself as a literal subject id.
+    return c ? ref : ref;
+  }
+
+  private resolveWaiverId(ref: string, ctx: ScenarioContext): string {
+    const id = ctx.waivers.get(ref);
+    if (!id) throw new Error(`unknown waiver ref "${ref}"`);
+    return id;
   }
 
   private resolveDigest(step: Extract<Step, { kind: 'report' }>, ctx: ScenarioContext): string {

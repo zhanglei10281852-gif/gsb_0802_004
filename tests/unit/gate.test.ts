@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateGate } from '../../src/domain/gate.ts';
-import type { AppliedEvidence, CompatReport, GateInput } from '../../src/domain/types.ts';
+import type { ActiveWaiver, AppliedEvidence, CompatReport, GateInput } from '../../src/domain/types.ts';
 
 const compat: CompatReport = { result: 'COMPATIBLE', changes: [] };
+const DIGEST = 'sha256:cand';
+const ENV = 'production';
 
 function ev(partial: Partial<AppliedEvidence> & { consumerId: string; verdict: 'PASS' | 'FAIL' }): AppliedEvidence {
   return {
@@ -16,6 +18,19 @@ function ev(partial: Partial<AppliedEvidence> & { consumerId: string; verdict: '
   };
 }
 
+function waiver(over: Partial<ActiveWaiver> & { consumerId: string; expiresAt: number }): ActiveWaiver {
+  return {
+    waiverId: over.waiverId ?? `w-${over.consumerId}`,
+    scope: {
+      candidateDigest: over.scope?.candidateDigest ?? DIGEST,
+      consumerId: over.consumerId,
+      environment: over.scope?.environment ?? ENV,
+      compatDirection: over.scope?.compatDirection ?? 'COMPATIBLE'
+    },
+    expiresAt: over.expiresAt
+  };
+}
+
 function input(over: Partial<GateInput>): GateInput {
   return {
     requiredConsumers: ['a', 'b'],
@@ -24,6 +39,9 @@ function input(over: Partial<GateInput>): GateInput {
     submittedAt: 0,
     now: 0,
     freshnessWindowMs: 1000,
+    candidateDigest: DIGEST,
+    environment: ENV,
+    waivers: [],
     ...over
   };
 }
@@ -106,4 +124,87 @@ test('BREAKING compat adds an advisory but does not block a fresh PASS gate', ()
   );
   assert.equal(r.status, 'READY');
   assert.ok(r.advisories.length > 0);
+});
+
+// --- waivers ---------------------------------------------------------------
+
+test('active waiver covers a MISSING consumer -> WAIVED, gate READY', () => {
+  const r = evaluateGate(
+    input({
+      requiredConsumers: ['a'],
+      appliedEvidence: [],
+      now: 100,
+      waivers: [waiver({ consumerId: 'a', expiresAt: 1000 })]
+    })
+  );
+  assert.equal(r.consumers[0].status, 'WAIVED');
+  assert.equal(r.status, 'READY');
+  assert.equal(r.canApprove, true);
+  assert.equal(r.appliedWaivers.length, 1);
+});
+
+test('active waiver covers a STALE consumer', () => {
+  const r = evaluateGate(
+    input({
+      requiredConsumers: ['a'],
+      now: 5000,
+      freshnessWindowMs: 1000,
+      appliedEvidence: [ev({ consumerId: 'a', verdict: 'PASS', producedAt: 0 })],
+      waivers: [waiver({ consumerId: 'a', expiresAt: 6000 })]
+    })
+  );
+  assert.equal(r.consumers[0].status, 'WAIVED');
+  assert.equal(r.status, 'READY');
+});
+
+test('a FAIL is never waived, even with a matching waiver', () => {
+  const r = evaluateGate(
+    input({
+      requiredConsumers: ['a'],
+      appliedEvidence: [ev({ consumerId: 'a', verdict: 'FAIL' })],
+      waivers: [waiver({ consumerId: 'a', expiresAt: 1000 })]
+    })
+  );
+  assert.equal(r.consumers[0].status, 'FAIL');
+  assert.equal(r.status, 'BLOCKED');
+  assert.equal(r.canApprove, false);
+});
+
+test('expired waiver does not participate; produces advisory', () => {
+  const r = evaluateGate(
+    input({
+      requiredConsumers: ['a'],
+      appliedEvidence: [],
+      now: 1000,
+      waivers: [waiver({ consumerId: 'a', expiresAt: 1000 })] // now >= expiresAt
+    })
+  );
+  assert.equal(r.consumers[0].status, 'MISSING');
+  assert.equal(r.status, 'COLLECTING');
+  assert.ok(r.advisories.some((a) => a.includes('expired')));
+});
+
+test('waiver with wrong scope does not apply (digest/env/consumer/direction)', () => {
+  const wrongDigest = waiver({ consumerId: 'a', expiresAt: 1000, scope: { candidateDigest: 'sha256:other', consumerId: 'a', environment: ENV, compatDirection: 'COMPATIBLE' } });
+  const wrongEnv = waiver({ consumerId: 'a', expiresAt: 1000, scope: { candidateDigest: DIGEST, consumerId: 'a', environment: 'staging', compatDirection: 'COMPATIBLE' } });
+  const wrongDir = waiver({ consumerId: 'a', expiresAt: 1000, scope: { candidateDigest: DIGEST, consumerId: 'a', environment: ENV, compatDirection: 'BREAKING' } });
+  const wrongConsumer = waiver({ consumerId: 'b', expiresAt: 1000 });
+  for (const w of [wrongDigest, wrongEnv, wrongDir, wrongConsumer]) {
+    const r = evaluateGate(input({ requiredConsumers: ['a'], appliedEvidence: [], waivers: [w] }));
+    assert.equal(r.status, 'COLLECTING', `waiver ${JSON.stringify(w.scope)} should not apply`);
+  }
+});
+
+test('fingerprint changes when an applied waiver is present', () => {
+  const withoutWaiver = evaluateGate(input({ requiredConsumers: ['a'], appliedEvidence: [ev({ consumerId: 'a', verdict: 'PASS' })] }));
+  const withWaiver = evaluateGate(
+    input({ requiredConsumers: ['a'], appliedEvidence: [], now: 10, waivers: [waiver({ consumerId: 'a', expiresAt: 1000 })] })
+  );
+  assert.notEqual(withoutWaiver.evidenceFingerprint, withWaiver.evidenceFingerprint);
+});
+
+test('different environment yields different fingerprint', () => {
+  const prod = evaluateGate(input({ requiredConsumers: ['a'], appliedEvidence: [ev({ consumerId: 'a', verdict: 'PASS' })], environment: 'production' }));
+  const stg = evaluateGate(input({ requiredConsumers: ['a'], appliedEvidence: [ev({ consumerId: 'a', verdict: 'PASS' })], environment: 'staging' }));
+  assert.notEqual(prod.evidenceFingerprint, stg.evidenceFingerprint);
 });

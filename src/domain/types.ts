@@ -36,7 +36,7 @@ export interface CompatReport {
 }
 
 /** Per-consumer readiness derived by the gate from applied evidence. */
-export type ConsumerStatus = 'MISSING' | 'STALE' | 'PASS' | 'FAIL';
+export type ConsumerStatus = 'MISSING' | 'STALE' | 'PASS' | 'FAIL' | 'WAIVED';
 
 /**
  * Overall gate status for a candidate.
@@ -54,6 +54,65 @@ export type ProposalState =
   | 'REJECTED';
 
 export type DecisionType = 'APPROVE' | 'REJECT';
+
+/**
+ * Target environment a decision (and a waiver) applies to. The system is not
+ * multi-environment for evidence collection — evidence stays global — but a
+ * decision is made *for* an environment, and a waiver is scoped to exactly one
+ * environment so a grace granted for staging cannot leak into production.
+ */
+export type Environment = string;
+
+export const DEFAULT_ENVIRONMENT: Environment = 'production';
+
+/**
+ * The compatibility direction a waiver is allowed to cover. A waiver is a
+ * deliberate, narrowly-scoped grace for a consumer that is *temporarily
+ * offline* during a release window; it therefore only makes sense to grant it
+ * for a specific static-compatibility direction (e.g. "this COMPATIBLE change
+ * is low risk"). Binding the direction stops a waiver written for a benign
+ * change from silently covering a later, riskier candidate.
+ */
+export type CompatDirection = CompatResult;
+
+/**
+ * Immutable scope of a waiver. A waiver may only ever affect the exact
+ * (candidate digest, consumer, environment, compatibility direction) tuple it
+ * names. Nothing about this scope is derived from or folds back into the
+ * candidate digest itself — waivers are separate entities layered on top of an
+ * unchanged candidate identity.
+ */
+export interface WaiverScope {
+  readonly candidateDigest: string;
+  readonly consumerId: string;
+  readonly environment: Environment;
+  readonly compatDirection: CompatDirection;
+}
+
+/**
+ * Lifecycle of a waiver.
+ * - REQUESTED: one reviewer has applied for it; not yet active.
+ * - ACTIVE:    a second, distinct reviewer confirmed it; it participates in
+ *              gate evaluation until it expires or is revoked.
+ * - REJECTED:  a second reviewer declined it; never participated.
+ * - REVOKED:   an active waiver was withdrawn; stops participating immediately.
+ * - EXPIRED:   its time limit passed; stops participating.
+ * REJECTED / REVOKED / EXPIRED are terminal and never re-enter evaluation.
+ */
+export type WaiverStatus = 'REQUESTED' | 'ACTIVE' | 'REJECTED' | 'REVOKED' | 'EXPIRED';
+
+/**
+ * An active waiver as seen by the pure gate. The gate is told only what it
+ * needs: the scope and the expiry, plus the id for explainability. Whether a
+ * waiver is ACTIVE and unexpired is decided by the caller (service), so the
+ * gate stays a pure function of its inputs.
+ */
+export interface ActiveWaiver {
+  readonly waiverId: string;
+  readonly scope: WaiverScope;
+  /** Logical time at which the waiver stops being valid. */
+  readonly expiresAt: number;
+}
 
 /** A piece of validation evidence as applied to a proposal. */
 export interface AppliedEvidence {
@@ -73,6 +132,19 @@ export interface GateInput {
   readonly submittedAt: number;
   readonly now: number;
   readonly freshnessWindowMs: number;
+  /**
+   * The candidate being evaluated. Waivers only apply when their scope names
+   * exactly this digest.
+   */
+  readonly candidateDigest: string;
+  /** The environment this evaluation/decision is for. */
+  readonly environment: Environment;
+  /**
+   * Waivers the caller has already filtered down to ACTIVE + unexpired. The
+   * gate re-checks scope and expiry defensively but does not decide dual
+   * control or persistence — that lives in the service.
+   */
+  readonly waivers: readonly ActiveWaiver[];
 }
 
 export interface ConsumerReadiness {
@@ -82,6 +154,10 @@ export interface ConsumerReadiness {
   readonly producedAt?: number;
   readonly ageMs?: number;
   readonly detail?: string;
+  /** Set when status is WAIVED: which waiver covered this consumer. */
+  readonly waiverId?: string;
+  /** Set when status is WAIVED: when the covering waiver expires. */
+  readonly waiverExpiresAt?: number;
 }
 
 /** Result of a pure gate evaluation. */
@@ -94,11 +170,21 @@ export interface GateEvaluation {
   readonly blockingReasons: readonly string[];
   /** Non-blocking risk notes (e.g. static compatibility warnings). */
   readonly advisories: readonly string[];
+  /** The environment this evaluation was computed for. */
+  readonly environment: Environment;
+  /**
+   * Waivers that actually contributed to this evaluation (i.e. covered a
+   * MISSING/STALE consumer). Recorded so a decision snapshot preserves exactly
+   * which graces it relied on, and so the workbench can show them.
+   */
+  readonly appliedWaivers: readonly ActiveWaiver[];
   /**
    * Stable fingerprint of the evidence set that produced this evaluation.
    * A decision is bound to this fingerprint so that evidence arriving after
    * the decision cannot silently change the conclusion, and so concurrent
-   * approvals cannot act on divergent views of the evidence.
+   * approvals cannot act on divergent views of the evidence. The set of
+   * applied waivers is folded in, so approving with a waiver in effect is a
+   * distinct decision basis from approving without it.
    */
   readonly evidenceFingerprint: string;
 }

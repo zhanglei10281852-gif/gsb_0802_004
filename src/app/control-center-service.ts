@@ -3,16 +3,21 @@ import { candidateDigest } from '../domain/digest.js';
 import { analyzeCompatibility } from '../domain/compatibility.js';
 import { evaluateGate } from '../domain/gate.js';
 import type { Clock } from '../domain/clock.js';
-import type {
-  AppliedEvidence,
-  GateEvaluation,
-  JsonSchema,
-  Verdict
+import {
+  DEFAULT_ENVIRONMENT,
+  type ActiveWaiver,
+  type AppliedEvidence,
+  type CompatDirection,
+  type Environment,
+  type GateEvaluation,
+  type JsonSchema,
+  type Verdict
 } from '../domain/types.js';
 import type {
   DecisionRecord,
   ProposalRecord,
-  Repository
+  Repository,
+  WaiverRecord
 } from '../ports/repository.js';
 import { InjectedCrash, NoFaults, type FaultInjector } from '../ports/faults.js';
 
@@ -68,6 +73,8 @@ export interface DecideInput {
   expectedDigest: string;
   /** Fingerprint the workbench last saw; guards against acting on stale view. */
   expectedFingerprint?: string;
+  /** Environment this decision is for (default 'production'). */
+  environment?: Environment;
   type: 'APPROVE' | 'REJECT';
   decidedBy: string;
   note?: string;
@@ -78,10 +85,33 @@ export type DecideOutcome =
   | { status: 'CONFLICT'; reason: string }
   | { status: 'REJECTED_PRECONDITION'; reason: string };
 
+export interface RequestWaiverInput {
+  subjectId: string;
+  /** Candidate the waiver is scoped to (exact digest). */
+  candidateDigest: string;
+  consumerId: string;
+  environment?: Environment;
+  /** Compatibility direction the waiver is allowed to cover. */
+  compatDirection: CompatDirection;
+  reason: string;
+  requestedBy: string;
+  /** Duration of the grace, in logical ms, from request time. */
+  ttlMs: number;
+}
+
+export type WaiverOutcome =
+  | { status: 'REQUESTED'; waiver: WaiverRecord }
+  | { status: 'CONFIRMED'; waiver: WaiverRecord }
+  | { status: 'REJECTED'; waiver: WaiverRecord }
+  | { status: 'REVOKED'; waiver: WaiverRecord }
+  | { status: 'DENIED'; reason: string };
+
 export interface ProposalView {
   proposal: ProposalRecord;
   gate: GateEvaluation;
   decision: DecisionRecord | null;
+  /** All waivers ever raised for this candidate (any status), for audit. */
+  waivers: WaiverRecord[];
 }
 
 export class ControlCenterService {
@@ -278,6 +308,11 @@ export class ControlCenterService {
   // --- decisions -----------------------------------------------------------
 
   decide(input: DecideInput): DecideOutcome {
+    const environment = input.environment ?? DEFAULT_ENVIRONMENT;
+    // Sweep expired waivers first, so a decision never relies on a grace that
+    // has already lapsed at decision time.
+    this.repo.expireWaivers(this.clock.now());
+
     const proposal = this.repo.getProposal(input.proposalId);
     if (!proposal) {
       return { status: 'REJECTED_PRECONDITION', reason: `unknown proposal "${input.proposalId}"` };
@@ -300,7 +335,7 @@ export class ControlCenterService {
     }
 
     const subject = this.repo.getSubject(proposal.subjectId)!;
-    const gate = this.evaluateProposalGate(proposal, subject.requiredConsumers, subject.freshnessWindowMs);
+    const gate = this.evaluateProposalGate(proposal, subject.requiredConsumers, subject.freshnessWindowMs, environment);
 
     // Guard against acting on a stale view: if the caller supplied the
     // fingerprint they saw and evidence has moved since, refuse.
@@ -312,7 +347,8 @@ export class ControlCenterService {
     }
 
     // Approval is only permitted for a candidate whose evidence is complete
-    // and fresh right now. Rejections are always allowed on an open proposal.
+    // and fresh right now (waivers may satisfy MISSING/STALE consumers, never
+    // FAIL). Rejections are always allowed on an open proposal.
     if (input.type === 'APPROVE' && !gate.canApprove) {
       return {
         status: 'REJECTED_PRECONDITION',
@@ -327,10 +363,12 @@ export class ControlCenterService {
       subjectId: proposal.subjectId,
       candidateDigest: proposal.candidateDigest,
       type: input.type,
+      environment,
       evidenceFingerprint: gate.evidenceFingerprint,
       // Immutable snapshot: the conclusion is frozen with the exact gate view
-      // it was based on. Evidence arriving later is still stored, but this
-      // snapshot never changes.
+      // it was based on — including which waivers it relied on. Evidence or
+      // waiver expiry arriving later is still recorded, but this snapshot
+      // never changes.
       gateSnapshot: gate,
       decidedAt,
       decidedBy: input.decidedBy,
@@ -361,15 +399,147 @@ export class ControlCenterService {
     return { status: 'DECIDED', decision };
   }
 
+  // --- waivers -------------------------------------------------------------
+
+  /**
+   * A reviewer applies for a time-limited waiver. The waiver starts in
+   * REQUESTED and does nothing until a second, distinct reviewer confirms it.
+   * Its scope is fixed at request time and can only ever cover the named
+   * (candidate digest, consumer, environment, compat direction). The candidate
+   * must exist and be OPEN, the consumer must be required for the subject, and
+   * the requested compat direction must match the candidate's actual static
+   * result — so a waiver written for a benign change can never later cover a
+   * riskier candidate.
+   */
+  requestWaiver(input: RequestWaiverInput): WaiverOutcome {
+    const environment = input.environment ?? DEFAULT_ENVIRONMENT;
+    if (input.ttlMs <= 0) return { status: 'DENIED', reason: 'ttlMs must be positive' };
+    if (!input.reason?.trim()) return { status: 'DENIED', reason: 'a waiver must carry a reason' };
+
+    return this.repo.transaction<WaiverOutcome>(() => {
+      const subject = this.repo.getSubject(input.subjectId);
+      if (!subject) return { status: 'DENIED', reason: `unknown subject "${input.subjectId}"` };
+
+      const proposal = this.repo.getProposalByDigest(input.subjectId, input.candidateDigest);
+      if (!proposal) return { status: 'DENIED', reason: `no candidate with digest ${input.candidateDigest}` };
+      if (proposal.state !== 'OPEN') {
+        return { status: 'DENIED', reason: `candidate is ${proposal.state}; waivers only apply to the open candidate` };
+      }
+      if (!subject.requiredConsumers.includes(input.consumerId)) {
+        return { status: 'DENIED', reason: `consumer "${input.consumerId}" is not required for this subject` };
+      }
+      if (proposal.compat.result !== input.compatDirection) {
+        return {
+          status: 'DENIED',
+          reason: `compat direction mismatch: candidate is ${proposal.compat.result}, waiver requested for ${input.compatDirection}`
+        };
+      }
+
+      const now = this.clock.now();
+      const waiver: WaiverRecord = {
+        waiverId: randomUUID(),
+        subjectId: input.subjectId,
+        candidateDigest: input.candidateDigest,
+        consumerId: input.consumerId,
+        environment,
+        compatDirection: input.compatDirection,
+        status: 'REQUESTED',
+        reason: input.reason.trim(),
+        requestedBy: input.requestedBy,
+        requestedAt: now,
+        expiresAt: now + input.ttlMs,
+        confirmedBy: null,
+        confirmedAt: null,
+        closedBy: null,
+        closedAt: null,
+        endReason: null
+      };
+      this.repo.insertWaiver(waiver);
+      this.repo.appendEvent('waiver.requested', now, { subjectId: input.subjectId, proposalId: proposal.proposalId }, {
+        waiverId: waiver.waiverId,
+        requestedBy: input.requestedBy,
+        scope: { candidateDigest: input.candidateDigest, consumerId: input.consumerId, environment, compatDirection: input.compatDirection },
+        expiresAt: waiver.expiresAt,
+        reason: waiver.reason
+      });
+      return { status: 'REQUESTED', waiver };
+    });
+  }
+
+  /**
+   * A second reviewer confirms a REQUESTED waiver, making it ACTIVE. Dual
+   * control: the confirmer must differ from the requester. The transition is a
+   * compare-and-set on REQUESTED, so concurrent/duplicate confirmations cannot
+   * double-activate.
+   */
+  confirmWaiver(waiverId: string, confirmedBy: string): WaiverOutcome {
+    return this.repo.transaction<WaiverOutcome>(() => {
+      const waiver = this.repo.getWaiver(waiverId);
+      if (!waiver) return { status: 'DENIED', reason: `unknown waiver "${waiverId}"` };
+      if (waiver.status !== 'REQUESTED') {
+        return { status: 'DENIED', reason: `waiver is ${waiver.status}; only a REQUESTED waiver can be confirmed` };
+      }
+      if (waiver.requestedBy === confirmedBy) {
+        return { status: 'DENIED', reason: 'dual control: the confirming reviewer must differ from the requester' };
+      }
+      // Expiry can pass before confirmation; do not activate a dead waiver.
+      if (this.clock.now() >= waiver.expiresAt) {
+        this.repo.expireWaivers(this.clock.now());
+        return { status: 'DENIED', reason: 'waiver has already expired and cannot be confirmed' };
+      }
+      const ok = this.repo.confirmWaiver(waiverId, confirmedBy, this.clock.now());
+      if (!ok) return { status: 'DENIED', reason: 'waiver was concurrently transitioned' };
+      return { status: 'CONFIRMED', waiver: this.repo.getWaiver(waiverId)! };
+    });
+  }
+
+  /** A second reviewer declines a REQUESTED waiver (terminal). */
+  rejectWaiver(waiverId: string, rejectedBy: string, reason: string): WaiverOutcome {
+    return this.repo.transaction<WaiverOutcome>(() => {
+      const waiver = this.repo.getWaiver(waiverId);
+      if (!waiver) return { status: 'DENIED', reason: `unknown waiver "${waiverId}"` };
+      if (waiver.status !== 'REQUESTED') {
+        return { status: 'DENIED', reason: `waiver is ${waiver.status}; only a REQUESTED waiver can be rejected` };
+      }
+      if (waiver.requestedBy === rejectedBy) {
+        return { status: 'DENIED', reason: 'dual control: the rejecting reviewer must differ from the requester' };
+      }
+      const ok = this.repo.rejectWaiver(waiverId, rejectedBy, this.clock.now(), reason || 'rejected by reviewer');
+      if (!ok) return { status: 'DENIED', reason: 'waiver was concurrently transitioned' };
+      return { status: 'REJECTED', waiver: this.repo.getWaiver(waiverId)! };
+    });
+  }
+
+  /** Withdraw an ACTIVE waiver early (terminal). It stops participating at once. */
+  revokeWaiver(waiverId: string, revokedBy: string, reason: string): WaiverOutcome {
+    return this.repo.transaction<WaiverOutcome>(() => {
+      const waiver = this.repo.getWaiver(waiverId);
+      if (!waiver) return { status: 'DENIED', reason: `unknown waiver "${waiverId}"` };
+      if (waiver.status !== 'ACTIVE') {
+        return { status: 'DENIED', reason: `waiver is ${waiver.status}; only an ACTIVE waiver can be revoked` };
+      }
+      const ok = this.repo.revokeWaiver(waiverId, revokedBy, this.clock.now(), reason || 'revoked by reviewer');
+      if (!ok) return { status: 'DENIED', reason: 'waiver was concurrently transitioned' };
+      return { status: 'REVOKED', waiver: this.repo.getWaiver(waiverId)! };
+    });
+  }
+
+  getWaiver(waiverId: string): WaiverRecord | undefined {
+    return this.repo.getWaiver(waiverId);
+  }
+
   // --- read models ---------------------------------------------------------
 
-  getProposalView(proposalId: string): ProposalView | undefined {
+  getProposalView(proposalId: string, environment: Environment = DEFAULT_ENVIRONMENT): ProposalView | undefined {
+    // Sweep expired waivers so a read never shows a lapsed grace as active.
+    this.repo.expireWaivers(this.clock.now());
     const proposal = this.repo.getProposal(proposalId);
     if (!proposal || proposal.proposalId === SENTINEL_PROPOSAL) return undefined;
     const subject = this.repo.getSubject(proposal.subjectId)!;
-    const gate = this.evaluateProposalGate(proposal, subject.requiredConsumers, subject.freshnessWindowMs);
+    const gate = this.evaluateProposalGate(proposal, subject.requiredConsumers, subject.freshnessWindowMs, environment);
     const decision = proposal.decisionId ? this.repo.getDecision(proposal.decisionId) ?? null : null;
-    return { proposal, gate, decision };
+    const waivers = this.repo.listWaiversForCandidate(proposal.subjectId, proposal.candidateDigest);
+    return { proposal, gate, decision, waivers };
   }
 
   /**
@@ -377,8 +547,9 @@ export class ControlCenterService {
    * so a reconnecting client sees the same authoritative state regardless of
    * in-process event history.
    */
-  snapshot(): {
+  snapshot(environment: Environment = DEFAULT_ENVIRONMENT): {
     at: number;
+    environment: Environment;
     subjects: Array<{
       subject: ReturnType<Repository['getSubject']>;
       current: ProposalView | null;
@@ -386,6 +557,9 @@ export class ControlCenterService {
     }>;
     eventSeq: number;
   } {
+    // A single expiry sweep up front makes the whole snapshot internally
+    // consistent with the current logical time.
+    this.repo.expireWaivers(this.clock.now());
     const now = this.clock.now();
     const subjects = this.repo
       .listSubjects()
@@ -393,7 +567,7 @@ export class ControlCenterService {
       .map((subject) => {
       const proposals = this.repo.listProposals(subject.subjectId);
       const open = proposals.find((p) => p.state === 'OPEN');
-      const current = open ? this.getProposalView(open.proposalId)! : null;
+      const current = open ? this.getProposalView(open.proposalId, environment)! : null;
       const history = proposals
         .filter((p) => p.proposalId !== SENTINEL_PROPOSAL)
         .map((p) => ({
@@ -407,7 +581,7 @@ export class ControlCenterService {
     });
     const events = this.repo.listEvents();
     const eventSeq = events.length > 0 ? events[events.length - 1].seq : 0;
-    return { at: now, subjects, eventSeq };
+    return { at: now, environment, subjects, eventSeq };
   }
 
   listEvents(sinceSeq = 0) {
@@ -419,7 +593,8 @@ export class ControlCenterService {
   private evaluateProposalGate(
     proposal: ProposalRecord,
     requiredConsumers: string[],
-    freshnessWindowMs: number
+    freshnessWindowMs: number,
+    environment: Environment
   ): GateEvaluation {
     const applied = this.repo.listAppliedEvidence(proposal.proposalId);
     const appliedEvidence: AppliedEvidence[] = applied.map((e) => ({
@@ -430,13 +605,31 @@ export class ControlCenterService {
       receivedAt: e.receivedAt,
       detail: e.detail ?? undefined
     }));
+    // Only ACTIVE waivers for this exact candidate are handed to the gate. The
+    // gate re-checks scope + expiry, but expired waivers have already been
+    // swept out by the caller.
+    const activeWaivers: ActiveWaiver[] = this.repo
+      .listActiveWaivers(proposal.subjectId, proposal.candidateDigest)
+      .map((w) => ({
+        waiverId: w.waiverId,
+        scope: {
+          candidateDigest: w.candidateDigest,
+          consumerId: w.consumerId,
+          environment: w.environment,
+          compatDirection: w.compatDirection
+        },
+        expiresAt: w.expiresAt
+      }));
     return evaluateGate({
       requiredConsumers,
       appliedEvidence,
       compat: proposal.compat,
       submittedAt: proposal.submittedAt,
       now: this.clock.now(),
-      freshnessWindowMs
+      freshnessWindowMs,
+      candidateDigest: proposal.candidateDigest,
+      environment,
+      waivers: activeWaivers
     });
   }
 

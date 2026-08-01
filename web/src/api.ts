@@ -6,11 +6,13 @@
  */
 export interface GateConsumer {
   consumerId: string;
-  status: 'MISSING' | 'STALE' | 'PASS' | 'FAIL';
+  status: 'MISSING' | 'STALE' | 'PASS' | 'FAIL' | 'WAIVED';
   reportId?: string;
   producedAt?: number;
   ageMs?: number;
   detail?: string;
+  waiverId?: string;
+  waiverExpiresAt?: number;
 }
 
 export interface Gate {
@@ -19,7 +21,35 @@ export interface Gate {
   consumers: GateConsumer[];
   blockingReasons: string[];
   advisories: string[];
+  environment: string;
+  appliedWaivers: Array<{ waiverId: string; scope: WaiverScope; expiresAt: number }>;
   evidenceFingerprint: string;
+}
+
+export interface WaiverScope {
+  candidateDigest: string;
+  consumerId: string;
+  environment: string;
+  compatDirection: string;
+}
+
+export interface Waiver {
+  waiverId: string;
+  subjectId: string;
+  candidateDigest: string;
+  consumerId: string;
+  environment: string;
+  compatDirection: string;
+  status: 'REQUESTED' | 'ACTIVE' | 'REJECTED' | 'REVOKED' | 'EXPIRED';
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  expiresAt: number;
+  confirmedBy: string | null;
+  confirmedAt: number | null;
+  closedBy: string | null;
+  closedAt: number | null;
+  endReason: string | null;
 }
 
 export interface ProposalView {
@@ -37,15 +67,19 @@ export interface ProposalView {
   decision: null | {
     decisionId: string;
     type: string;
+    environment: string;
     evidenceFingerprint: string;
     decidedAt: number;
     decidedBy: string;
     note: string | null;
+    gateSnapshot: Gate;
   };
+  waivers: Waiver[];
 }
 
 export interface Snapshot {
   at: number;
+  environment: string;
   eventSeq: number;
   subjects: Array<{
     subject: { subjectId: string; requiredConsumers: string[]; freshnessWindowMs: number };
@@ -66,7 +100,7 @@ export async function fetchEvents(since = 0): Promise<{ events: any[] }> {
 
 export async function decide(
   proposalId: string,
-  input: { expectedDigest: string; expectedFingerprint?: string; type: 'APPROVE' | 'REJECT'; decidedBy: string; note?: string }
+  input: { expectedDigest: string; expectedFingerprint?: string; environment?: string; type: 'APPROVE' | 'REJECT'; decidedBy: string; note?: string }
 ): Promise<{ status: number; body: any }> {
   const res = await fetch(`/api/proposals/${encodeURIComponent(proposalId)}/decision`, {
     method: 'POST',
@@ -74,4 +108,38 @@ export async function decide(
     body: JSON.stringify(input)
   });
   return { status: res.status, body: await res.json() };
+}
+
+async function post(path: string, body: unknown): Promise<{ status: number; body: any }> {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return { status: res.status, body: await res.json() };
+}
+
+export function requestWaiver(input: {
+  subjectId: string;
+  candidateDigest: string;
+  consumerId: string;
+  environment: string;
+  compatDirection: string;
+  reason: string;
+  requestedBy: string;
+  ttlMs: number;
+}) {
+  return post('/api/waivers', input);
+}
+
+export function confirmWaiver(waiverId: string, confirmedBy: string) {
+  return post(`/api/waivers/${encodeURIComponent(waiverId)}/confirm`, { confirmedBy });
+}
+
+export function rejectWaiver(waiverId: string, rejectedBy: string, reason: string) {
+  return post(`/api/waivers/${encodeURIComponent(waiverId)}/reject`, { rejectedBy, reason });
+}
+
+export function revokeWaiver(waiverId: string, revokedBy: string, reason: string) {
+  return post(`/api/waivers/${encodeURIComponent(waiverId)}/revoke`, { revokedBy, reason });
 }

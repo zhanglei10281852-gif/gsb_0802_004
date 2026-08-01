@@ -1,4 +1,4 @@
-import type { CompatReport, DecisionType, GateEvaluation, JsonSchema, Verdict } from '../domain/types.js';
+import type { CompatDirection, CompatReport, DecisionType, Environment, GateEvaluation, JsonSchema, Verdict, WaiverStatus } from '../domain/types.js';
 
 /**
  * Persistence port.
@@ -63,6 +63,8 @@ export interface DecisionRecord {
   subjectId: string;
   candidateDigest: string;
   type: DecisionType;
+  /** The environment this decision was made for. */
+  environment: Environment;
   /** Evidence fingerprint the decision was bound to at decision time. */
   evidenceFingerprint: string;
   /** Immutable snapshot of the gate evaluation when the decision was made. */
@@ -70,6 +72,40 @@ export interface DecisionRecord {
   decidedAt: number;
   decidedBy: string;
   note: string | null;
+}
+
+/**
+ * A time-limited, scoped, dual-controlled waiver.
+ *
+ * A waiver is requested by one reviewer and only becomes ACTIVE once a second,
+ * distinct reviewer confirms it. Its scope is immutable and narrow: it can only
+ * ever cover the named (candidateDigest, consumerId, environment,
+ * compatDirection). It carries an explicit expiry; once expired or revoked it
+ * is terminal and never re-enters gate evaluation. The record retains the full
+ * lifecycle (who requested/confirmed/rejected/revoked, and why it ended) for
+ * the audit chain.
+ */
+export interface WaiverRecord {
+  waiverId: string;
+  subjectId: string;
+  candidateDigest: string;
+  consumerId: string;
+  environment: Environment;
+  compatDirection: CompatDirection;
+  status: WaiverStatus;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  /** Absolute logical time the waiver expires. */
+  expiresAt: number;
+  /** The second reviewer who confirmed it (null until ACTIVE). */
+  confirmedBy: string | null;
+  confirmedAt: number | null;
+  /** Reviewer who rejected/revoked it (null otherwise). */
+  closedBy: string | null;
+  closedAt: number | null;
+  /** Human-readable reason a waiver stopped participating. */
+  endReason: string | null;
 }
 
 /** Append-only causal event, for explainable history and recovery. */
@@ -113,6 +149,31 @@ export interface Repository {
    * first), giving us compare-and-set semantics for concurrent approvals.
    */
   commitDecision(rec: DecisionRecord): boolean;
+
+  // --- waivers ---
+  insertWaiver(rec: WaiverRecord): void;
+  getWaiver(waiverId: string): WaiverRecord | undefined;
+  /** All waivers for a candidate digest (any status), for audit/read models. */
+  listWaiversForCandidate(subjectId: string, candidateDigest: string): WaiverRecord[];
+  /** All currently-ACTIVE waivers for a candidate (status only; expiry handled by caller). */
+  listActiveWaivers(subjectId: string, candidateDigest: string): WaiverRecord[];
+  /**
+   * Confirm a REQUESTED waiver, transitioning it to ACTIVE, only if it is still
+   * REQUESTED. Returns false on a lost race / wrong state — compare-and-set for
+   * dual control. The confirming reviewer must differ from the requester; that
+   * check is enforced by the service before calling.
+   */
+  confirmWaiver(waiverId: string, confirmedBy: string, at: number): boolean;
+  /** Reject a REQUESTED waiver (terminal). Returns false if not REQUESTED. */
+  rejectWaiver(waiverId: string, rejectedBy: string, at: number, reason: string): boolean;
+  /** Revoke an ACTIVE waiver (terminal). Returns false if not ACTIVE. */
+  revokeWaiver(waiverId: string, revokedBy: string, at: number, reason: string): boolean;
+  /**
+   * Mark ACTIVE waivers whose expiry has passed as EXPIRED, appending an audit
+   * event for each. Returns the ids expired. Idempotent: only ACTIVE rows are
+   * touched, so re-running never double-expires.
+   */
+  expireWaivers(now: number): string[];
 
   // --- events / causal log ---
   appendEvent(type: string, at: number, ids: { subjectId?: string | null; proposalId?: string | null }, payload: unknown): number;

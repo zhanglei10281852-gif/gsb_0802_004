@@ -1,5 +1,16 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { fetchSnapshot, fetchEvents, decide, type Snapshot, type ProposalView } from './api';
+import {
+  fetchSnapshot,
+  fetchEvents,
+  decide,
+  requestWaiver,
+  confirmWaiver,
+  rejectWaiver,
+  revokeWaiver,
+  type Snapshot,
+  type ProposalView,
+  type Waiver
+} from './api';
 
 /**
  * Release manager's workbench.
@@ -28,7 +39,16 @@ const CONSUMER_COLORS: Record<string, string> = {
   PASS: '#137333',
   FAIL: '#b3261e',
   STALE: '#a56300',
-  MISSING: '#5f6368'
+  MISSING: '#5f6368',
+  WAIVED: '#6a1b9a'
+};
+
+const WAIVER_COLORS: Record<string, string> = {
+  REQUESTED: '#a56300',
+  ACTIVE: '#6a1b9a',
+  REJECTED: '#b3261e',
+  REVOKED: '#5f6368',
+  EXPIRED: '#5f6368'
 };
 
 export default function App(): JSX.Element {
@@ -36,6 +56,10 @@ export default function App(): JSX.Element {
   const [events, setEvents] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [decidedBy, setDecidedBy] = useState('release-manager');
+  // Two distinct reviewer identities so dual control can be exercised from the
+  // workbench: one applies for a waiver, the other confirms it.
+  const [reviewerA, setReviewerA] = useState('reviewer-A');
+  const [reviewerB, setReviewerB] = useState('reviewer-B');
   const [busy, setBusy] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -61,6 +85,7 @@ export default function App(): JSX.Element {
       const r = await decide(view.proposal.proposalId, {
         expectedDigest: view.proposal.candidateDigest,
         expectedFingerprint: view.gate.evidenceFingerprint,
+        environment: view.gate.environment,
         type,
         decidedBy
       });
@@ -75,12 +100,42 @@ export default function App(): JSX.Element {
     }
   };
 
+  const runWaiverAction = async (key: string, fn: () => Promise<{ status: number; body: any }>) => {
+    setBusy(key);
+    try {
+      const r = await fn();
+      if (r.status !== 201) setError(`豁免操作被拒绝: ${r.body?.reason ?? r.body?.status ?? r.status}`);
+      else setError(null);
+      await refresh();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const onRequestWaiver = (view: ProposalView, consumerId: string, reason: string, ttlMs: number) =>
+    runWaiverAction(`req-${consumerId}`, () =>
+      requestWaiver({
+        subjectId: view.proposal.subjectId,
+        candidateDigest: view.proposal.candidateDigest,
+        consumerId,
+        environment: view.gate.environment,
+        compatDirection: view.proposal.compat.result,
+        reason,
+        requestedBy: reviewerA,
+        ttlMs
+      })
+    );
+
+  const onConfirmWaiver = (w: Waiver) => runWaiverAction(`conf-${w.waiverId}`, () => confirmWaiver(w.waiverId, reviewerB));
+  const onRejectWaiver = (w: Waiver) => runWaiverAction(`rej-${w.waiverId}`, () => rejectWaiver(w.waiverId, reviewerB, 'rejected from workbench'));
+  const onRevokeWaiver = (w: Waiver) => runWaiverAction(`rev-${w.waiverId}`, () => revokeWaiver(w.waiverId, reviewerB, 'revoked from workbench'));
+
   return (
     <div style={{ fontFamily: 'Segoe UI, system-ui, sans-serif', maxWidth: 1100, margin: '0 auto', padding: 24, color: '#202124' }}>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
         <h1 style={{ fontSize: 22 }}>数据契约变更控制中心</h1>
         <div style={{ fontSize: 13, color: '#5f6368' }}>
-          快照时刻 t={snapshot?.at ?? '—'} · 事件序号 {snapshot?.eventSeq ?? 0}
+          环境 {snapshot?.environment ?? '—'} · 快照时刻 t={snapshot?.at ?? '—'} · 事件序号 {snapshot?.eventSeq ?? 0}
         </div>
       </header>
 
@@ -88,6 +143,14 @@ export default function App(): JSX.Element {
         <label style={{ fontSize: 13 }}>
           发布负责人：
           <input value={decidedBy} onChange={(e) => setDecidedBy(e.target.value)} style={{ marginLeft: 6, padding: '2px 6px' }} />
+        </label>
+        <label style={{ fontSize: 13 }}>
+          复核人 A（申请）：
+          <input value={reviewerA} onChange={(e) => setReviewerA(e.target.value)} style={{ marginLeft: 6, padding: '2px 6px', width: 90 }} />
+        </label>
+        <label style={{ fontSize: 13 }}>
+          复核人 B（确认）：
+          <input value={reviewerB} onChange={(e) => setReviewerB(e.target.value)} style={{ marginLeft: 6, padding: '2px 6px', width: 90 }} />
         </label>
         <button onClick={refresh} style={btn}>手动刷新</button>
       </div>
@@ -112,7 +175,17 @@ export default function App(): JSX.Element {
 
           {!s.current && <p style={{ color: '#5f6368', fontSize: 14 }}>没有进行中的候选契约。</p>}
 
-          {s.current && <CandidatePanel view={s.current} onDecide={onDecide} busy={busy} />}
+          {s.current && (
+            <CandidatePanel
+              view={s.current}
+              onDecide={onDecide}
+              onRequestWaiver={onRequestWaiver}
+              onConfirmWaiver={onConfirmWaiver}
+              onRejectWaiver={onRejectWaiver}
+              onRevokeWaiver={onRevokeWaiver}
+              busy={busy}
+            />
+          )}
 
           {s.history.length > 1 && (
             <details style={{ marginTop: 8 }}>
@@ -158,18 +231,27 @@ export default function App(): JSX.Element {
 function CandidatePanel({
   view,
   onDecide,
+  onRequestWaiver,
+  onConfirmWaiver,
+  onRejectWaiver,
+  onRevokeWaiver,
   busy
 }: {
   view: ProposalView;
   onDecide: (v: ProposalView, t: 'APPROVE' | 'REJECT') => void;
+  onRequestWaiver: (v: ProposalView, consumerId: string, reason: string, ttlMs: number) => void;
+  onConfirmWaiver: (w: Waiver) => void;
+  onRejectWaiver: (w: Waiver) => void;
+  onRevokeWaiver: (w: Waiver) => void;
   busy: string | null;
 }): JSX.Element {
-  const { proposal, gate, decision } = view;
+  const { proposal, gate, decision, waivers } = view;
   return (
     <div style={{ marginTop: 8 }}>
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
         <Badge text={`门禁 ${gate.status}`} color={STATUS_COLORS[gate.status]} />
         <Badge text={`静态兼容性 ${proposal.compat.result}`} color={proposal.compat.result === 'COMPATIBLE' ? '#137333' : proposal.compat.result === 'BREAKING' ? '#b3261e' : '#a56300'} />
+        <Badge text={`环境 ${gate.environment}`} color="#1a56db" />
         <code style={{ fontSize: 12 }}>{proposal.candidateDigest.slice(0, 26)}…</code>
         <span style={{ fontSize: 12, color: '#5f6368' }}>提交人 {proposal.submittedBy}</span>
       </div>
@@ -182,7 +264,7 @@ function CandidatePanel({
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
         <thead>
           <tr style={{ textAlign: 'left', color: '#5f6368' }}>
-            <th style={th}>消费方</th><th style={th}>状态</th><th style={th}>report</th><th style={th}>产出时刻</th><th style={th}>证据年龄</th>
+            <th style={th}>消费方</th><th style={th}>状态</th><th style={th}>report</th><th style={th}>产出时刻</th><th style={th}>证据年龄</th><th style={th}>豁免</th>
           </tr>
         </thead>
         <tbody>
@@ -193,10 +275,31 @@ function CandidatePanel({
               <td style={td}>{c.reportId ? <code>{c.reportId}</code> : '—'}</td>
               <td style={td}>{c.producedAt ?? '—'}</td>
               <td style={td}>{c.ageMs != null ? `${c.ageMs}ms` : '—'}</td>
+              <td style={td}>
+                {c.status === 'WAIVED' ? (
+                  <span title={c.waiverId}>豁免至 t={c.waiverExpiresAt}</span>
+                ) : (c.status === 'MISSING' || c.status === 'STALE') ? (
+                  <button
+                    disabled={busy != null}
+                    onClick={() => onRequestWaiver(view, c.consumerId, `${c.consumerId} 在发布窗口内暂时离线`, 5_000)}
+                    style={{ ...btn, padding: '2px 8px', fontSize: 11 }}
+                  >
+                    申请豁免
+                  </button>
+                ) : '—'}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
+
+      <WaiverList
+        waivers={waivers}
+        busy={busy}
+        onConfirm={onConfirmWaiver}
+        onReject={onRejectWaiver}
+        onRevoke={onRevokeWaiver}
+      />
 
       {gate.blockingReasons.length > 0 && (
         <div style={{ marginTop: 8 }}>
@@ -214,15 +317,18 @@ function CandidatePanel({
 
       {decision ? (
         <div style={{ marginTop: 12, padding: 10, background: '#e6f4ea', borderRadius: 6, fontSize: 13 }}>
-          已决策：<strong>{decision.type}</strong> · 由 {decision.decidedBy} 于 t={decision.decidedAt}。
-          该结论已冻结于不可变快照，此后到达的证据不会改变它。
+          已决策：<strong>{decision.type}</strong> · 环境 {decision.environment} · 由 {decision.decidedBy} 于 t={decision.decidedAt}。
+          {decision.gateSnapshot?.appliedWaivers?.length > 0 && (
+            <> 依据的豁免：{decision.gateSnapshot.appliedWaivers.map((w) => w.waiverId.slice(0, 8)).join(', ')}。</>
+          )}
+          该结论已冻结于不可变快照，此后到达的证据或豁免到期/撤销都不会改变它。
         </div>
       ) : (
         <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
           <button
             disabled={!gate.canApprove || busy != null}
             onClick={() => onDecide(view, 'APPROVE')}
-            title={gate.canApprove ? '证据齐备，可以批准' : '证据未齐备，无法批准'}
+            title={gate.canApprove ? '证据齐备（或已豁免），可以批准' : '证据未齐备，无法批准'}
             style={{ ...btn, background: gate.canApprove ? '#137333' : '#c8c8c8', color: '#fff', cursor: gate.canApprove ? 'pointer' : 'not-allowed' }}
           >
             批准（仅证据齐备时可用）
@@ -232,6 +338,61 @@ function CandidatePanel({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function WaiverList({
+  waivers,
+  busy,
+  onConfirm,
+  onReject,
+  onRevoke
+}: {
+  waivers: Waiver[];
+  busy: string | null;
+  onConfirm: (w: Waiver) => void;
+  onReject: (w: Waiver) => void;
+  onRevoke: (w: Waiver) => void;
+}): JSX.Element | null {
+  if (waivers.length === 0) return null;
+  return (
+    <div style={{ marginTop: 12 }}>
+      <h4 style={{ margin: '4px 0', fontSize: 13 }}>限时豁免（双人复核）</h4>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+        <thead>
+          <tr style={{ textAlign: 'left', color: '#5f6368' }}>
+            <th style={th}>消费方</th><th style={th}>状态</th><th style={th}>方向/环境</th><th style={th}>申请人</th><th style={th}>确认人</th><th style={th}>到期</th><th style={th}>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {waivers.map((w) => (
+            <tr key={w.waiverId} style={{ borderTop: '1px solid #eee' }}>
+              <td style={td}>{w.consumerId}</td>
+              <td style={td}><Badge text={w.status} color={WAIVER_COLORS[w.status]} /></td>
+              <td style={td}>{w.compatDirection}/{w.environment}</td>
+              <td style={td}>{w.requestedBy}</td>
+              <td style={td}>{w.confirmedBy ?? '—'}</td>
+              <td style={td}>t={w.expiresAt}{w.endReason ? ` (${w.endReason})` : ''}</td>
+              <td style={td}>
+                {w.status === 'REQUESTED' && (
+                  <span style={{ display: 'flex', gap: 4 }}>
+                    <button disabled={busy != null} onClick={() => onConfirm(w)} style={{ ...btn, padding: '2px 6px', fontSize: 11, background: '#6a1b9a', color: '#fff' }}>确认</button>
+                    <button disabled={busy != null} onClick={() => onReject(w)} style={{ ...btn, padding: '2px 6px', fontSize: 11 }}>拒绝</button>
+                  </span>
+                )}
+                {w.status === 'ACTIVE' && (
+                  <button disabled={busy != null} onClick={() => onRevoke(w)} style={{ ...btn, padding: '2px 6px', fontSize: 11 }}>撤销</button>
+                )}
+                {['REJECTED', 'REVOKED', 'EXPIRED'].includes(w.status) && '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p style={{ fontSize: 11, color: '#5f6368', margin: '4px 0' }}>
+        豁免仅覆盖“缺席/证据陈旧”，不覆盖 FAIL；确认人必须不同于申请人；过期或撤销后立即停止参与新决策。
+      </p>
     </div>
   );
 }

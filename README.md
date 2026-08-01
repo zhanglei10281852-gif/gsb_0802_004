@@ -101,7 +101,24 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 
 ### 6. 因果记录与可解释性
 
-每个有意义的状态转移都写入**只增不改**的事件日志（`events` 表）：`subject.registered`、`proposal.submitted`、`proposal.superseded`、`evidence.applied`、`evidence.ignored`（含忽略原因）、`decision.committed`。工作台底部实时展示该日志，`GET /api/events` 可按序号增量拉取。
+每个有意义的状态转移都写入**只增不改**的事件日志（`events` 表）：`subject.registered`、`proposal.submitted`、`proposal.superseded`、`evidence.applied`、`evidence.ignored`（含忽略原因）、`decision.committed`（含依据的豁免 id）、`waiver.requested`、`waiver.confirmed`、`waiver.rejected`、`waiver.revoked`、`waiver.expired`（含到期原因）。工作台底部实时展示该日志，`GET /api/events` 可按序号增量拉取。
+
+---
+
+## 限时豁免（双人复核、精确作用域、可到期/撤销）
+
+有些消费方会在发布窗口内**暂时离线**。限时豁免让发布得以继续，同时**不稀释**候选摘要与不可变决策快照。
+
+设计要点：
+
+- **精确作用域**：一项豁免只能覆盖它命名的 `(候选摘要 candidateDigest, 消费方 consumerId, 环境 environment, 兼容方向 compatDirection)` 四元组。作用域在申请时固定、不可变，且**不参与、也不改变候选摘要**——豁免是叠加在不变候选身份之上的独立实体。申请时会校验候选存在且为 OPEN、消费方属于该主题、且请求的兼容方向与候选实际静态结果一致（避免为温和变更写的豁免日后覆盖更危险的候选）。
+- **双人复核（dual control）**：豁免由一名复核人 `requestWaiver` 提出，进入 `REQUESTED`，此时**不参与**门禁；必须由**另一名不同的**复核人 `confirmWaiver` 才转为 `ACTIVE` 并开始参与。确认/拒绝是对 `REQUESTED` 的比较并设置（CAS），重复或并发确认不会重复激活。
+- **只覆盖缺席/陈旧，绝不覆盖 FAIL**：豁免只能把 `MISSING` 或 `STALE` 的消费方标记为 `WAIVED`（视为已满足）。消费方一旦明确报送 `FAIL`（真实的不兼容信号），门禁始终 `BLOCKED`，豁免无法掩盖它。
+- **到期 / 撤销后不再参与**：每项豁免带绝对到期时刻（`expiresAt = 申请时刻 + ttlMs`）。到期（`EXPIRED`）或被 `revokeWaiver` 撤销（`REVOKED`）后立即成为终态，**不再进入任何新决策**。系统在每次评估 / 决策 / 快照前做惰性到期扫描（`expireWaivers`），且只扫 `ACTIVE` 行，因此幂等。
+- **环境限定**：决策针对某个环境作出（默认 `production`），豁免绑定到单一环境。为 staging 授予的豁免不会泄漏到 production 门禁；不同环境产生不同的证据指纹。
+- **历史快照保持原样**：决策时冻结的 `gateSnapshot` 记录了它**依据的具体豁免**（`appliedWaivers`）。此后该豁免到期或被撤销，只改变**实时**评估，**绝不**改动已经形成的历史快照与已决结论。证据指纹把「应用了哪些豁免」一并纳入，所以「凭豁免批准」与「无豁免批准」是两个不同的决策依据。
+
+豁免的完整生命周期（申请、复核、拒绝、撤销、到期原因）都写入因果审计链（见上一节的事件类型），并随 SQLite 重启完整恢复。
 
 ---
 
@@ -192,13 +209,18 @@ tests/
 | `POST /api/analyze` | 无状态预览：`{ baselineSchema, candidateSchema }` → `{ candidateDigest, compat }` |
 | `POST /api/subjects/:id/candidates` | 提交候选：`{ baselineSchema, candidateSchema, submittedBy }` |
 | `POST /api/evidence` | 报送证据：`{ reportId, subjectId, targetDigest, consumerId, verdict, producedAt, detail? }` |
-| `POST /api/proposals/:id/decision` | 决策：`{ expectedDigest, expectedFingerprint?, type, decidedBy, note? }` |
-| `GET  /api/proposals/:id` | 单个提案视图（含实时门禁与决策） |
-| `GET  /api/snapshot` | 一致快照（工作台使用，源自持久化存储） |
+| `POST /api/proposals/:id/decision` | 决策：`{ expectedDigest, expectedFingerprint?, environment?, type, decidedBy, note? }` |
+| `POST /api/waivers` | 申请豁免：`{ subjectId, candidateDigest, consumerId, environment?, compatDirection, reason, requestedBy, ttlMs }` |
+| `POST /api/waivers/:id/confirm` | 第二名复核人确认：`{ confirmedBy }`（须不同于申请人） |
+| `POST /api/waivers/:id/reject` | 第二名复核人拒绝：`{ rejectedBy, reason }` |
+| `POST /api/waivers/:id/revoke` | 撤销 ACTIVE 豁免：`{ revokedBy, reason }` |
+| `GET  /api/waivers/:id` | 单个豁免记录（完整生命周期） |
+| `GET  /api/proposals/:id?environment=` | 单个提案视图（含实时门禁、决策、豁免列表） |
+| `GET  /api/snapshot?environment=` | 一致快照（工作台使用，源自持久化存储） |
 | `GET  /api/events?since=<seq>` | 因果事件日志（增量） |
 | `*    /api/control/*` | **仅** `CONTROLLABLE=1` 时存在：逻辑时钟 / 故障点控制 |
 
-状态码约定：`201` 新建（提案 / 证据应用 / 决策成功）、`200` 幂等或忽略、`409` 冲突（决策竞争 / 已终态）、`422` 前置条件不满足（门禁未就绪 / 摘要或指纹不匹配）、`503` 注入崩溃。
+状态码约定：`201` 新建（提案 / 证据应用 / 决策成功 / 豁免状态转移成功）、`200` 幂等或忽略、`409` 冲突（决策竞争 / 已终态）、`422` 前置条件不满足（门禁未就绪 / 摘要或指纹不匹配 / 豁免被拒绝，如双人复核违规、作用域或方向不符、已过期）、`503` 注入崩溃。
 
 ---
 
@@ -209,12 +231,13 @@ tests/
 3. 开发者通过 `POST /api/subjects` 注册主题，`POST /api/subjects/:id/candidates` 提交基线与候选，得到稳定摘要与兼容性结果。
 4. 构建代理对该候选持续 `POST /api/evidence` 报送各消费方结果（可重试，幂等）。
 5. 工作台实时显示依赖消费方就绪度、证据新鲜度、阻塞原因；**批准按钮仅在门禁 `READY` 时可用**。
-6. 发布负责人批准 / 驳回，结论以不可变快照落库；之后的迟到证据不改变结论。
-7. 需要复现异常时序时，用 `CONTROLLABLE=1` 启动并通过 `npm run e2e` 或模拟器 CLI 脚本化重放。
+6. 若某消费方在发布窗口内暂时离线（`MISSING`/`STALE`），复核人 A 可对精确作用域 `申请豁免`；复核人 B（不同人）`确认`后该消费方变为 `WAIVED`，门禁可达 `READY`。豁免不覆盖 `FAIL`，过期/撤销后自动退出。
+7. 发布负责人批准 / 驳回，结论以不可变快照落库（含依据的豁免）；之后的迟到证据或豁免到期/撤销都不改变结论。
+8. 需要复现异常时序时，用 `CONTROLLABLE=1` 启动并通过 `npm run e2e` 或模拟器 CLI 脚本化重放。
 
 ---
 
 ## 测试与验证
 
-- `npm test`：40+ 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复。
-- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景，随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照。
+- `npm test`：54 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复，以及豁免：双人复核、精确作用域、绝不覆盖 FAIL、到期/撤销退出、决策快照不可变、审计链与重启恢复。
+- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景（含 `dual-controlled-waiver-covers-offline-consumer-then-expires` 与 `waiver-cannot-mask-a-fail`，全程逻辑时钟无真实等待），随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照。

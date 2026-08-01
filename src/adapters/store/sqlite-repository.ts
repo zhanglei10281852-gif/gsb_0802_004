@@ -5,7 +5,8 @@ import type {
   EvidenceRecord,
   ProposalRecord,
   Repository,
-  SubjectRecord
+  SubjectRecord,
+  WaiverRecord
 } from '../../ports/repository.js';
 
 /**
@@ -85,12 +86,34 @@ export class SqliteRepository implements Repository {
         subject_id TEXT NOT NULL,
         candidate_digest TEXT NOT NULL,
         type TEXT NOT NULL,
+        environment TEXT NOT NULL DEFAULT 'production',
         evidence_fingerprint TEXT NOT NULL,
         gate_snapshot TEXT NOT NULL,
         decided_at INTEGER NOT NULL,
         decided_by TEXT NOT NULL,
         note TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS waivers (
+        waiver_id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL,
+        candidate_digest TEXT NOT NULL,
+        consumer_id TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        compat_direction TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        requested_by TEXT NOT NULL,
+        requested_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        confirmed_by TEXT,
+        confirmed_at INTEGER,
+        closed_by TEXT,
+        closed_at INTEGER,
+        end_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_waivers_candidate ON waivers(subject_id, candidate_digest);
+      CREATE INDEX IF NOT EXISTS idx_waivers_status ON waivers(status);
 
       CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,10 +291,10 @@ export class SqliteRepository implements Repository {
       this.db
         .prepare(
           `INSERT INTO decisions
-            (decision_id, proposal_id, subject_id, candidate_digest, type,
+            (decision_id, proposal_id, subject_id, candidate_digest, type, environment,
              evidence_fingerprint, gate_snapshot, decided_at, decided_by, note)
            VALUES
-            (@decisionId, @proposalId, @subjectId, @candidateDigest, @type,
+            (@decisionId, @proposalId, @subjectId, @candidateDigest, @type, @environment,
              @evidenceFingerprint, @gateSnapshot, @decidedAt, @decidedBy, @note)`
         )
         .run({
@@ -280,6 +303,7 @@ export class SqliteRepository implements Repository {
           subjectId: d.subjectId,
           candidateDigest: d.candidateDigest,
           type: d.type,
+          environment: d.environment,
           evidenceFingerprint: d.evidenceFingerprint,
           gateSnapshot: JSON.stringify(d.gateSnapshot),
           decidedAt: d.decidedAt,
@@ -295,12 +319,151 @@ export class SqliteRepository implements Repository {
         .run(d.decidedAt, 'decision.committed', d.subjectId, d.proposalId, JSON.stringify({
           decisionId: d.decisionId,
           type: d.type,
-          evidenceFingerprint: d.evidenceFingerprint
+          environment: d.environment,
+          evidenceFingerprint: d.evidenceFingerprint,
+          appliedWaivers: d.gateSnapshot.appliedWaivers.map((w) => w.waiverId)
         }));
 
       return true;
     });
     return tx(rec);
+  }
+
+  // --- waivers ---
+  insertWaiver(rec: WaiverRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO waivers
+          (waiver_id, subject_id, candidate_digest, consumer_id, environment, compat_direction,
+           status, reason, requested_by, requested_at, expires_at,
+           confirmed_by, confirmed_at, closed_by, closed_at, end_reason)
+         VALUES
+          (@waiverId, @subjectId, @candidateDigest, @consumerId, @environment, @compatDirection,
+           @status, @reason, @requestedBy, @requestedAt, @expiresAt,
+           @confirmedBy, @confirmedAt, @closedBy, @closedAt, @endReason)`
+      )
+      .run({
+        waiverId: rec.waiverId,
+        subjectId: rec.subjectId,
+        candidateDigest: rec.candidateDigest,
+        consumerId: rec.consumerId,
+        environment: rec.environment,
+        compatDirection: rec.compatDirection,
+        status: rec.status,
+        reason: rec.reason,
+        requestedBy: rec.requestedBy,
+        requestedAt: rec.requestedAt,
+        expiresAt: rec.expiresAt,
+        confirmedBy: rec.confirmedBy,
+        confirmedAt: rec.confirmedAt,
+        closedBy: rec.closedBy,
+        closedAt: rec.closedAt,
+        endReason: rec.endReason
+      });
+  }
+
+  getWaiver(waiverId: string): WaiverRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM waivers WHERE waiver_id = ?').get(waiverId) as any;
+    return row ? rowToWaiver(row) : undefined;
+  }
+
+  listWaiversForCandidate(subjectId: string, candidateDigest: string): WaiverRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM waivers WHERE subject_id = ? AND candidate_digest = ? ORDER BY requested_at ASC, waiver_id ASC')
+      .all(subjectId, candidateDigest) as any[];
+    return rows.map(rowToWaiver);
+  }
+
+  listActiveWaivers(subjectId: string, candidateDigest: string): WaiverRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM waivers WHERE subject_id = ? AND candidate_digest = ? AND status = 'ACTIVE' ORDER BY expires_at DESC")
+      .all(subjectId, candidateDigest) as any[];
+    return rows.map(rowToWaiver);
+  }
+
+  confirmWaiver(waiverId: string, confirmedBy: string, at: number): boolean {
+    // Compare-and-set: only a REQUESTED waiver can transition to ACTIVE, so a
+    // duplicate/concurrent confirmation cannot re-activate or double-confirm.
+    const tx = this.db.transaction((): boolean => {
+      const upd = this.db
+        .prepare(
+          `UPDATE waivers SET status = 'ACTIVE', confirmed_by = @by, confirmed_at = @at
+           WHERE waiver_id = @id AND status = 'REQUESTED'`
+        )
+        .run({ id: waiverId, by: confirmedBy, at });
+      if (upd.changes !== 1) return false;
+      const w = this.getWaiver(waiverId)!;
+      this.appendEvent('waiver.confirmed', at, { subjectId: w.subjectId }, {
+        waiverId,
+        confirmedBy,
+        scope: { candidateDigest: w.candidateDigest, consumerId: w.consumerId, environment: w.environment, compatDirection: w.compatDirection },
+        expiresAt: w.expiresAt
+      });
+      return true;
+    });
+    return tx();
+  }
+
+  rejectWaiver(waiverId: string, rejectedBy: string, at: number, reason: string): boolean {
+    const tx = this.db.transaction((): boolean => {
+      const upd = this.db
+        .prepare(
+          `UPDATE waivers SET status = 'REJECTED', closed_by = @by, closed_at = @at, end_reason = @reason
+           WHERE waiver_id = @id AND status = 'REQUESTED'`
+        )
+        .run({ id: waiverId, by: rejectedBy, at, reason });
+      if (upd.changes !== 1) return false;
+      const w = this.getWaiver(waiverId)!;
+      this.appendEvent('waiver.rejected', at, { subjectId: w.subjectId }, { waiverId, rejectedBy, reason });
+      return true;
+    });
+    return tx();
+  }
+
+  revokeWaiver(waiverId: string, revokedBy: string, at: number, reason: string): boolean {
+    const tx = this.db.transaction((): boolean => {
+      const upd = this.db
+        .prepare(
+          `UPDATE waivers SET status = 'REVOKED', closed_by = @by, closed_at = @at, end_reason = @reason
+           WHERE waiver_id = @id AND status = 'ACTIVE'`
+        )
+        .run({ id: waiverId, by: revokedBy, at, reason });
+      if (upd.changes !== 1) return false;
+      const w = this.getWaiver(waiverId)!;
+      this.appendEvent('waiver.revoked', at, { subjectId: w.subjectId }, { waiverId, revokedBy, reason });
+      return true;
+    });
+    return tx();
+  }
+
+  expireWaivers(now: number): string[] {
+    // Lazy expiry: flip any ACTIVE waiver past its expiry to EXPIRED and log
+    // why. Only ACTIVE rows are matched, so this is idempotent across calls.
+    const tx = this.db.transaction((): string[] => {
+      const due = this.db
+        .prepare("SELECT * FROM waivers WHERE status = 'ACTIVE' AND expires_at <= ?")
+        .all(now) as any[];
+      const ids: string[] = [];
+      for (const row of due) {
+        const w = rowToWaiver(row);
+        this.db
+          .prepare(
+            `UPDATE waivers SET status = 'EXPIRED', end_reason = @reason
+             WHERE waiver_id = @id AND status = 'ACTIVE'`
+          )
+          .run({ id: w.waiverId, reason: `expired at t=${w.expiresAt}` });
+        this.appendEvent('waiver.expired', now, { subjectId: w.subjectId }, {
+          waiverId: w.waiverId,
+          consumerId: w.consumerId,
+          environment: w.environment,
+          expiresAt: w.expiresAt,
+          reason: `waiver expired at t=${w.expiresAt} (now t=${now})`
+        });
+        ids.push(w.waiverId);
+      }
+      return ids;
+    });
+    return tx();
   }
 
   // --- events ---
@@ -389,10 +552,32 @@ function rowToDecision(row: any): DecisionRecord {
     subjectId: row.subject_id,
     candidateDigest: row.candidate_digest,
     type: row.type,
+    environment: row.environment ?? 'production',
     evidenceFingerprint: row.evidence_fingerprint,
     gateSnapshot: JSON.parse(row.gate_snapshot),
     decidedAt: row.decided_at,
     decidedBy: row.decided_by,
     note: row.note
+  };
+}
+
+function rowToWaiver(row: any): WaiverRecord {
+  return {
+    waiverId: row.waiver_id,
+    subjectId: row.subject_id,
+    candidateDigest: row.candidate_digest,
+    consumerId: row.consumer_id,
+    environment: row.environment,
+    compatDirection: row.compat_direction,
+    status: row.status,
+    reason: row.reason,
+    requestedBy: row.requested_by,
+    requestedAt: row.requested_at,
+    expiresAt: row.expires_at,
+    confirmedBy: row.confirmed_by,
+    confirmedAt: row.confirmed_at,
+    closedBy: row.closed_by,
+    closedAt: row.closed_at,
+    endReason: row.end_reason
   };
 }
