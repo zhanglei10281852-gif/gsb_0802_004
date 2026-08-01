@@ -121,6 +121,7 @@ export interface ProposalDetail {
   lineage: ProposalLineage;
   successors: Proposal[];
   parent: Proposal | null;
+  rollout: Rollout | null;
 }
 
 export interface Snapshot {
@@ -135,6 +136,40 @@ export interface CausalEvent {
   payload: Record<string, unknown>;
   clock: number;
   recordedAt: number;
+}
+
+export type WaveStatus = 'pending' | 'in_progress' | 'succeeded' | 'failed' | 'paused' | 'rolled_back';
+export type RolloutStatus = 'not_started' | 'in_progress' | 'paused' | 'succeeded' | 'failed' | 'rolled_back';
+export type ReceiptResult = 'success' | 'failure' | 'unknown';
+
+export interface Wave {
+  id: string;
+  rolloutId: string;
+  proposalId: string;
+  sequence: number;
+  environment: string;
+  status: WaveStatus;
+  startedAt: number | null;
+  finishedAt: number | null;
+  lastResult: ReceiptResult | null;
+  attempts: number;
+  lastMessage: string | null;
+  lastAdapterId: string | null;
+}
+
+export interface Rollout {
+  id: string;
+  proposalId: string;
+  candidateHash: string;
+  decisionId: string;
+  environment: string;
+  status: RolloutStatus;
+  waves: Wave[];
+  previousVersion: string | null;
+  rolledBackTo: string | null;
+  rolledBackAt: number | null;
+  createdAt: number;
+  updatedAt: number;
 }
 
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -210,6 +245,36 @@ export const api = {
       body: JSON.stringify({ reviewerId, note }),
     }),
   causalEvents: () => jsonRequest<{ events: CausalEvent[] }>('/api/causal-events'),
+  startRollout: (proposalId: string, waves: Array<{ sequence: number; environment: string }>, previousVersion: string | null) =>
+    jsonRequest<{ rollout: Rollout }>(`/api/proposals/${proposalId}/rollout`, {
+      method: 'POST',
+      body: JSON.stringify({ waves, previousVersion }),
+    }),
+  reportReceipt: (
+    rolloutId: string,
+    body: { sequence: number; result: ReceiptResult; adapterId: string; idempotencyKey: string; message?: string },
+  ) =>
+    jsonRequest<{ receipt: unknown; rollout: Rollout; duplicate: boolean }>(`/api/rollouts/${rolloutId}/receipt`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  pauseRollout: (rolloutId: string, reason: string) =>
+    jsonRequest<{ rollout: Rollout }>(`/api/rollouts/${rolloutId}/pause`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  resumeRollout: (rolloutId: string) =>
+    jsonRequest<{ rollout: Rollout }>(`/api/rollouts/${rolloutId}/resume`, { method: 'POST' }),
+  retryWave: (rolloutId: string, sequence: number) =>
+    jsonRequest<{ rollout: Rollout }>(`/api/rollouts/${rolloutId}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({ sequence }),
+    }),
+  rollbackRollout: (rolloutId: string, targetVersion: string, reason: string) =>
+    jsonRequest<{ rollout: Rollout }>(`/api/rollouts/${rolloutId}/rollback`, {
+      method: 'POST',
+      body: JSON.stringify({ targetVersion, reason }),
+    }),
 };
 
 export function shortHash(hash: string): string {

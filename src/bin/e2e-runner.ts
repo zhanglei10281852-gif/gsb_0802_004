@@ -139,6 +139,18 @@ const breakingCandidate = {
   required: ['orderId', 'amount'],
 };
 
+const rolloutCandidate = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  type: 'object',
+  properties: {
+    orderId: { type: 'string' },
+    amount: { type: 'number', minimum: 0 },
+    note: { type: 'string' },
+    rolloutToken: { type: 'string' },
+  },
+  required: ['orderId'],
+};
+
 async function postEvidenceCrashAfterWrite(
   baseUrl: string,
   proposalId: string,
@@ -161,6 +173,50 @@ async function postEvidenceCrashAfterWrite(
       break;
     }
   }
+  controller.abort();
+  try {
+    await promise;
+  } catch {
+    /* expected: connection reset before response */
+  }
+}
+
+async function pollWaveState(
+  baseUrl: string,
+  rolloutId: string,
+  sequence: number,
+  predicate: (wave: any) => boolean,
+  timeoutMs = 5000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(15);
+    try {
+      const r = await getJson(baseUrl, `/api/rollouts/${rolloutId}`);
+      const wave = r.rollout?.waves?.find((w: any) => w.sequence === sequence);
+      if (wave && predicate(wave)) return;
+    } catch {
+      /* retry */
+    }
+  }
+  throw new Error(`wave ${sequence} did not reach expected state within ${timeoutMs}ms`);
+}
+
+async function postReceiptCrashAfterWrite(
+  baseUrl: string,
+  rolloutId: string,
+  body: any,
+): Promise<void> {
+  const controller = new AbortController();
+  const promise = fetch(`${baseUrl}/api/rollouts/${rolloutId}/receipt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  });
+
+  await pollWaveState(baseUrl, rolloutId, body.sequence, (w) => w.attempts > 0 || w.status === 'succeeded' || w.status === 'failed');
+
   controller.abort();
   try {
     await promise;
@@ -681,6 +737,353 @@ async function scenarioExemptionsVirtualClock(baseUrl: string): Promise<void> {
   check(approveExpired.status === 409, 'cannot approve P2 once its exemption expired');
 }
 
+async function setupApprovedProposal(
+  baseUrl: string,
+  consumerId: string,
+  label: string,
+): Promise<{ proposalId: string; candidateHash: string; decisionId: string }> {
+  await postJson(baseUrl, '/api/consumers', { id: consumerId, name: label });
+  const created = await postJson(baseUrl, '/api/proposals', {
+    candidateSchema: rolloutCandidate,
+    baselineSchema,
+    environment: 'production',
+  });
+  check(created.status === 201, `[rollout] created proposal for ${label}`);
+  const proposalId: string = created.body.proposal.id;
+  const candidateHash: string = created.body.proposal.candidateHash;
+
+  const ev = await postJson(baseUrl, `/api/proposals/${proposalId}/evidence`, {
+    consumerId,
+    candidateHash,
+    verdict: 'compatible',
+    details: 'build green',
+    idempotencyKey: `ev-${consumerId}`,
+  });
+  check(ev.status === 200, `[rollout] evidence submitted for ${label}`);
+
+  const decision = await postJson(baseUrl, `/api/proposals/${proposalId}/decision`, {
+    action: 'approve',
+    reason: `gate ready for ${label}`,
+  });
+  check(decision.status === 200, `[rollout] proposal approved for ${label}`);
+  return { proposalId, candidateHash, decisionId: decision.body.decision.id };
+}
+
+async function scenarioPhasedRollout(baseUrl: string, dbPath: string, port: number): Promise<void> {
+  console.log('\n[scenario] phased rollout: duplicate/lost receipts, restart, pause, retry, rollback');
+  const client = new FetchClient(baseUrl);
+
+  const { proposalId, candidateHash, decisionId } = await setupApprovedProposal(
+    baseUrl,
+    'rollout-svc',
+    'Rollout Service',
+  );
+
+  const waves = [
+    { sequence: 1, environment: 'canary' },
+    { sequence: 2, environment: 'staging' },
+    { sequence: 3, environment: 'production' },
+  ];
+  const started = await postJson(baseUrl, `/api/proposals/${proposalId}/rollout`, {
+    waves,
+    previousVersion: 'v1.4.0',
+  });
+  check(started.status === 201, '[rollout] 3-wave rollout started');
+  const rolloutId: string = started.body.rollout.id;
+  check(started.body.rollout.status === 'in_progress', '[rollout] rollout in_progress');
+  check(started.body.rollout.candidateHash === candidateHash, '[rollout] bound to candidate hash');
+  check(started.body.rollout.decisionId === decisionId, '[rollout] bound to decision snapshot');
+  check(started.body.rollout.previousVersion === 'v1.4.0', '[rollout] records previous known version');
+  check(started.body.rollout.waves[0].status === 'in_progress', '[rollout] wave 1 starts in_progress');
+  check(started.body.rollout.waves[1].status === 'pending', '[rollout] wave 2 pending');
+  check(started.body.rollout.waves[2].status === 'pending', '[rollout] wave 3 pending');
+
+  const dupReceipt = await client.post(
+    `/api/rollouts/${rolloutId}/receipt`,
+    { sequence: 1, result: 'success', adapterId: 'adapter-canary', idempotencyKey: 'wave1-success', message: 'canary green' },
+    [{ kind: 'duplicate' }],
+  );
+  check(dupReceipt.status === 200, '[rollout] duplicate receipt delivery accepted');
+  const firstBody = (dupReceipt.body as any).first?.body;
+  const secondBody = (dupReceipt.body as any).second?.body;
+  check(firstBody && firstBody.duplicate === false, '[rollout] first receipt is not a duplicate');
+  check(secondBody && secondBody.duplicate === true, '[rollout] second identical receipt is marked duplicate');
+  check(
+    secondBody.receipt.id === firstBody.receipt.id,
+    '[rollout] duplicate returns the same persisted receipt',
+  );
+
+  const afterDup = await getJson(baseUrl, `/api/rollouts/${rolloutId}`);
+  const w1 = afterDup.rollout.waves.find((w: any) => w.sequence === 1);
+  check(w1.status === 'succeeded', '[rollout] wave 1 succeeded after duplicate delivery');
+  check(w1.attempts === 1, '[rollout] duplicate did not increment wave 1 attempts');
+  const w2 = afterDup.rollout.waves.find((w: any) => w.sequence === 2);
+  check(w2.status === 'in_progress', '[rollout] wave 2 started after wave 1 success');
+  const w3pending = afterDup.rollout.waves.find((w: any) => w.sequence === 3);
+  check(w3pending.status === 'pending', '[rollout] wave 3 still pending');
+
+  const futureWave = await postJson(baseUrl, `/api/rollouts/${rolloutId}/receipt`, {
+    sequence: 3,
+    result: 'success',
+    adapterId: 'adapter-prod',
+    idempotencyKey: 'too-early',
+  });
+  check(futureWave.status === 409, '[rollout] out-of-order receipt for pending wave rejected');
+  const afterFuture = await getJson(baseUrl, `/api/rollouts/${rolloutId}`);
+  check(
+    afterFuture.rollout.waves.find((w: any) => w.sequence === 3).status === 'pending',
+    '[rollout] rejected out-of-order receipt did not mutate wave 3',
+  );
+
+  const lostKey = 'wave2-lost-success';
+  await postReceiptCrashAfterWrite(baseUrl, rolloutId, {
+    sequence: 2,
+    result: 'success',
+    adapterId: 'adapter-staging',
+    idempotencyKey: lostKey,
+    message: 'staging green (response lost)',
+  });
+  check(true, '[rollout] simulated lost receipt response after durable write (crash after write)');
+
+  const retryLost = await postJson(baseUrl, `/api/rollouts/${rolloutId}/receipt`, {
+    sequence: 2,
+    result: 'success',
+    adapterId: 'adapter-staging',
+    idempotencyKey: lostKey,
+  });
+  check(retryLost.status === 200, '[rollout] retry of lost receipt accepted');
+  check(retryLost.body.duplicate === true, '[rollout] retried lost receipt deduped (write had committed)');
+  const afterLost = await getJson(baseUrl, `/api/rollouts/${rolloutId}`);
+  const w2recovered = afterLost.rollout.waves.find((w: any) => w.sequence === 2);
+  check(w2recovered.status === 'succeeded', '[rollout] wave 2 succeeded after lost-then-retried receipt');
+  check(w2recovered.attempts === 1, '[rollout] wave 2 attempts not doubled by lost-then-retried receipt');
+  const w3 = afterLost.rollout.waves.find((w: any) => w.sequence === 3);
+  check(w3.status === 'in_progress', '[rollout] wave 3 started after wave 2 success');
+
+  const outOfOrder = await postJson(baseUrl, `/api/rollouts/${rolloutId}/receipt`, {
+    sequence: 1,
+    result: 'success',
+    adapterId: 'adapter-canary',
+    idempotencyKey: 'late-for-wave1',
+  });
+  check(outOfOrder.status === 409, '[rollout] receipt for a non-current (succeeded) wave rejected');
+
+  const failed = await postJson(baseUrl, `/api/rollouts/${rolloutId}/receipt`, {
+    sequence: 3,
+    result: 'failure',
+    adapterId: 'adapter-prod',
+    idempotencyKey: 'wave3-fail',
+    message: 'health check failed',
+  });
+  check(failed.status === 200, '[rollout] failure receipt recorded');
+  check(failed.body.rollout.status === 'failed', '[rollout] rollout halted on failure');
+  const w3failed = failed.body.rollout.waves.find((w: any) => w.sequence === 3);
+  check(w3failed.status === 'failed', '[rollout] wave 3 marked failed');
+  check(w3failed.lastResult === 'failure', '[rollout] wave 3 last result is failure');
+
+  const retryNonFailed = await postJson(baseUrl, `/api/rollouts/${rolloutId}/retry`, { sequence: 1 });
+  check(retryNonFailed.status === 409, '[rollout] cannot retry a wave that did not fail');
+
+  const retried = await postJson(baseUrl, `/api/rollouts/${rolloutId}/retry`, { sequence: 3 });
+  check(retried.status === 200, '[rollout] failed wave retried');
+  check(retried.body.rollout.status === 'in_progress', '[rollout] rollout back in_progress after retry');
+  const w3retry = retried.body.rollout.waves.find((w: any) => w.sequence === 3);
+  check(w3retry.status === 'in_progress', '[rollout] wave 3 back in_progress after retry');
+
+  const unknown = await postJson(baseUrl, `/api/rollouts/${rolloutId}/receipt`, {
+    sequence: 3,
+    result: 'unknown',
+    adapterId: 'adapter-prod',
+    idempotencyKey: 'wave3-unknown',
+    message: 'adapter timed out',
+  });
+  check(unknown.status === 200, '[rollout] unknown receipt recorded');
+  check(unknown.body.rollout.status === 'in_progress', '[rollout] unknown does not halt or advance');
+  const w3unknown = unknown.body.rollout.waves.find((w: any) => w.sequence === 3);
+  check(w3unknown.status === 'in_progress', '[rollout] wave 3 stays in_progress after unknown');
+  check(w3unknown.attempts === 2, '[rollout] unknown receipt incremented attempt count');
+
+  const paused = await postJson(baseUrl, `/api/rollouts/${rolloutId}/pause`, { reason: 'investigate prod metrics' });
+  check(paused.status === 200, '[rollout] rollout paused');
+  check(paused.body.rollout.status === 'paused', '[rollout] status paused');
+  const w3paused = paused.body.rollout.waves.find((w: any) => w.sequence === 3);
+  check(w3paused.status === 'paused', '[rollout] current wave paused');
+
+  const receiptWhilePaused = await postJson(baseUrl, `/api/rollouts/${rolloutId}/receipt`, {
+    sequence: 3,
+    result: 'success',
+    adapterId: 'adapter-prod',
+    idempotencyKey: 'while-paused',
+  });
+  check(receiptWhilePaused.status === 409, '[rollout] receipt rejected while paused');
+
+  console.log('  restarting server mid-rollout (while paused)...');
+  await stopAndRestart(baseUrl, dbPath, port);
+  const recoveredPaused = await getJson(baseUrl, `/api/rollouts/${rolloutId}`);
+  check(recoveredPaused.rollout.status === 'paused', '[rollout] paused status survived restart');
+  const w3RecoveredPaused = recoveredPaused.rollout.waves.find((w: any) => w.sequence === 3);
+  check(w3RecoveredPaused.status === 'paused', '[rollout] paused wave survived restart');
+  check(w3RecoveredPaused.attempts === 2, '[rollout] attempt count survived restart');
+  check(recoveredPaused.rollout.waves.find((w: any) => w.sequence === 1).status === 'succeeded', '[rollout] wave 1 success survived restart');
+  check(recoveredPaused.rollout.waves.find((w: any) => w.sequence === 2).status === 'succeeded', '[rollout] wave 2 success survived restart');
+
+  const resumed = await postJson(baseUrl, `/api/rollouts/${rolloutId}/resume`, {});
+  check(resumed.status === 200, '[rollout] rollout resumed after restart');
+  check(resumed.body.rollout.status === 'in_progress', '[rollout] status in_progress after resume');
+
+  const finalSuccess = await postJson(baseUrl, `/api/rollouts/${rolloutId}/receipt`, {
+    sequence: 3,
+    result: 'success',
+    adapterId: 'adapter-prod',
+    idempotencyKey: 'wave3-success',
+  });
+  check(finalSuccess.status === 200, '[rollout] final wave success recorded');
+  check(finalSuccess.body.rollout.status === 'succeeded', '[rollout] rollout succeeded');
+  check(
+    finalSuccess.body.rollout.waves.every((w: any) => w.status === 'succeeded'),
+    '[rollout] all waves succeeded',
+  );
+
+  const rollbackAfterSuccess = await postJson(baseUrl, `/api/rollouts/${rolloutId}/rollback`, {
+    targetVersion: 'v1.4.0',
+    reason: 'should fail',
+  });
+  check(rollbackAfterSuccess.status === 409, '[rollout] cannot rollback an already succeeded rollout');
+
+  const proposalAfter = await getJson(baseUrl, `/api/proposals/${proposalId}`);
+  check(proposalAfter.proposal.status === 'approved', '[rollout] rollout lifecycle did not change contract decision');
+  check(proposalAfter.decision !== null && proposalAfter.decision.id === decisionId, '[rollout] original decision intact');
+
+  const events = (await getJson(baseUrl, '/api/causal-events')).events as Array<{ type: string }>;
+  const rolloutTypes = events.filter((e) => e.type.startsWith('rollout_') || e.type.startsWith('wave_')).map((e) => e.type);
+  for (const t of ['rollout_started', 'wave_started', 'wave_receipt', 'wave_succeeded', 'wave_failed', 'rollout_failed', 'wave_retried', 'rollout_paused', 'rollout_resumed', 'rollout_succeeded']) {
+    check(rolloutTypes.includes(t), `[rollout] causal event ${t} recorded`);
+  }
+
+  console.log('  [rollout] verifying rollback does not revive voided exemptions...');
+  await postJson(baseUrl, '/api/consumers', { id: 'rollout-rb', name: 'Rollback Service' });
+  const rbParent = await postJson(baseUrl, '/api/proposals', {
+    candidateSchema: {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      properties: {
+        orderId: { type: 'string' },
+        amount: { type: 'number', minimum: 0 },
+        rbTag: { type: 'string' },
+      },
+      required: ['orderId'],
+    },
+    baselineSchema,
+    environment: 'production',
+  });
+  check(rbParent.status === 201, '[rollback] parent proposal created (pending)');
+  const rbParentId: string = rbParent.body.proposal.id;
+  const oldHash: string = rbParent.body.proposal.candidateHash;
+
+  const now = Date.now();
+  const exReq = await postJson(baseUrl, '/api/exemptions', {
+    candidateHash: oldHash,
+    consumerId: 'rollout-rb',
+    environment: 'production',
+    direction: 'compatible',
+    reason: 'offline',
+    requesterId: 'alice',
+    validFrom: now,
+    validUntil: now + 3_600_000,
+  });
+  check(exReq.status === 201, '[rollback] exemption requested on parent');
+  const exConfirm = await postJson(baseUrl, `/api/exemptions/${exReq.body.exemption.id}/confirm`, { confirmerId: 'bob' });
+  check(exConfirm.status === 200, '[rollback] exemption confirmed by second reviewer');
+
+  const succ = await postJson(baseUrl, `/api/proposals/${rbParentId}/successor`, {
+    candidateSchema: {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      properties: {
+        orderId: { type: 'string' },
+        amount: { type: 'number', minimum: 0 },
+        rbTag: { type: 'string' },
+        priority: { type: 'string' },
+      },
+      required: ['orderId'],
+    },
+  });
+  check(succ.status === 201, '[rollback] successor created (parent superseded, exemption voided)');
+  const succId: string = succ.body.successor.id;
+  const succHash: string = succ.body.successor.candidateHash;
+
+  const voidedList = await getJson(baseUrl, `/api/exemptions?candidateHash=${oldHash}`);
+  check(
+    voidedList.exemptions.every((e: any) => e.status === 'voided'),
+    '[rollback] old exemptions voided by successor',
+  );
+
+  await postJson(baseUrl, `/api/proposals/${succId}/evidence`, {
+    consumerId: 'rollout-rb',
+    candidateHash: succHash,
+    verdict: 'compatible',
+    details: 'green',
+    idempotencyKey: 'rb-succ-ev',
+  });
+  await postJson(baseUrl, `/api/proposals/${succId}/evidence`, {
+    consumerId: 'rollout-svc',
+    candidateHash: succHash,
+    verdict: 'compatible',
+    details: 'green',
+    idempotencyKey: 'rb-succ-svc',
+  });
+  const succDecision = await postJson(baseUrl, `/api/proposals/${succId}/decision`, {
+    action: 'approve',
+    reason: 'successor approved',
+  });
+  check(succDecision.status === 200, '[rollback] successor approved');
+  const succDecisionId: string = succDecision.body.decision.id;
+
+  const rbStarted = await postJson(baseUrl, `/api/proposals/${succId}/rollout`, {
+    waves: [
+      { sequence: 1, environment: 'canary' },
+      { sequence: 2, environment: 'production' },
+    ],
+    previousVersion: 'v2.0.0',
+  });
+  check(rbStarted.status === 201, '[rollback] rollout started for successor');
+  const rbRolloutId: string = rbStarted.body.rollout.id;
+
+  await postJson(baseUrl, `/api/rollouts/${rbRolloutId}/receipt`, {
+    sequence: 1,
+    result: 'success',
+    adapterId: 'a1',
+    idempotencyKey: 'rb-wave1',
+  });
+
+  const rb = await postJson(baseUrl, `/api/rollouts/${rbRolloutId}/rollback`, {
+    targetVersion: 'v2.0.0',
+    reason: 'canary regression',
+  });
+  check(rb.status === 200, '[rollback] rollback executed');
+  check(rb.body.rollout.status === 'rolled_back', '[rollback] rollout marked rolled_back');
+  check(rb.body.rollout.rolledBackTo === 'v2.0.0', '[rollback] rolled back to previous known version');
+  check(
+    rb.body.rollout.waves.some((w: any) => w.status === 'rolled_back'),
+    '[rollback] unfinished waves marked rolled_back',
+  );
+
+  const decisionAfterRb = await getJson(baseUrl, `/api/proposals/${succId}`);
+  check(decisionAfterRb.proposal.status === 'approved', '[rollback] successor proposal still approved');
+  check(
+    decisionAfterRb.decision.id === succDecisionId && decisionAfterRb.decision.decision === 'approved',
+    '[rollback] original contract decision not rewritten',
+  );
+
+  const voidedAfterRb = await getJson(baseUrl, `/api/exemptions?candidateHash=${oldHash}`);
+  check(
+    voidedAfterRb.exemptions.every((e: any) => e.status === 'voided'),
+    '[rollback] voided exemptions not revived by rollback',
+  );
+  const succExAfterRb = await getJson(baseUrl, `/api/exemptions?candidateHash=${succHash}`);
+  check(succExAfterRb.exemptions.length === 0, '[rollback] no exemptions invented for successor');
+}
+
 async function main(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'ccc-e2e-'));
   const dbPath = join(dir, 'e2e.sqlite');
@@ -700,6 +1103,7 @@ async function main(): Promise<void> {
     await scenarioSuccessorLineage(handle.baseUrl, dbPath, port);
   } finally {
     if (currentHandle) await currentHandle.stop();
+    currentHandle = null;
   }
 
   const vdir = mkdtempSync(join(tmpdir(), 'ccc-e2e-virtual-'));
@@ -715,8 +1119,26 @@ async function main(): Promise<void> {
     await scenarioExemptionsVirtualClock(vhandle.baseUrl);
   } finally {
     await vhandle.stop();
+  }
+
+  const rdir = mkdtempSync(join(tmpdir(), 'ccc-e2e-rollout-'));
+  const rdbPath = join(rdir, 'rollout.sqlite');
+  const rport = 4125;
+  const rhandle = spawnServer(rdbPath, rport);
+  currentHandle = rhandle;
+  try {
+    await waitForHealth(rhandle.baseUrl).catch((err) => {
+      console.error('rollout server output:\n', rhandle.stderr);
+      throw err;
+    });
+    console.log(`rollout server up at ${rhandle.baseUrl}`);
+    await scenarioPhasedRollout(rhandle.baseUrl, rdbPath, rport);
+  } finally {
+    if (currentHandle) await currentHandle.stop();
+    currentHandle = null;
     rmSync(dir, { recursive: true, force: true });
     rmSync(vdir, { recursive: true, force: true });
+    rmSync(rdir, { recursive: true, force: true });
   }
 
   console.log(`\n${totalChecks - failedChecks}/${totalChecks} checks passed`);

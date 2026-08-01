@@ -128,6 +128,7 @@ export interface ProposalDetail {
   lineage: ProposalLineage;
   successors: Proposal[];
   parent: Proposal | null;
+  rollout: Rollout | null;
 }
 
 export interface EvidenceSubmission {
@@ -154,6 +155,61 @@ export interface ExemptionRequest {
   validUntil: number;
 }
 
+export type WaveStatus = 'pending' | 'in_progress' | 'succeeded' | 'failed' | 'paused' | 'rolled_back';
+
+export type RolloutStatus = 'not_started' | 'in_progress' | 'paused' | 'succeeded' | 'failed' | 'rolled_back';
+
+export type ReceiptResult = 'success' | 'failure' | 'unknown';
+
+export interface WaveSpec {
+  sequence: number;
+  environment: string;
+}
+
+export interface Wave {
+  id: string;
+  rolloutId: string;
+  proposalId: string;
+  sequence: number;
+  environment: string;
+  status: WaveStatus;
+  startedAt: number | null;
+  finishedAt: number | null;
+  lastResult: ReceiptResult | null;
+  attempts: number;
+  lastMessage: string | null;
+  lastAdapterId: string | null;
+}
+
+export interface Receipt {
+  id: string;
+  waveId: string;
+  proposalId: string;
+  candidateHash: string;
+  decisionId: string;
+  result: ReceiptResult;
+  adapterId: string;
+  idempotencyKey: string;
+  message: string;
+  recordedAt: number;
+  duplicate: boolean;
+}
+
+export interface Rollout {
+  id: string;
+  proposalId: string;
+  candidateHash: string;
+  decisionId: string;
+  environment: string;
+  status: RolloutStatus;
+  waves: Wave[];
+  previousVersion: string | null;
+  rolledBackTo: string | null;
+  rolledBackAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type CausalEventType =
   | 'proposal_created'
   | 'proposal_superseded'
@@ -168,7 +224,18 @@ export type CausalEventType =
   | 'exemption_rejected'
   | 'exemption_revoked'
   | 'exemption_expired'
-  | 'exemption_voided';
+  | 'exemption_voided'
+  | 'rollout_started'
+  | 'wave_started'
+  | 'wave_receipt'
+  | 'wave_succeeded'
+  | 'wave_failed'
+  | 'rollout_succeeded'
+  | 'rollout_failed'
+  | 'rollout_paused'
+  | 'rollout_resumed'
+  | 'wave_retried'
+  | 'rollout_rolled_back';
 
 export interface CausalEvent {
   id: number;

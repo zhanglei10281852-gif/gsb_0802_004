@@ -27,6 +27,13 @@ import type {
   ProposalDetail,
   ProposalLineage,
   ProposalStatus,
+  Receipt,
+  ReceiptResult,
+  Rollout,
+  RolloutStatus,
+  Wave,
+  WaveSpec,
+  WaveStatus,
 } from '../domain/types.js';
 
 export interface RepositoryOptions {
@@ -94,6 +101,48 @@ interface ExemptionRow {
   closed_at: number | null;
   closed_by: string | null;
   close_note: string | null;
+}
+
+interface RolloutRow {
+  id: string;
+  proposal_id: string;
+  candidate_hash: string;
+  decision_id: string;
+  environment: string;
+  status: RolloutStatus;
+  previous_version: string | null;
+  rolled_back_to: string | null;
+  rolled_back_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface WaveRow {
+  id: string;
+  rollout_id: string;
+  proposal_id: string;
+  sequence: number;
+  environment: string;
+  status: WaveStatus;
+  started_at: number | null;
+  finished_at: number | null;
+  last_result: ReceiptResult | null;
+  attempts: number;
+  last_message: string | null;
+  last_adapter_id: string | null;
+}
+
+interface ReceiptRow {
+  id: string;
+  wave_id: string;
+  proposal_id: string;
+  candidate_hash: string;
+  decision_id: string;
+  result: ReceiptResult;
+  adapter_id: string;
+  idempotency_key: string;
+  message: string;
+  recorded_at: number;
 }
 
 export class Repository {
@@ -737,7 +786,491 @@ export class Repository {
       lineage,
       successors,
       parent,
+      rollout: this.getRolloutByProposal(id),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phased rollout
+  // ---------------------------------------------------------------------------
+
+  private rowToWave(row: WaveRow): Wave {
+    return {
+      id: row.id,
+      rolloutId: row.rollout_id,
+      proposalId: row.proposal_id,
+      sequence: row.sequence,
+      environment: row.environment,
+      status: row.status as WaveStatus,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      lastResult: (row.last_result as ReceiptResult | null) ?? null,
+      attempts: row.attempts,
+      lastMessage: row.last_message,
+      lastAdapterId: row.last_adapter_id,
+    };
+  }
+
+  private rowToRollout(row: RolloutRow, waves: Wave[]): Rollout {
+    return {
+      id: row.id,
+      proposalId: row.proposal_id,
+      candidateHash: row.candidate_hash,
+      decisionId: row.decision_id,
+      environment: row.environment,
+      status: row.status as RolloutStatus,
+      waves,
+      previousVersion: row.previous_version,
+      rolledBackTo: row.rolled_back_to,
+      rolledBackAt: row.rolled_back_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  getRolloutByProposal(proposalId: string): Rollout | null {
+    const row = this.db
+      .prepare('SELECT * FROM rollouts WHERE proposal_id = ?')
+      .get(proposalId) as RolloutRow | undefined;
+    if (!row) return null;
+    const waves = this.db
+      .prepare('SELECT * FROM waves WHERE rollout_id = ? ORDER BY sequence ASC')
+      .all(row.id) as WaveRow[];
+    return this.rowToRollout(row, waves.map((w) => this.rowToWave(w)));
+  }
+
+  getRollout(id: string): Rollout | null {
+    const row = this.db.prepare('SELECT * FROM rollouts WHERE id = ?').get(id) as RolloutRow | undefined;
+    if (!row) return null;
+    const waves = this.db
+      .prepare('SELECT * FROM waves WHERE rollout_id = ? ORDER BY sequence ASC')
+      .all(id) as WaveRow[];
+    return this.rowToRollout(row, waves.map((w) => this.rowToWave(w)));
+  }
+
+  startRollout(
+    proposalId: string,
+    waveSpecs: WaveSpec[],
+    previousVersion: string | null,
+  ): { ok: true; rollout: Rollout } | { ok: false; reason: string } {
+    const txn = this.db.transaction<
+      () => { ok: true; rollout: Rollout } | { ok: false; reason: string }
+    >(() => {
+      const proposal = this.getProposal(proposalId);
+      if (!proposal) return { ok: false, reason: 'unknown proposal' };
+      if (proposal.status !== 'approved') {
+        return { ok: false, reason: `can only start rollout for an approved proposal (status=${proposal.status})` };
+      }
+      const decision = this.getDecision(proposalId);
+      if (!decision) return { ok: false, reason: 'approved proposal has no decision' };
+
+      const existing = this.getRolloutByProposal(proposalId);
+      if (existing) return { ok: false, reason: 'rollout already exists for this proposal' };
+
+      if (!Array.isArray(waveSpecs) || waveSpecs.length === 0) {
+        return { ok: false, reason: 'at least one wave is required' };
+      }
+      const sequences = waveSpecs.map((w) => w.sequence);
+      if (new Set(sequences).size !== sequences.length) {
+        return { ok: false, reason: 'wave sequences must be unique' };
+      }
+      const sorted = [...waveSpecs].sort((a, b) => a.sequence - b.sequence);
+      if (sorted.some((w, i) => w.sequence !== i + 1)) {
+        return { ok: false, reason: 'wave sequences must be 1..N with no gaps' };
+      }
+
+      const now = this.clock.now();
+      const rolloutId = randomUUID();
+      this.db
+        .prepare(
+          `INSERT INTO rollouts
+            (id, proposal_id, candidate_hash, decision_id, environment, status,
+             previous_version, rolled_back_to, rolled_back_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'in_progress', ?, NULL, NULL, ?, ?)`,
+        )
+        .run(
+          rolloutId,
+          proposalId,
+          proposal.candidateHash,
+          decision.id,
+          proposal.environment,
+          previousVersion,
+          now,
+          now,
+        );
+
+      const waveIds: string[] = [];
+      for (const spec of sorted) {
+        const waveId = randomUUID();
+        waveIds.push(waveId);
+        const isFirst = spec.sequence === 1;
+        this.db
+          .prepare(
+            `INSERT INTO waves
+              (id, rollout_id, proposal_id, sequence, environment, status,
+               started_at, finished_at, last_result, attempts, last_message, last_adapter_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, NULL)`,
+          )
+          .run(
+            waveId,
+            rolloutId,
+            proposalId,
+            spec.sequence,
+            spec.environment,
+            isFirst ? 'in_progress' : 'pending',
+            isFirst ? now : null,
+          );
+        if (isFirst) {
+          this.recordEvent('wave_started', {
+            rolloutId,
+            waveId,
+            proposalId,
+            sequence: spec.sequence,
+            environment: spec.environment,
+            decisionId: decision.id,
+            candidateHash: proposal.candidateHash,
+            startedAt: now,
+          });
+        }
+      }
+
+      this.recordEvent('rollout_started', {
+        rolloutId,
+        proposalId,
+        decisionId: decision.id,
+        candidateHash: proposal.candidateHash,
+        waveCount: sorted.length,
+        waves: sorted.map((w) => ({ sequence: w.sequence, environment: w.environment })),
+        previousVersion,
+        startedAt: now,
+      });
+
+      return { ok: true, rollout: this.getRollout(rolloutId)! };
+    });
+    return this.transactional(() => txn());
+  }
+
+  reportReceipt(input: {
+    rolloutId: string;
+    sequence: number;
+    result: ReceiptResult;
+    adapterId: string;
+    idempotencyKey: string;
+    message?: string;
+  }):
+    | { ok: true; receipt: Receipt; rollout: Rollout; duplicate: boolean }
+    | { ok: false; reason: string } {
+    const txn = this.db.transaction<
+      () =>
+        | { ok: true; receipt: Receipt; rollout: Rollout; duplicate: boolean }
+        | { ok: false; reason: string }
+    >(() => {
+      const rollout = this.getRollout(input.rolloutId);
+      if (!rollout) return { ok: false, reason: 'unknown rollout' };
+
+      const wave = rollout.waves.find((w) => w.sequence === input.sequence);
+      if (!wave) return { ok: false, reason: `no wave with sequence ${input.sequence}` };
+
+      if (wave.proposalId !== rollout.proposalId) {
+        return { ok: false, reason: 'wave/proposal binding mismatch' };
+      }
+
+      const existing = this.db
+        .prepare('SELECT * FROM receipts WHERE wave_id = ? AND idempotency_key = ?')
+        .get(wave.id, input.idempotencyKey) as ReceiptRow | undefined;
+      if (existing) {
+        const receipt = this.rowToReceipt(existing, true);
+        return { ok: true, receipt, rollout: this.getRollout(rollout.id)!, duplicate: true };
+      }
+
+      if (input.result !== 'success' && input.result !== 'failure' && input.result !== 'unknown') {
+        return { ok: false, reason: `invalid result "${input.result}"` };
+      }
+
+      if (wave.status !== 'in_progress') {
+        return {
+          ok: false,
+          reason: `wave ${input.sequence} is ${wave.status}; receipts only accepted for the current (in_progress) wave`,
+        };
+      }
+
+      const now = this.clock.now();
+      const receiptId = randomUUID();
+      const message = input.message ?? '';
+      this.db
+        .prepare(
+          `INSERT INTO receipts
+            (id, wave_id, proposal_id, candidate_hash, decision_id, result, adapter_id, idempotency_key, message, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          receiptId,
+          wave.id,
+          rollout.proposalId,
+          rollout.candidateHash,
+          rollout.decisionId,
+          input.result,
+          input.adapterId,
+          input.idempotencyKey,
+          message,
+          now,
+        );
+
+      const attempts = wave.attempts + 1;
+      this.db
+        .prepare(
+          `UPDATE waves SET attempts = ?, last_result = ?, last_message = ?, last_adapter_id = ? WHERE id = ?`,
+        )
+        .run(attempts, input.result, message, input.adapterId, wave.id);
+
+      const receipt = {
+        id: receiptId,
+        waveId: wave.id,
+        proposalId: rollout.proposalId,
+        candidateHash: rollout.candidateHash,
+        decisionId: rollout.decisionId,
+        result: input.result,
+        adapterId: input.adapterId,
+        idempotencyKey: input.idempotencyKey,
+        message,
+        recordedAt: now,
+        duplicate: false,
+      };
+
+      this.recordEvent('wave_receipt', {
+        rolloutId: rollout.id,
+        waveId: wave.id,
+        proposalId: rollout.proposalId,
+        sequence: wave.sequence,
+        decisionId: rollout.decisionId,
+        candidateHash: rollout.candidateHash,
+        result: input.result,
+        adapterId: input.adapterId,
+        idempotencyKey: input.idempotencyKey,
+        attempts,
+        recordedAt: now,
+      });
+
+      if (input.result === 'success') {
+        this.db
+          .prepare(
+            `UPDATE waves SET status = 'succeeded', finished_at = ? WHERE id = ?`,
+          )
+          .run(now, wave.id);
+        this.recordEvent('wave_succeeded', {
+          rolloutId: rollout.id,
+          waveId: wave.id,
+          sequence: wave.sequence,
+          finishedAt: now,
+        });
+
+        const next = rollout.waves.find((w) => w.sequence === wave.sequence + 1);
+        if (next) {
+          this.db
+            .prepare(
+              `UPDATE waves SET status = 'in_progress', started_at = ? WHERE id = ?`,
+            )
+            .run(now, next.id);
+          this.recordEvent('wave_started', {
+            rolloutId: rollout.id,
+            waveId: next.id,
+            sequence: next.sequence,
+            environment: next.environment,
+            startedAt: now,
+          });
+          this.db.prepare("UPDATE rollouts SET status = 'in_progress', updated_at = ? WHERE id = ?").run(now, rollout.id);
+        } else {
+          this.db
+            .prepare("UPDATE rollouts SET status = 'succeeded', updated_at = ? WHERE id = ?")
+            .run(now, rollout.id);
+          this.recordEvent('rollout_succeeded', {
+            rolloutId: rollout.id,
+            proposalId: rollout.proposalId,
+            finishedAt: now,
+          });
+        }
+      } else if (input.result === 'failure') {
+        this.db
+          .prepare(`UPDATE waves SET status = 'failed', finished_at = ? WHERE id = ?`)
+          .run(now, wave.id);
+        this.db
+          .prepare("UPDATE rollouts SET status = 'failed', updated_at = ? WHERE id = ?")
+          .run(now, rollout.id);
+        this.recordEvent('wave_failed', {
+          rolloutId: rollout.id,
+          waveId: wave.id,
+          sequence: wave.sequence,
+          message,
+          finishedAt: now,
+        });
+        this.recordEvent('rollout_failed', {
+          rolloutId: rollout.id,
+          proposalId: rollout.proposalId,
+          failedWave: wave.sequence,
+          finishedAt: now,
+        });
+      } else {
+        this.db.prepare("UPDATE rollouts SET updated_at = ? WHERE id = ?").run(now, rollout.id);
+      }
+
+      return { ok: true, receipt, rollout: this.getRollout(rollout.id)!, duplicate: false };
+    });
+    return this.transactional(() => txn());
+  }
+
+  pauseRollout(rolloutId: string, reason: string): { ok: true; rollout: Rollout } | { ok: false; reason: string } {
+    const txn = this.db.transaction<
+      () => { ok: true; rollout: Rollout } | { ok: false; reason: string }
+    >(() => {
+      const rollout = this.getRollout(rolloutId);
+      if (!rollout) return { ok: false, reason: 'unknown rollout' };
+      if (rollout.status !== 'in_progress') {
+        return { ok: false, reason: `cannot pause a ${rollout.status} rollout` };
+      }
+      const now = this.clock.now();
+      const current = rollout.waves.find((w) => w.status === 'in_progress');
+      if (current) {
+        this.db.prepare("UPDATE waves SET status = 'paused' WHERE id = ?").run(current.id);
+      }
+      this.db.prepare("UPDATE rollouts SET status = 'paused', updated_at = ? WHERE id = ?").run(now, rolloutId);
+      this.recordEvent('rollout_paused', {
+        rolloutId,
+        proposalId: rollout.proposalId,
+        currentWave: current?.sequence ?? null,
+        reason,
+        pausedAt: now,
+      });
+      return { ok: true, rollout: this.getRollout(rolloutId)! };
+    });
+    return this.transactional(() => txn());
+  }
+
+  resumeRollout(rolloutId: string): { ok: true; rollout: Rollout } | { ok: false; reason: string } {
+    const txn = this.db.transaction<
+      () => { ok: true; rollout: Rollout } | { ok: false; reason: string }
+    >(() => {
+      const rollout = this.getRollout(rolloutId);
+      if (!rollout) return { ok: false, reason: 'unknown rollout' };
+      if (rollout.status !== 'paused') {
+        return { ok: false, reason: `cannot resume a ${rollout.status} rollout` };
+      }
+      const now = this.clock.now();
+      const paused = rollout.waves.find((w) => w.status === 'paused');
+      if (paused) {
+        this.db.prepare("UPDATE waves SET status = 'in_progress' WHERE id = ?").run(paused.id);
+      }
+      this.db.prepare("UPDATE rollouts SET status = 'in_progress', updated_at = ? WHERE id = ?").run(now, rolloutId);
+      this.recordEvent('rollout_resumed', {
+        rolloutId,
+        proposalId: rollout.proposalId,
+        resumedWave: paused?.sequence ?? null,
+        resumedAt: now,
+      });
+      return { ok: true, rollout: this.getRollout(rolloutId)! };
+    });
+    return this.transactional(() => txn());
+  }
+
+  retryWave(
+    rolloutId: string,
+    sequence: number,
+  ): { ok: true; rollout: Rollout } | { ok: false; reason: string } {
+    const txn = this.db.transaction<
+      () => { ok: true; rollout: Rollout } | { ok: false; reason: string }
+    >(() => {
+      const rollout = this.getRollout(rolloutId);
+      if (!rollout) return { ok: false, reason: 'unknown rollout' };
+      const wave = rollout.waves.find((w) => w.sequence === sequence);
+      if (!wave) return { ok: false, reason: `no wave with sequence ${sequence}` };
+      if (wave.status !== 'failed') {
+        return { ok: false, reason: `only failed waves can be retried (status=${wave.status})` };
+      }
+      const now = this.clock.now();
+      this.db
+        .prepare(
+          `UPDATE waves SET status = 'in_progress', started_at = COALESCE(started_at, ?), finished_at = NULL WHERE id = ?`,
+        )
+        .run(now, wave.id);
+      this.db
+        .prepare("UPDATE rollouts SET status = 'in_progress', updated_at = ? WHERE id = ?")
+        .run(now, rolloutId);
+      this.recordEvent('wave_retried', {
+        rolloutId,
+        waveId: wave.id,
+        proposalId: rollout.proposalId,
+        sequence,
+        retriedAt: now,
+      });
+      return { ok: true, rollout: this.getRollout(rolloutId)! };
+    });
+    return this.transactional(() => txn());
+  }
+
+  rollback(
+    rolloutId: string,
+    targetVersion: string,
+    reason: string,
+  ): { ok: true; rollout: Rollout } | { ok: false; reason: string } {
+    const txn = this.db.transaction<
+      () => { ok: true; rollout: Rollout } | { ok: false; reason: string }
+    >(() => {
+      const rollout = this.getRollout(rolloutId);
+      if (!rollout) return { ok: false, reason: 'unknown rollout' };
+      if (rollout.status === 'succeeded') {
+        return { ok: false, reason: 'cannot rollback a completed rollout' };
+      }
+      if (rollout.status === 'rolled_back') {
+        return { ok: false, reason: 'rollout already rolled back' };
+      }
+      if (!targetVersion) return { ok: false, reason: 'targetVersion is required' };
+      const now = this.clock.now();
+      this.db
+        .prepare(
+          `UPDATE waves SET status = 'rolled_back', finished_at = COALESCE(finished_at, ?)
+           WHERE rollout_id = ? AND status IN ('in_progress','pending','paused','failed')`,
+        )
+        .run(now, rolloutId);
+      this.db
+        .prepare(
+          `UPDATE rollouts SET status = 'rolled_back', rolled_back_to = ?, rolled_back_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(targetVersion, now, now, rolloutId);
+      this.recordEvent('rollout_rolled_back', {
+        rolloutId,
+        proposalId: rollout.proposalId,
+        decisionId: rollout.decisionId,
+        candidateHash: rollout.candidateHash,
+        targetVersion,
+        previousVersion: rollout.previousVersion,
+        reason,
+        rolledBackAt: now,
+      });
+      return { ok: true, rollout: this.getRollout(rolloutId)! };
+    });
+    return this.transactional(() => txn());
+  }
+
+  private rowToReceipt(row: ReceiptRow, duplicate: boolean): Receipt {
+    return {
+      id: row.id,
+      waveId: row.wave_id,
+      proposalId: row.proposal_id,
+      candidateHash: row.candidate_hash,
+      decisionId: row.decision_id,
+      result: row.result as ReceiptResult,
+      adapterId: row.adapter_id,
+      idempotencyKey: row.idempotency_key,
+      message: row.message,
+      recordedAt: row.recorded_at,
+      duplicate,
+    };
+  }
+
+  listReceipts(waveId: string): Receipt[] {
+    const rows = this.db
+      .prepare('SELECT * FROM receipts WHERE wave_id = ? ORDER BY recorded_at ASC')
+      .all(waveId) as ReceiptRow[];
+    return rows.map((r) => this.rowToReceipt(r, false));
   }
 
   decide(

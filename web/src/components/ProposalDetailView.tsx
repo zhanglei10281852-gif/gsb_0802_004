@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { shortHash, timeAgo, type Consumer, type ProposalDetail } from '../api';
 import { ExemptionsPanel } from './ExemptionsPanel';
 import { LineagePanel } from './LineagePanel';
+import { RolloutPanel } from './RolloutPanel';
 
 interface Props {
   detail: ProposalDetail;
@@ -11,9 +12,10 @@ interface Props {
   onExemptionChange: () => void;
   onSelectProposal: (id: string) => void;
   onLineageChanged: () => void;
+  onRolloutChanged: () => void;
 }
 
-export function ProposalDetailView({ detail, consumers, now, onDecide, onExemptionChange, onSelectProposal, onLineageChanged }: Props) {
+export function ProposalDetailView({ detail, consumers, now, onDecide, onExemptionChange, onSelectProposal, onLineageChanged, onRolloutChanged }: Props) {
   const {
     proposal,
     evidence,
@@ -24,6 +26,7 @@ export function ProposalDetailView({ detail, consumers, now, onDecide, onExempti
     blockingReasons,
     gateReady,
     decision,
+    rollout,
   } = detail;
   const [reason, setReason] = useState('');
   const [tab, setTab] = useState<'candidate' | 'baseline'>('candidate');
@@ -131,6 +134,10 @@ export function ProposalDetailView({ detail, consumers, now, onDecide, onExempti
         consumerNames={consumerNames}
         onChange={onExemptionChange}
       />
+
+      {proposal.status === 'approved' && (
+        <RolloutPanel proposal={proposal} rollout={rollout} onChanged={onRolloutChanged} />
+      )}
 
       <div className="card">
         <h2>Gate Evaluation</h2>

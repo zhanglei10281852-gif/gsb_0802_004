@@ -183,6 +183,10 @@ export function App() {
               void refreshSnapshot();
               void refreshEvents();
             }}
+            onRolloutChanged={() => {
+              void refreshSnapshot();
+              void refreshEvents();
+            }}
           />
         ) : (
           <div className="empty">Select a proposal to inspect evidence and make a decision</div>

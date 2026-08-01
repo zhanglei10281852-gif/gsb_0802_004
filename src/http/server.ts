@@ -139,6 +139,126 @@ export async function buildServer(opts: ServerOptions): Promise<FastifyInstance>
     return { lineage: repo.getLineage(proposal.lineageRootId) };
   });
 
+  app.get('/api/proposals/:id/rollout', async (req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const rollout = repo.getRolloutByProposal(req.params.id);
+    if (!rollout) return reply.code(404).send({ error: 'no rollout for this proposal' });
+    return { rollout };
+  });
+
+  app.get('/api/rollouts/:id', async (req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const rollout = repo.getRollout(req.params.id);
+    if (!rollout) return reply.code(404).send({ error: 'rollout not found' });
+    return { rollout };
+  });
+
+  app.post(
+    '/api/proposals/:id/rollout',
+    async (
+      req: FastifyRequest<{
+        Params: { id: string };
+        Body: { waves?: Array<{ sequence: number; environment: string }>; previousVersion?: string };
+      }>,
+      reply: FastifyReply,
+    ) => {
+      const waves = req.body?.waves;
+      if (!Array.isArray(waves) || waves.length === 0) {
+        return reply.code(400).send({ error: 'waves array with at least one entry is required' });
+      }
+      for (const w of waves) {
+        if (!w || typeof w.sequence !== 'number' || !w.environment) {
+          return reply.code(400).send({ error: 'each wave needs numeric sequence and environment' });
+        }
+      }
+      const result = repo.startRollout(req.params.id, waves, req.body?.previousVersion ?? null);
+      if (!result.ok) return reply.code(409).send({ error: result.reason });
+      return reply.code(201).send({ rollout: result.rollout });
+    },
+  );
+
+  app.post(
+    '/api/rollouts/:id/receipt',
+    async (
+      req: FastifyRequest<{
+        Params: { id: string };
+        Body: {
+          sequence?: number;
+          result?: string;
+          adapterId?: string;
+          idempotencyKey?: string;
+          message?: string;
+        };
+      }>,
+      reply: FastifyReply,
+    ) => {
+      const b = req.body ?? {};
+      if (
+        typeof b.sequence !== 'number' ||
+        !b.result ||
+        !b.adapterId ||
+        !b.idempotencyKey
+      ) {
+        return reply
+          .code(400)
+          .send({ error: 'sequence, result, adapterId and idempotencyKey are required' });
+      }
+      if (b.result !== 'success' && b.result !== 'failure' && b.result !== 'unknown') {
+        return reply.code(400).send({ error: 'result must be success, failure or unknown' });
+      }
+      const result = repo.reportReceipt({
+        rolloutId: req.params.id,
+        sequence: b.sequence,
+        result: b.result,
+        adapterId: b.adapterId,
+        idempotencyKey: b.idempotencyKey,
+        message: b.message,
+      });
+      if (!result.ok) return reply.code(409).send({ error: result.reason });
+      return reply.code(200).send({ receipt: result.receipt, rollout: result.rollout, duplicate: result.duplicate });
+    },
+  );
+
+  app.post('/api/rollouts/:id/pause', async (
+    req: FastifyRequest<{ Params: { id: string }; Body: { reason?: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const result = repo.pauseRollout(req.params.id, req.body?.reason ?? '');
+    if (!result.ok) return reply.code(409).send({ error: result.reason });
+    return reply.code(200).send({ rollout: result.rollout });
+  });
+
+  app.post('/api/rollouts/:id/resume', async (
+    req: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const result = repo.resumeRollout(req.params.id);
+    if (!result.ok) return reply.code(409).send({ error: result.reason });
+    return reply.code(200).send({ rollout: result.rollout });
+  });
+
+  app.post('/api/rollouts/:id/retry', async (
+    req: FastifyRequest<{ Params: { id: string }; Body: { sequence?: number } }>,
+    reply: FastifyReply,
+  ) => {
+    if (typeof req.body?.sequence !== 'number') {
+      return reply.code(400).send({ error: 'sequence is required' });
+    }
+    const result = repo.retryWave(req.params.id, req.body.sequence);
+    if (!result.ok) return reply.code(409).send({ error: result.reason });
+    return reply.code(200).send({ rollout: result.rollout });
+  });
+
+  app.post('/api/rollouts/:id/rollback', async (
+    req: FastifyRequest<{ Params: { id: string }; Body: { targetVersion?: string; reason?: string } }>,
+    reply: FastifyReply,
+  ) => {
+    if (!req.body?.targetVersion) {
+      return reply.code(400).send({ error: 'targetVersion is required' });
+    }
+    const result = repo.rollback(req.params.id, req.body.targetVersion, req.body?.reason ?? '');
+    if (!result.ok) return reply.code(409).send({ error: result.reason });
+    return reply.code(200).send({ rollout: result.rollout });
+  });
+
   app.get('/api/exemptions', async (req: FastifyRequest<{ Querystring: { candidateHash?: string } }>) => {
     repo.sweepExpiredExemptions();
     return { exemptions: repo.listExemptions(req.query.candidateHash) };

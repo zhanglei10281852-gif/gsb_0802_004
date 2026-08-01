@@ -108,6 +108,22 @@ When upstream revises a candidate while a proposal is still waiting, a release m
 
 The workbench shows a lineage strip (parent → current → successors), a "Create revised proposal" form for pending proposals without successors, a `superseded` badge, and a `late` badge on evidence received after supersession.
 
+### Phased rollout
+
+Once a proposal is approved, a release owner can connect it to a phased deployment flow (`POST /api/proposals/:id/rollout`). A rollout is an ordered list of waves — each wave targets one environment and has a 1-based sequence with no gaps or duplicates. The first wave starts `in_progress`; the rest are `pending`.
+
+- **Bound to the decision** — every rollout, wave, and receipt stores the `candidateHash` and `decisionId` of the approved proposal. A receipt can never advance a wave belonging to a different decision snapshot or successor proposal.
+- **Adapter receipts** — a deployment adapter reports `success`, `failure`, or `unknown` (`POST /api/rollouts/:id/receipt`) with an `idempotencyKey`, `adapterId`, and optional message. Each receipt carries `(waveId, idempotencyKey)`; a repeated key returns the original receipt with `duplicate: true` and does not increment attempts or re-advance.
+  - `success` marks the wave `succeeded` and atomically starts the next wave (`in_progress`), or marks the whole rollout `succeeded` on the final wave.
+  - `failure` marks the wave and rollout `failed`; deployment halts until a human retries.
+  - `unknown` is recorded (attempt count and last result updated) but does not advance or halt — the adapter can report again later.
+- **Only the current wave advances** — receipts for a `pending`, `succeeded`, `failed`, or `paused` wave are rejected with HTTP 409. Duplicate and out-of-order receipts cannot skip ahead or replay a finished wave.
+- **Pause / resume / retry** — an in-progress rollout can be paused (current wave becomes `paused`; receipts are rejected until resumed). A failed wave can be retried, returning it to `in_progress` and the rollout to `in_progress`.
+- **Rollback** — an in-progress, paused, or failed rollout can be rolled back to a previous known version (`POST /api/rollouts/:id/rollback`). Unfinished waves are marked `rolled_back`; the rollout records `rolledBackTo` and `rolledBackAt`. Rollback **does not** rewrite the original contract decision (the proposal stays `approved`, the `DecisionSnapshot` is untouched) and **does not revive** exemptions that were `voided` by a successor. A completed (`succeeded`) rollout cannot be rolled back through this endpoint.
+- **Persistence and recovery** — rollouts, waves, and receipts are stored in SQLite with `UNIQUE(rollout_id, sequence)` and `UNIQUE(wave_id, idempotency_key)` constraints. Wave status, attempt counts, and rollout state survive a process kill and restart; the adapter can resume by querying `GET /api/rollouts/:id` and retrying with the same idempotency key.
+
+The workbench shows a rollout panel for approved proposals: a start form (default canary → staging → production waves), per-wave status badges and attempt counts, an adapter receipt form with a rotating idempotency key, retry on failed waves, pause/resume, and a rollback control.
+
 ## Architecture
 
 The contract/gate core is deliberately decoupled from adapters:
@@ -139,6 +155,13 @@ test/              Vitest unit tests
 | POST | `/api/proposals/:id/decision` | `{action: "approve"|"reject", reason}` |
 | POST | `/api/proposals/:id/successor` | Create a revised candidate; supersedes the parent, voids its exemptions |
 | GET | `/api/proposals/:id/lineage` | Full revision chain by lineage root |
+| GET/POST | `/api/proposals/:id/rollout` | Get / start a phased rollout (`{waves:[{sequence,environment}], previousVersion?}`) |
+| GET | `/api/rollouts/:id` | Rollout state with all waves |
+| POST | `/api/rollouts/:id/receipt` | Adapter receipt `{sequence, result, adapterId, idempotencyKey, message?}` |
+| POST | `/api/rollouts/:id/pause` | Pause an in-progress rollout (`{reason?}`) |
+| POST | `/api/rollouts/:id/resume` | Resume a paused rollout |
+| POST | `/api/rollouts/:id/retry` | Retry a failed wave (`{sequence}`) |
+| POST | `/api/rollouts/:id/rollback` | Roll back to a previous known version (`{targetVersion, reason?}`) |
 | GET/POST | `/api/exemptions?candidateHash=` | List / request a dual-reviewed, time-limited exemption |
 | POST | `/api/exemptions/:id/confirm` | Second reviewer confirms (`{confirmerId}`, must differ from requester) |
 | POST | `/api/exemptions/:id/reject` | Reject a pending exemption (`{reviewerId, note}`) |
@@ -156,6 +179,9 @@ test/              Vitest unit tests
 - **Process restart:** all durable state is in SQLite; the Lamport clock and causal log are reconstructed on boot.
 - **New evidence after a decision:** rejected; the stored snapshot is immutable.
 - **Exemption expiry/revocation after a decision:** the exemption row changes status for future decisions, but the `appliedExemptions` already frozen inside the decision snapshot are never altered.
+- **Duplicate/lost adapter receipts:** the `(wave_id, idempotency_key)` unique constraint collapses retries; a crash-after-write before the HTTP response is resolved by retrying with the same key (returns the stored receipt, no double advance). Out-of-order receipts for a non-current wave are rejected.
+- **Rollback:** rollback marks unfinished waves `rolled_back` and records the target version, but never mutates the `decisions` row, the proposal's `approved` status, or any exemption (voided exemptions stay voided).
+- **Process restart mid-rollout:** wave status, attempt counts, receipts, and rollout status are all in SQLite; after restart the adapter queries the rollout, finds the current wave, and resumes. A paused rollout stays paused.
 - **Web disconnect:** SSE auto-reconnects and receives a fresh full snapshot; missed events are not required for correctness.
 
 ## End-to-end scenarios
@@ -173,6 +199,7 @@ test/              Vitest unit tests
 9. A breaking candidate that all consumers claim is fine (asserted system gate still blocks approval; rejection allowed).
 10. On a separate **virtual-clock** server: dual-reviewer exemption request (self-confirm rejected, different reviewer accepted), approval through the exemption, frozen snapshot containing the exemption, then a second proposal whose exemption expires deterministically after advancing the virtual clock (asserted gate re-blocks, `exemption_expired` audited, and the earlier frozen snapshot is unchanged).
 11. **Successor lineage:** create a revised candidate from a pending proposal (asserted parent superseded, new hash, revision 2, zero inherited evidence, old open exemptions voided); a late result for the old candidate is filed to the superseded parent as `late` and never reaches the successor; a report to the successor carrying the old hash is rejected; `proposal_superseded`/`successor_created`/`exemption_voided`/`evidence_received_late` are audited; after a process restart the lineage links and late flag are recovered.
+12. **Phased rollout (on a dedicated server):** an approved proposal starts a 3-wave rollout bound to its decision snapshot; a duplicate receipt delivery is deduped (one receipt, one attempt); a lost-response/crash-after-write receipt is retried with the same key and deduped; out-of-order receipts for pending/succeeded waves are rejected; a failure halts the rollout, retry returns the wave to `in_progress`, an `unknown` receipt is recorded without advancing; the rollout is paused, the server is killed and restarted (paused state, attempt counts, and prior waves survive), then resumed and completed; rollback of a succeeded rollout is rejected; a separate successor-based rollout verifies that rollback leaves the contract decision `approved` and does not revive `voided` exemptions. All rollout/wave lifecycle events are audited in the causal chain.
 
 ## Local development workflow
 

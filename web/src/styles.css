@@ -124,6 +124,13 @@ body {
 .badge.active { background: #0f3320; color: var(--green); }
 .badge.superseded, .badge.voided { background: #2a2150; color: var(--purple); }
 .badge.late { background: #3d2e00; color: var(--yellow); }
+.badge.in_progress { background: #1e3a5f; color: #7cc4ff; }
+.badge.pending { background: #2a2a2a; color: var(--muted); }
+.badge.paused { background: #3d2e00; color: var(--yellow); }
+.badge.succeeded { background: #0f3320; color: var(--green); }
+.badge.failed { background: #3d1418; color: var(--red); }
+.badge.rolled_back { background: #2a2150; color: var(--purple); }
+.badge.not_started { background: #2a2a2a; color: var(--muted); }
 
 .lineage-node {
   display: inline-flex;

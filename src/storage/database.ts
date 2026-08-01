@@ -90,6 +90,54 @@ CREATE TABLE IF NOT EXISTS causal_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_causal_clock ON causal_events(clock);
+
+CREATE TABLE IF NOT EXISTS rollouts (
+  id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
+  candidate_hash TEXT NOT NULL,
+  decision_id TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('not_started','in_progress','paused','succeeded','failed','rolled_back')),
+  previous_version TEXT,
+  rolled_back_to TEXT,
+  rolled_back_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS waves (
+  id TEXT PRIMARY KEY,
+  rollout_id TEXT NOT NULL REFERENCES rollouts(id) ON DELETE CASCADE,
+  proposal_id TEXT NOT NULL REFERENCES proposals(id),
+  sequence INTEGER NOT NULL,
+  environment TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending','in_progress','succeeded','failed','paused','rolled_back')),
+  started_at INTEGER,
+  finished_at INTEGER,
+  last_result TEXT CHECK (last_result IS NULL OR last_result IN ('success','failure','unknown')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_message TEXT,
+  last_adapter_id TEXT,
+  UNIQUE (rollout_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_waves_rollout ON waves(rollout_id, sequence);
+
+CREATE TABLE IF NOT EXISTS receipts (
+  id TEXT PRIMARY KEY,
+  wave_id TEXT NOT NULL REFERENCES waves(id) ON DELETE CASCADE,
+  proposal_id TEXT NOT NULL,
+  candidate_hash TEXT NOT NULL,
+  decision_id TEXT NOT NULL,
+  result TEXT NOT NULL CHECK (result IN ('success','failure','unknown')),
+  adapter_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  message TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  UNIQUE (wave_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipts_wave ON receipts(wave_id, recorded_at);
 `;
 
 function hasColumn(db: DB, table: string, column: string): boolean {
