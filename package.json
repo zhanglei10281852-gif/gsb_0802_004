@@ -1,0 +1,41 @@
+{
+  "name": "contract-change-control-center",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Data-contract change control center: stable candidate digests, JSON Schema 2020-12 compatibility, evidence-gated immutable decisions, deterministic fault/timeline replay.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "install:all": "npm install",
+    "clean": "node scripts/clean.mjs",
+    "build:server": "tsc -p tsconfig.json",
+    "build:web": "vite build",
+    "build": "npm run clean && npm run build:server && npm run build:web",
+    "test": "node --test --import tsx tests/unit/*.test.ts tests/integration/*.test.ts",
+    "start": "node dist/src/adapters/http/main.js",
+    "e2e": "npm run build && node dist/tests/e2e/run-e2e.js",
+    "dev:server": "tsx watch src/adapters/http/main.ts",
+    "dev:web": "vite",
+    "sim": "node dist/src/adapters/agent/cli.js"
+  },
+  "dependencies": {
+    "@fastify/static": "^7.0.4",
+    "ajv": "^8.17.1",
+    "better-sqlite3": "^11.8.1",
+    "fastify": "^4.28.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.8"
+  }
+}
