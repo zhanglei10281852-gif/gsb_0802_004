@@ -1,8 +1,8 @@
-export type ProposalStatus = 'pending' | 'approved' | 'rejected';
+export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'superseded';
 
 export type EvidenceVerdict = 'compatible' | 'incompatible' | 'error';
 
-export type ExemptionStatus = 'pending' | 'active' | 'rejected' | 'revoked' | 'expired';
+export type ExemptionStatus = 'pending' | 'active' | 'rejected' | 'revoked' | 'expired' | 'voided';
 
 export type ExemptionDirection = 'compatible' | 'incompatible';
 
@@ -32,6 +32,7 @@ export interface EvidenceRecord {
   details: string;
   idempotencyKey: string;
   recordedAt: number;
+  late: boolean;
 }
 
 export interface Exemption {
@@ -62,6 +63,10 @@ export interface Proposal {
   status: ProposalStatus;
   environment: string;
   createdAt: number;
+  parentProposalId: string | null;
+  replacesCandidateHash: string | null;
+  lineageRootId: string;
+  revision: number;
 }
 
 export interface Decision {
@@ -99,6 +104,14 @@ export interface DecisionSnapshot {
   systemCompatibility: CompatibilityResult;
 }
 
+export interface ProposalLineage {
+  rootId: string;
+  revision: number;
+  parentProposalId: string | null;
+  replacesCandidateHash: string | null;
+  successorIds: string[];
+}
+
 export interface ProposalDetail {
   proposal: Proposal;
   evidence: EvidenceRecord[];
@@ -112,6 +125,9 @@ export interface ProposalDetail {
   gateReady: boolean;
   blockingReasons: string[];
   decision: Decision | null;
+  lineage: ProposalLineage;
+  successors: Proposal[];
+  parent: Proposal | null;
 }
 
 export interface EvidenceSubmission {
@@ -140,15 +156,19 @@ export interface ExemptionRequest {
 
 export type CausalEventType =
   | 'proposal_created'
+  | 'proposal_superseded'
+  | 'successor_created'
   | 'consumer_registered'
   | 'evidence_accepted'
+  | 'evidence_received_late'
   | 'evidence_rejected'
   | 'decision_made'
   | 'exemption_requested'
   | 'exemption_confirmed'
   | 'exemption_rejected'
   | 'exemption_revoked'
-  | 'exemption_expired';
+  | 'exemption_expired'
+  | 'exemption_voided';
 
 export interface CausalEvent {
   id: number;

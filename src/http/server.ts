@@ -117,6 +117,28 @@ export async function buildServer(opts: ServerOptions): Promise<FastifyInstance>
     },
   );
 
+  app.post(
+    '/api/proposals/:id/successor',
+    async (
+      req: FastifyRequest<{ Params: { id: string }; Body: { candidateSchema?: unknown } }>,
+      reply: FastifyReply,
+    ) => {
+      const { candidateSchema } = req.body ?? {};
+      if (!candidateSchema || typeof candidateSchema !== 'object') {
+        return reply.code(400).send({ error: 'candidateSchema object is required' });
+      }
+      const result = repo.createSuccessor(req.params.id, candidateSchema as Record<string, unknown>);
+      if (!result.ok) return reply.code(409).send({ error: result.reason });
+      return reply.code(result.duplicate ? 200 : 201).send(result);
+    },
+  );
+
+  app.get('/api/proposals/:id/lineage', async (req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const proposal = repo.getProposal(req.params.id);
+    if (!proposal) return reply.code(404).send({ error: 'proposal not found' });
+    return { lineage: repo.getLineage(proposal.lineageRootId) };
+  });
+
   app.get('/api/exemptions', async (req: FastifyRequest<{ Querystring: { candidateHash?: string } }>) => {
     repo.sweepExpiredExemptions();
     return { exemptions: repo.listExemptions(req.query.candidateHash) };

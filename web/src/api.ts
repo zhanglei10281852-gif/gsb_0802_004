@@ -1,6 +1,6 @@
-export type ProposalStatus = 'pending' | 'approved' | 'rejected';
+export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'superseded';
 export type EvidenceVerdict = 'compatible' | 'incompatible' | 'error';
-export type ExemptionStatus = 'pending' | 'active' | 'rejected' | 'revoked' | 'expired';
+export type ExemptionStatus = 'pending' | 'active' | 'rejected' | 'revoked' | 'expired' | 'voided';
 export type ExemptionDirection = 'compatible' | 'incompatible';
 
 export interface CompatibilityIssue {
@@ -29,6 +29,7 @@ export interface EvidenceRecord {
   details: string;
   idempotencyKey: string;
   recordedAt: number;
+  late: boolean;
 }
 
 export interface Exemption {
@@ -59,6 +60,18 @@ export interface Proposal {
   status: ProposalStatus;
   environment: string;
   createdAt: number;
+  parentProposalId: string | null;
+  replacesCandidateHash: string | null;
+  lineageRootId: string;
+  revision: number;
+}
+
+export interface ProposalLineage {
+  rootId: string;
+  revision: number;
+  parentProposalId: string | null;
+  replacesCandidateHash: string | null;
+  successorIds: string[];
 }
 
 export interface Decision {
@@ -105,6 +118,9 @@ export interface ProposalDetail {
   gateReady: boolean;
   blockingReasons: string[];
   decision: Decision | null;
+  lineage: ProposalLineage;
+  successors: Proposal[];
+  parent: Proposal | null;
 }
 
 export interface Snapshot {
@@ -142,6 +158,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ candidateSchema, baselineSchema, environment }),
     }),
+  createSuccessor: (parentId: string, candidateSchema: unknown) =>
+    jsonRequest<{ successor: Proposal; superseded: Proposal; duplicate: boolean }>(
+      `/api/proposals/${parentId}/successor`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ candidateSchema }),
+      },
+    ),
   registerConsumer: (id: string, name: string) =>
     jsonRequest<{ consumer: Consumer }>('/api/consumers', {
       method: 'POST',

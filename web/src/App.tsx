@@ -140,7 +140,10 @@ export function App() {
             className={`proposal-item ${selectedId === p.proposal.id ? 'active' : ''}`}
             onClick={() => setSelectedId(p.proposal.id)}
           >
-            <div className="hash">{shortHash(p.proposal.candidateHash)}</div>
+            <div className="hash">
+              {shortHash(p.proposal.candidateHash)}
+              {p.proposal.revision > 1 && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>rev {p.proposal.revision}</span>}
+            </div>
             <div className="meta">
               <span className={`badge ${p.proposal.status}`}>{p.proposal.status}</span>
               <span>
@@ -171,7 +174,12 @@ export function App() {
             consumers={consumers}
             now={now}
             onDecide={handleDecision}
+            onSelectProposal={setSelectedId}
             onExemptionChange={() => {
+              void refreshSnapshot();
+              void refreshEvents();
+            }}
+            onLineageChanged={() => {
               void refreshSnapshot();
               void refreshEvents();
             }}

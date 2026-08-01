@@ -106,6 +106,9 @@ export function evaluateGate(
   if (proposal.status === 'approved' || proposal.status === 'rejected') {
     blockingReasons.push(`proposal already ${proposal.status}`);
   }
+  if (proposal.status === 'superseded') {
+    blockingReasons.push('proposal has been superseded by a newer revision');
+  }
 
   return {
     gateReady:
@@ -133,6 +136,9 @@ export function decide(
 ): DecisionTransition {
   if (currentStatus === 'approved' || currentStatus === 'rejected') {
     return { ok: false, reason: `proposal already ${currentStatus}; decisions are immutable` };
+  }
+  if (currentStatus === 'superseded') {
+    return { ok: false, reason: 'proposal has been superseded; decisions must be made on the latest revision' };
   }
   if (action === 'approve' && !gateReady) {
     return { ok: false, reason: 'cannot approve: gate is not ready' };

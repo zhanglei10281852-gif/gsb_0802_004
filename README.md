@@ -95,6 +95,19 @@ Exemption lifecycle events (`exemption_requested`, `exemption_confirmed`, `exemp
 
 The e2e suite also starts a second server with `CCC_CLOCK=virtual`, which replaces the wall clock with a `VirtualClock`. A test-only endpoint `POST /api/test/clock/advance {ms}` advances the clock and immediately sweeps expired exemptions, so expiry can be asserted deterministically without sleeping real time. This endpoint is only registered when the virtual clock is enabled and is never present in normal operation.
 
+### Successor proposals and lineage
+
+When upstream revises a candidate while a proposal is still waiting, a release manager creates a successor from the current proposal (`POST /api/proposals/:id/successor` with a new `candidateSchema`). This happens in one SQLite transaction:
+
+- The corrected content is hashed; the new proposal gets a **new candidate hash**, `revision + 1`, `parentProposalId`, `replacesCandidateHash`, and the same `lineageRootId`, so the chain is unambiguous.
+- The parent is atomically flipped to `superseded` and can no longer be approved or rejected; its gate never reports ready.
+- The successor starts with **zero evidence**. Build evidence is bound to `proposal_id`, so the parent's evidence is never inherited — a consumer must verify the new candidate.
+- All **open exemptions** for the parent's candidate hash are set to `voided` (recorded as `exemption_voided` events). Even though the consumer name and environment may be identical, an exemption is scoped to the exact candidate hash and therefore cannot carry over. A fresh dual-reviewed exemption is required for the successor.
+- If a build agent that was still running against the old candidate reports back after the successor is created, the result is accepted onto the **superseded parent** (flagged `late: true` and recorded as `evidence_received_late`) for audit. It never lands on the successor and cannot unblock it. A report submitted to the successor with the *old* candidate hash is rejected with HTTP 409.
+- The full replacement is captured as `proposal_superseded` and `successor_created` causal events. Lineage (parent, revision, successors) survives process restart because it is stored in SQLite.
+
+The workbench shows a lineage strip (parent → current → successors), a "Create revised proposal" form for pending proposals without successors, a `superseded` badge, and a `late` badge on evidence received after supersession.
+
 ## Architecture
 
 The contract/gate core is deliberately decoupled from adapters:
@@ -124,6 +137,8 @@ test/              Vitest unit tests
 | GET | `/api/proposals/:id` | Detail with evidence, exemptions, gate state, blocking reasons, decision |
 | POST | `/api/proposals/:id/evidence` | Agent report `{consumerId, candidateHash, verdict, details, idempotencyKey}` |
 | POST | `/api/proposals/:id/decision` | `{action: "approve"|"reject", reason}` |
+| POST | `/api/proposals/:id/successor` | Create a revised candidate; supersedes the parent, voids its exemptions |
+| GET | `/api/proposals/:id/lineage` | Full revision chain by lineage root |
 | GET/POST | `/api/exemptions?candidateHash=` | List / request a dual-reviewed, time-limited exemption |
 | POST | `/api/exemptions/:id/confirm` | Second reviewer confirms (`{confirmerId}`, must differ from requester) |
 | POST | `/api/exemptions/:id/reject` | Reject a pending exemption (`{reviewerId, note}`) |
@@ -157,6 +172,7 @@ test/              Vitest unit tests
 8. Killing and restarting the server process on the same SQLite file (asserted status, evidence, snapshot, and causal log all survive with identical clocks/order).
 9. A breaking candidate that all consumers claim is fine (asserted system gate still blocks approval; rejection allowed).
 10. On a separate **virtual-clock** server: dual-reviewer exemption request (self-confirm rejected, different reviewer accepted), approval through the exemption, frozen snapshot containing the exemption, then a second proposal whose exemption expires deterministically after advancing the virtual clock (asserted gate re-blocks, `exemption_expired` audited, and the earlier frozen snapshot is unchanged).
+11. **Successor lineage:** create a revised candidate from a pending proposal (asserted parent superseded, new hash, revision 2, zero inherited evidence, old open exemptions voided); a late result for the old candidate is filed to the superseded parent as `late` and never reaches the successor; a report to the successor carrying the old hash is rejected; `proposal_superseded`/`successor_created`/`exemption_voided`/`evidence_received_late` are audited; after a process restart the lineage links and late flag are recovered.
 
 ## Local development workflow
 

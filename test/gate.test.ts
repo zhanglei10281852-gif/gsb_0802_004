@@ -24,6 +24,10 @@ const proposal: Proposal = {
   status: 'pending',
   environment: 'production',
   createdAt: 0,
+  parentProposalId: null,
+  replacesCandidateHash: null,
+  lineageRootId: 'p1',
+  revision: 1,
 };
 
 function ev(consumerId: string, verdict: 'compatible' | 'incompatible' = 'compatible'): EvidenceRecord {
@@ -36,6 +40,7 @@ function ev(consumerId: string, verdict: 'compatible' | 'incompatible' = 'compat
     details: '',
     idempotencyKey: `k-${consumerId}`,
     recordedAt: 1,
+    late: false,
   };
 }
 
@@ -130,6 +135,15 @@ describe('gate state machine', () => {
     const g = evaluateGate(proposal, [ev('c1')], ['c1', 'c2'], [exemption({ status: 'revoked' })], 500);
     expect(g.gateReady).toBe(false);
     expect(g.missingConsumerIds).toEqual(['c2']);
+  });
+
+  it('is never ready when the proposal is superseded', () => {
+    const superseded = { ...proposal, status: 'superseded' as const };
+    const g = evaluateGate(superseded, [ev('c1'), ev('c2')], ['c1', 'c2'], [], 500);
+    expect(g.gateReady).toBe(false);
+    expect(g.blockingReasons.some((r) => r.includes('superseded'))).toBe(true);
+    expect(decide('superseded', false, 'reject').ok).toBe(false);
+    expect(decide('superseded', false, 'reject').reason).toContain('superseded');
   });
 
   it('refuses approval when not ready', () => {

@@ -25,6 +25,7 @@ import type {
   FrozenExemption,
   Proposal,
   ProposalDetail,
+  ProposalLineage,
   ProposalStatus,
 } from '../domain/types.js';
 
@@ -42,6 +43,10 @@ interface ProposalRow {
   system_issues: string;
   status: ProposalStatus;
   environment: string;
+  parent_proposal_id: string | null;
+  replaces_candidate_hash: string | null;
+  lineage_root_id: string;
+  revision: number;
   created_at: number;
 }
 
@@ -54,6 +59,7 @@ interface EvidenceRow {
   details: string;
   idempotency_key: string;
   recorded_at: number;
+  late: number;
 }
 
 interface ConsumerRow {
@@ -194,8 +200,9 @@ export class Repository {
     this.db
       .prepare(
         `INSERT INTO proposals
-          (id, candidate_hash, candidate_schema, baseline_schema, system_compatible, system_issues, status, environment, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+          (id, candidate_hash, candidate_schema, baseline_schema, system_compatible, system_issues,
+           status, environment, parent_proposal_id, replaces_candidate_hash, lineage_root_id, revision, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, ?, 1, ?)`,
       )
       .run(
         id,
@@ -205,6 +212,7 @@ export class Repository {
         systemCompatibility.compatible ? 1 : 0,
         JSON.stringify(systemCompatibility.issues),
         environment,
+        id,
         createdAt,
       );
     const proposal = this.getProposal(id)!;
@@ -212,10 +220,142 @@ export class Repository {
       proposalId: id,
       candidateHash,
       environment,
+      revision: 1,
+      lineageRootId: id,
       systemCompatible: systemCompatibility.compatible,
       issueCount: systemCompatibility.issues.length,
     });
     return { proposal, duplicate: false };
+  }
+
+  createSuccessor(
+    parentId: string,
+    newCandidateSchema: Record<string, unknown>,
+  ):
+    | { ok: true; successor: Proposal; superseded: Proposal; duplicate: boolean }
+    | { ok: false; reason: string } {
+    const txn = this.db.transaction<
+      () =>
+        | { ok: true; successor: Proposal; superseded: Proposal; duplicate: boolean }
+        | { ok: false; reason: string }
+    >(() => {
+      const parent = this.getProposal(parentId);
+      if (!parent) return { ok: false, reason: 'unknown parent proposal' };
+      if (parent.status !== 'pending') {
+        return { ok: false, reason: `cannot supersede a ${parent.status} proposal` };
+      }
+
+      const candidateHash = stableHash(newCandidateSchema);
+      if (candidateHash === parent.candidateHash) {
+        return { ok: false, reason: 'successor candidate is identical to parent candidate' };
+      }
+      const existing = this.db
+        .prepare('SELECT * FROM proposals WHERE candidate_hash = ?')
+        .get(candidateHash) as ProposalRow | undefined;
+      if (existing) {
+        return {
+          ok: true,
+          successor: rowToProposal(existing),
+          superseded: parent,
+          duplicate: true,
+        };
+      }
+
+      const systemCompatibility = checkBackwardCompatibility(parent.baselineSchema, newCandidateSchema);
+      const id = randomUUID();
+      const createdAt = this.clock.now();
+      const revision = parent.revision + 1;
+      const lineageRootId = parent.lineageRootId;
+      this.db
+        .prepare(
+          `INSERT INTO proposals
+            (id, candidate_hash, candidate_schema, baseline_schema, system_compatible, system_issues,
+             status, environment, parent_proposal_id, replaces_candidate_hash, lineage_root_id, revision, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          candidateHash,
+          JSON.stringify(newCandidateSchema),
+          JSON.stringify(parent.baselineSchema),
+          systemCompatibility.compatible ? 1 : 0,
+          JSON.stringify(systemCompatibility.issues),
+          parent.environment,
+          parent.id,
+          parent.candidateHash,
+          lineageRootId,
+          revision,
+          createdAt,
+        );
+
+      const updateResult = this.db
+        .prepare("UPDATE proposals SET status = 'superseded' WHERE id = ? AND status = 'pending'")
+        .run(parent.id);
+      if (updateResult.changes !== 1) {
+        throw new Error('concurrent close of parent proposal detected');
+      }
+
+      const oldExemptions = this.db
+        .prepare("SELECT * FROM exemptions WHERE candidate_hash = ? AND status IN ('pending','active')")
+        .all(parent.candidateHash) as ExemptionRow[];
+      const closedAt = this.clock.now();
+      for (const ex of oldExemptions) {
+        this.db
+          .prepare(
+            `UPDATE exemptions SET status = 'voided', closed_at = ?, closed_by = ?, close_note = ? WHERE id = ?`,
+          )
+          .run(closedAt, 'system:successor', `voided when parent proposal superseded by ${id}`, ex.id);
+        this.recordEvent('exemption_voided', {
+          exemptionId: ex.id,
+          candidateHash: ex.candidate_hash,
+          consumerId: ex.consumer_id,
+          environment: ex.environment,
+          direction: ex.direction,
+          successorProposalId: id,
+          successorCandidateHash: candidateHash,
+          voidedAt: closedAt,
+        });
+      }
+
+      const successor = this.getProposal(id)!;
+      const superseded = this.getProposal(parent.id)!;
+
+      this.recordEvent('proposal_superseded', {
+        proposalId: parent.id,
+        candidateHash: parent.candidateHash,
+        successorProposalId: id,
+        successorCandidateHash: candidateHash,
+        voidedExemptionIds: oldExemptions.map((e) => e.id),
+        supersededAt: closedAt,
+      });
+      this.recordEvent('successor_created', {
+        proposalId: id,
+        candidateHash,
+        parentProposalId: parent.id,
+        replacesCandidateHash: parent.candidateHash,
+        lineageRootId,
+        revision,
+        environment: parent.environment,
+      });
+
+      return { ok: true, successor, superseded, duplicate: false };
+    });
+
+    return this.transactional(() => txn());
+  }
+
+  listSuccessors(parentProposalId: string): Proposal[] {
+    const rows = this.db
+      .prepare('SELECT * FROM proposals WHERE parent_proposal_id = ? ORDER BY revision ASC')
+      .all(parentProposalId) as ProposalRow[];
+    return rows.map(rowToProposal);
+  }
+
+  getLineage(rootId: string): Proposal[] {
+    const rows = this.db
+      .prepare('SELECT * FROM proposals WHERE lineage_root_id = ? ORDER BY revision ASC')
+      .all(rootId) as ProposalRow[];
+    return rows.map(rowToProposal);
   }
 
   getProposal(id: string): Proposal | null {
@@ -275,7 +415,7 @@ export class Repository {
           evidence: null,
         };
       }
-      if (proposal.status !== 'pending') {
+      if (proposal.status === 'approved' || proposal.status === 'rejected') {
         this.recordEvent('evidence_rejected', {
           reason: `proposal already ${proposal.status}`,
           consumerId: sub.consumerId,
@@ -289,6 +429,7 @@ export class Repository {
         };
       }
 
+      const late = proposal.status === 'superseded';
       const existing = this.db
         .prepare('SELECT * FROM evidence WHERE proposal_id = ? AND consumer_id = ?')
         .get(sub.proposalId, sub.consumerId) as EvidenceRow | undefined;
@@ -302,19 +443,20 @@ export class Repository {
         this.db
           .prepare(
             `UPDATE evidence
-             SET verdict = ?, details = ?, idempotency_key = ?, recorded_at = ?, candidate_hash = ?
+             SET verdict = ?, details = ?, idempotency_key = ?, recorded_at = ?, candidate_hash = ?, late = ?
              WHERE id = ?`,
           )
-          .run(sub.verdict, sub.details, sub.idempotencyKey, recordedAt, sub.candidateHash, existing.id);
+          .run(sub.verdict, sub.details, sub.idempotencyKey, recordedAt, sub.candidateHash, late ? 1 : 0, existing.id);
         const updated = this.db.prepare('SELECT * FROM evidence WHERE id = ?').get(existing.id) as EvidenceRow;
         const evidence = rowToEvidence(updated);
-        this.recordEvent('evidence_accepted', {
+        this.recordEvent(late ? 'evidence_received_late' : 'evidence_accepted', {
           proposalId: sub.proposalId,
           consumerId: sub.consumerId,
           verdict: sub.verdict,
           idempotencyKey: sub.idempotencyKey,
           deduped: false,
           updated: true,
+          late,
         });
         return { accepted: true, evidence, deduped: false };
       }
@@ -323,8 +465,8 @@ export class Repository {
       this.db
         .prepare(
           `INSERT INTO evidence
-            (id, proposal_id, consumer_id, candidate_hash, verdict, details, idempotency_key, recorded_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, proposal_id, consumer_id, candidate_hash, verdict, details, idempotency_key, recorded_at, late)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -335,16 +477,18 @@ export class Repository {
           sub.details,
           sub.idempotencyKey,
           recordedAt,
+          late ? 1 : 0,
         );
       const row = this.db.prepare('SELECT * FROM evidence WHERE id = ?').get(id) as EvidenceRow;
       const evidence = rowToEvidence(row);
-      this.recordEvent('evidence_accepted', {
+      this.recordEvent(late ? 'evidence_received_late' : 'evidence_accepted', {
         proposalId: sub.proposalId,
         consumerId: sub.consumerId,
         verdict: sub.verdict,
         idempotencyKey: sub.idempotencyKey,
         deduped: false,
         updated: false,
+        late,
       });
       return { accepted: true, evidence, deduped: false };
     });
@@ -567,6 +711,16 @@ export class Repository {
     const exemptions = this.listExemptions(proposal.candidateHash);
     const evaluation = evaluateGate(proposal, evidence, requiredConsumerIds, exemptions, now);
     const decision = this.getDecision(id);
+    const successors = this.listSuccessors(id);
+    const parent = proposal.parentProposalId ? this.getProposal(proposal.parentProposalId) : null;
+    const successorIds = successors.map((s) => s.id);
+    const lineage: ProposalLineage = {
+      rootId: proposal.lineageRootId,
+      revision: proposal.revision,
+      parentProposalId: proposal.parentProposalId,
+      replacesCandidateHash: proposal.replacesCandidateHash,
+      successorIds,
+    };
     return {
       proposal,
       evidence,
@@ -580,6 +734,9 @@ export class Repository {
       gateReady: evaluation.gateReady,
       blockingReasons: evaluation.blockingReasons,
       decision,
+      lineage,
+      successors,
+      parent,
     };
   }
 
@@ -593,6 +750,9 @@ export class Repository {
       const now = this.clock.now();
       const proposal = this.getProposal(proposalId);
       if (!proposal) return { ok: false, reason: 'unknown proposal' };
+      if (proposal.status === 'superseded') {
+        return { ok: false, reason: 'proposal has been superseded; decide on the latest revision' };
+      }
       if (proposal.status !== 'pending') {
         return { ok: false, reason: `proposal already ${proposal.status}; decisions are immutable` };
       }
@@ -708,6 +868,10 @@ function rowToProposal(row: ProposalRow): Proposal {
     },
     status: row.status,
     environment: row.environment ?? 'production',
+    parentProposalId: row.parent_proposal_id,
+    replacesCandidateHash: row.replaces_candidate_hash,
+    lineageRootId: row.lineage_root_id,
+    revision: row.revision,
     createdAt: row.created_at,
   };
 }
@@ -722,6 +886,7 @@ function rowToEvidence(row: EvidenceRow): EvidenceRecord {
     details: row.details,
     idempotencyKey: row.idempotency_key,
     recordedAt: row.recorded_at,
+    late: row.late === 1,
   };
 }
 

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { shortHash, timeAgo, type Consumer, type ProposalDetail } from '../api';
 import { ExemptionsPanel } from './ExemptionsPanel';
+import { LineagePanel } from './LineagePanel';
 
 interface Props {
   detail: ProposalDetail;
@@ -8,9 +9,11 @@ interface Props {
   now: number;
   onDecide: (action: 'approve' | 'reject', reason: string) => void;
   onExemptionChange: () => void;
+  onSelectProposal: (id: string) => void;
+  onLineageChanged: () => void;
 }
 
-export function ProposalDetailView({ detail, consumers, now, onDecide, onExemptionChange }: Props) {
+export function ProposalDetailView({ detail, consumers, now, onDecide, onExemptionChange, onSelectProposal, onLineageChanged }: Props) {
   const {
     proposal,
     evidence,
@@ -48,6 +51,8 @@ export function ProposalDetailView({ detail, consumers, now, onDecide, onExempti
           </div>
         </div>
       </div>
+
+      <LineagePanel detail={detail} onSelectProposal={onSelectProposal} onChanged={onLineageChanged} />
 
       <div className="card">
         <h2>System Compatibility</h2>
@@ -91,7 +96,10 @@ export function ProposalDetailView({ detail, consumers, now, onDecide, onExempti
                 </div>
                 <div>
                   {e ? (
-                    <span className={`badge ${e.verdict}`}>{e.verdict}</span>
+                    <span className="flex-row" style={{ gap: 4 }}>
+                      <span className={`badge ${e.verdict}`}>{e.verdict}</span>
+                      {e.late && <span className="badge late" title="received after this proposal was superseded">late</span>}
+                    </span>
                   ) : isExempted ? (
                     <span className="badge exempt">exempted</span>
                   ) : (
@@ -103,6 +111,7 @@ export function ProposalDetailView({ detail, consumers, now, onDecide, onExempti
                     <>
                       <div className="fresh">
                         {timeAgo(e.recordedAt, now)} · {shortHash(e.candidateHash)}
+                        {e.late && ' · filed to superseded proposal'}
                       </div>
                       {e.details && <div className="cid">{e.details}</div>}
                     </>

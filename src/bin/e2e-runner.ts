@@ -397,6 +397,154 @@ const secondCompatibleCandidate = {
   required: ['orderId'],
 };
 
+const lineageBaseline = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  type: 'object',
+  properties: {
+    orderId: { type: 'string' },
+    amount: { type: 'number', minimum: 0 },
+  },
+  required: ['orderId'],
+};
+
+const lineageCandidateV1 = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  type: 'object',
+  properties: {
+    orderId: { type: 'string' },
+    amount: { type: 'number', minimum: 0 },
+    region: { type: 'string' },
+  },
+  required: ['orderId'],
+};
+
+const lineageCandidateV2 = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  type: 'object',
+  properties: {
+    orderId: { type: 'string' },
+    amount: { type: 'number', minimum: 0 },
+    region: { type: 'string' },
+    channel: { type: 'string' },
+  },
+  required: ['orderId'],
+};
+
+async function scenarioSuccessorLineage(baseUrl: string, dbPath: string, port: number): Promise<void> {
+  console.log('\n[scenario] successor proposal lineage, late old results, voided exemptions');
+
+  await postJson(baseUrl, '/api/consumers', { id: 'lineage-a', name: 'Lineage A' });
+  await postJson(baseUrl, '/api/consumers', { id: 'lineage-b', name: 'Lineage B' });
+
+  const v1 = await postJson(baseUrl, '/api/proposals', {
+    candidateSchema: lineageCandidateV1,
+    baselineSchema: lineageBaseline,
+    environment: 'production',
+  });
+  check(v1.status === 201, 'created lineage proposal v1');
+  const v1Id: string = v1.body.proposal.id;
+  const v1Hash: string = v1.body.proposal.candidateHash;
+
+  await postJson(baseUrl, `/api/proposals/${v1Id}/evidence`, {
+    consumerId: 'lineage-a',
+    candidateHash: v1Hash,
+    verdict: 'compatible',
+    details: 'ok',
+    idempotencyKey: 'la-v1',
+  });
+
+  const now = Date.now();
+  const ex = await postJson(baseUrl, '/api/exemptions', {
+    candidateHash: v1Hash,
+    consumerId: 'lineage-b',
+    environment: 'production',
+    direction: 'compatible',
+    reason: 'offline during revision',
+    requesterId: 'alice',
+    validFrom: now,
+    validUntil: now + 3_600_000,
+  });
+  check(ex.status === 201, 'exemption requested for v1');
+  const exId: string = ex.body.exemption.id;
+  await postJson(baseUrl, `/api/exemptions/${exId}/confirm`, { confirmerId: 'bob' });
+
+  const succ = await postJson(baseUrl, `/api/proposals/${v1Id}/successor`, {
+    candidateSchema: lineageCandidateV2,
+  });
+  check(succ.status === 201, 'created successor v2 from v1');
+  const v2Id: string = succ.body.successor.id;
+  const v2Hash: string = succ.body.successor.candidateHash;
+  check(succ.body.superseded.status === 'superseded', 'v1 marked superseded');
+  check(succ.body.successor.parentProposalId === v1Id, 'v2 parent is v1');
+  check(succ.body.successor.replacesCandidateHash === v1Hash, 'v2 replaces v1 hash');
+  check(succ.body.successor.revision === 2, 'v2 is revision 2');
+  check(v2Hash !== v1Hash, 'v2 has a different candidate hash');
+
+  const v2Detail = await getJson(baseUrl, `/api/proposals/${v2Id}`);
+  check(v2Detail.evidence.length === 0, 'v2 starts with zero evidence (not inherited)');
+  check(v2Detail.appliedExemptions.length === 0, 'v2 has no applied exemptions (not inherited)');
+  check(v2Detail.exemptions.every((e: any) => e.status === 'voided'), 'v1 exemptions were voided');
+  check(v2Detail.gateReady === false, 'v2 gate is blocked without new evidence');
+
+  const voidedEx = await getJson(baseUrl, `/api/exemptions?candidateHash=${v1Hash}`);
+  check(
+    voidedEx.exemptions.some((e: any) => e.id === exId && e.status === 'voided'),
+    'old exemption status is voided',
+  );
+
+  const late = await postJson(baseUrl, `/api/proposals/${v1Id}/evidence`, {
+    consumerId: 'lineage-b',
+    candidateHash: v1Hash,
+    verdict: 'compatible',
+    details: 'build finished after revision',
+    idempotencyKey: 'lb-late',
+  });
+  check(late.status === 200, 'late result accepted and filed to superseded v1');
+  check(late.body.evidence.late === true, 'late evidence flagged as late');
+
+  const staleOnV2 = await postJson(baseUrl, `/api/proposals/${v2Id}/evidence`, {
+    consumerId: 'lineage-a',
+    candidateHash: v1Hash,
+    verdict: 'compatible',
+    details: 'stale hash',
+    idempotencyKey: 'stale-hash',
+  });
+  check(staleOnV2.status === 409, 'evidence with old candidate hash rejected on v2');
+
+  const v2After = await getJson(baseUrl, `/api/proposals/${v2Id}`);
+  check(v2After.evidence.length === 0, 'v2 still has no evidence after stale/late submissions');
+
+  const decideV1 = await postJson(baseUrl, `/api/proposals/${v1Id}/decision`, {
+    action: 'approve',
+    reason: 'should fail',
+  });
+  check(decideV1.status === 409, 'cannot decide on superseded v1');
+
+  const events = (await getJson(baseUrl, '/api/causal-events')).events as Array<{ type: string; payload: any }>;
+  check(events.some((e) => e.type === 'successor_created' && e.payload.candidateHash === v2Hash && e.payload.parentProposalId === v1Id),
+    'successor_created causal event recorded');
+  check(events.some((e) => e.type === 'proposal_superseded' && e.payload.proposalId === v1Id),
+    'proposal_superseded causal event recorded');
+  check(events.some((e) => e.type === 'exemption_voided' && e.payload.exemptionId === exId),
+    'exemption_voided causal event recorded');
+  check(events.some((e) => e.type === 'evidence_received_late' && e.payload.proposalId === v1Id),
+    'evidence_received_late causal event recorded');
+
+  console.log('  restarting server to verify lineage recovery...');
+  await stopAndRestart(baseUrl, dbPath, port);
+  const recovered = await getJson(baseUrl, `/api/proposals/${v2Id}`);
+  check(recovered.proposal.parentProposalId === v1Id, 'lineage parent survived restart');
+  check(recovered.proposal.revision === 2, 'revision survived restart');
+  check(recovered.parent.status === 'superseded', 'superseded status survived restart');
+  check(recovered.lineage.successorIds.length === 0, 'v2 has no successors after restart');
+  const v1Recovered = await getJson(baseUrl, `/api/proposals/${v1Id}`);
+  check(v1Recovered.lineage.successorIds.includes(v2Id), 'v1 successor link survived restart');
+  check(
+    v1Recovered.evidence.some((e: any) => e.consumerId === 'lineage-b' && e.late === true),
+    'late evidence flag survived restart',
+  );
+}
+
 async function scenarioExemptionsVirtualClock(baseUrl: string): Promise<void> {
   console.log('\n[scenario] dual-reviewer exemptions, deterministic expiry (virtual clock)');
 
@@ -549,6 +697,7 @@ async function main(): Promise<void> {
 
     await scenarioAnomaliesAndRestart(handle.baseUrl, dbPath, port);
     await scenarioBreakingChange(handle.baseUrl);
+    await scenarioSuccessorLineage(handle.baseUrl, dbPath, port);
   } finally {
     if (currentHandle) await currentHandle.stop();
   }
