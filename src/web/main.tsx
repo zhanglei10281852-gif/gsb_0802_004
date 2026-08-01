@@ -12,6 +12,7 @@ import type {
   ExemptionRecord,
   GateView,
   StoredProposal,
+  StoredRollout,
 } from "./types";
 import "./styles.css";
 
@@ -285,9 +286,10 @@ function GateDetail({
     appliedExemptions,
     environment,
     eventLog,
+    rollouts,
   } = gate;
   const [tab, setTab] = useState<
-    "overview" | "exemptions" | "schemas" | "events" | "decision"
+    "overview" | "exemptions" | "rollouts" | "schemas" | "events" | "decision"
   >("overview");
   const [decider, setDecider] = useState("release-manager");
   const [rationale, setRationale] = useState("");
@@ -385,6 +387,12 @@ function GateDetail({
           onClick={() => setTab("exemptions")}
         >
           Exemptions ({exemptions.length})
+        </div>
+        <div
+          className={`tab ${tab === "rollouts" ? "active" : ""}`}
+          onClick={() => setTab("rollouts")}
+        >
+          Rollout{rollouts.length === 1 ? "" : "s"} ({rollouts.length})
         </div>
         <div
           className={`tab ${tab === "schemas" ? "active" : ""}`}
@@ -498,6 +506,14 @@ function GateDetail({
           consumers={proposal.consumers.map((c) => c.consumerId)}
           exemptions={exemptions}
           decided={Boolean(proposal.decision)}
+          onChange={onDecision}
+        />
+      )}
+
+      {tab === "rollouts" && (
+        <RolloutsPanel
+          proposal={proposal}
+          rollouts={rollouts}
           onChange={onDecision}
         />
       )}
@@ -634,6 +650,422 @@ function GateDetail({
   );
 }
 
+function RolloutsPanel({
+  proposal,
+  rollouts,
+  onChange,
+}: {
+  proposal: StoredProposal;
+  rollouts: StoredRollout[];
+  onChange: () => void;
+}): React.ReactElement {
+  const approved =
+    proposal.status === "approved" && proposal.decision?.kind === "approve";
+  const [wavesText, setWavesText] = useState("canary,prod");
+  const [adaptersText, setAdaptersText] = useState(
+    "canary-adapter,prod-adapter",
+  );
+  const [owner, setOwner] = useState("release-manager");
+  const [previousVersion, setPreviousVersion] = useState("v1.4.2");
+  const [note, setNote] = useState("");
+  const [operator, setOperator] = useState("release-manager");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [receiptWave, setReceiptWave] = useState(1);
+  const [receiptResult, setReceiptResult] = useState<
+    "success" | "failure" | "unknown"
+  >("success");
+  const [receiptMsg, setReceiptMsg] = useState("deployed");
+  const [receiptKey, setReceiptKey] = useState("rcpt-1");
+
+  async function guard(fn: () => Promise<void>): Promise<void> {
+    setBusy(true);
+    setError("");
+    try {
+      await fn();
+      onChange();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createRollout(): Promise<void> {
+    const envs = wavesText
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const adapters = adaptersText
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (envs.length !== adapters.length) {
+      throw new Error(
+        "number of environments must match number of adapters (one per wave)",
+      );
+    }
+    const waves = envs.map((environment, i) => ({
+      environment,
+      adapter: adapters[i] ?? `adapter-${environment}`,
+    }));
+    await api.createRollout(proposal.proposalId, {
+      owner,
+      waves,
+      previousVersion: previousVersion || undefined,
+      note: note || undefined,
+      autoStart: true,
+    });
+  }
+
+  return (
+    <div>
+      <p style={{ color: "var(--muted)", fontSize: 13 }}>
+        A rollout binds an <strong>approved decision snapshot</strong> to a
+        sequence of environment waves. Receipts only advance the{" "}
+        <strong>current wave</strong> of the rollout bound to this snapshot;
+        duplicates (same <code>Idempotency-Key</code>) and out-of-order reports
+        are rejected. Rollback reverts deployments to the previous known version
+        but does <strong>not</strong> change the contract decision or revive any
+        expired/revoked exemptions.
+      </p>
+
+      {approved && rollouts.length === 0 && (
+        <div
+          className="panel"
+          style={{ background: "var(--panel-2)", marginBottom: 16 }}
+        >
+          <h3 style={{ marginTop: 0 }}>Schedule phased rollout</h3>
+          <div className="form-row">
+            <div className="field">
+              <label>Owner</label>
+              <input value={owner} onChange={(e) => setOwner(e.target.value)} />
+            </div>
+            <div className="field">
+              <label>Previous version (rollback target)</label>
+              <input
+                value={previousVersion}
+                onChange={(e) => setPreviousVersion(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="form-row">
+            <div className="field">
+              <label>Environments (comma-separated, in order)</label>
+              <input
+                value={wavesText}
+                onChange={(e) => setWavesText(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>Adapters (comma-separated, per wave)</label>
+              <input
+                value={adaptersText}
+                onChange={(e) => setAdaptersText(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="field">
+            <label>Note</label>
+            <input value={note} onChange={(e) => setNote(e.target.value)} />
+          </div>
+          {error && (
+            <div className="blocker">
+              <span className="code">ERROR</span>
+              {error}
+            </div>
+          )}
+          <button disabled={busy} onClick={() => void guard(createRollout)}>
+            Create &amp; start rollout
+          </button>
+        </div>
+      )}
+
+      {!approved && (
+        <div className="empty">
+          Rollouts are only available for an <strong>approved</strong> proposal
+          (a decision snapshot is required to bind the waves).
+        </div>
+      )}
+
+      {rollouts.map((r) => (
+        <RolloutCard
+          key={r.rolloutId}
+          rollout={r}
+          operator={operator}
+          onOperator={setOperator}
+          receiptWave={receiptWave}
+          onReceiptWave={setReceiptWave}
+          receiptResult={receiptResult}
+          onReceiptResult={setReceiptResult}
+          receiptMsg={receiptMsg}
+          onReceiptMsg={setReceiptMsg}
+          receiptKey={receiptKey}
+          onReceiptKey={setReceiptKey}
+          busy={busy}
+          onAction={(fn) => void guard(fn)}
+          error={error}
+        />
+      ))}
+    </div>
+  );
+}
+
+function RolloutCard({
+  rollout,
+  operator,
+  onOperator,
+  receiptWave,
+  onReceiptWave,
+  receiptResult,
+  onReceiptResult,
+  receiptMsg,
+  onReceiptMsg,
+  receiptKey,
+  onReceiptKey,
+  busy,
+  onAction,
+  error,
+}: {
+  rollout: StoredRollout;
+  operator: string;
+  onOperator: (s: string) => void;
+  receiptWave: number;
+  onReceiptWave: (n: number) => void;
+  receiptResult: "success" | "failure" | "unknown";
+  onReceiptResult: (r: "success" | "failure" | "unknown") => void;
+  receiptMsg: string;
+  onReceiptMsg: (s: string) => void;
+  receiptKey: string;
+  onReceiptKey: (s: string) => void;
+  busy: boolean;
+  onAction: (fn: () => Promise<void>) => void;
+  error: string;
+}): React.ReactElement {
+  const terminal =
+    rollout.status === "completed" ||
+    rollout.status === "rolled-back" ||
+    rollout.status === "failed";
+  const current = rollout.waves.find(
+    (w) => w.sequence === rollout.currentWaveSequence,
+  );
+  return (
+    <div
+      className="panel"
+      style={{ background: "var(--panel-2)", marginBottom: 16 }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <div>
+          <strong>Rollout {rollout.rolloutId.slice(0, 22)}…</strong>
+          <div className="consumer-detail">
+            owner {rollout.owner} · bound to candidate{" "}
+            {rollout.snapshot.candidateDigest.slice(0, 16)}… · decision by{" "}
+            {rollout.snapshot.decider}
+          </div>
+          {rollout.previousVersion && (
+            <div className="consumer-detail">
+              previous known version: <code>{rollout.previousVersion}</code>
+              {rollout.rollbackTargetWaveId &&
+                rollout.status === "rolled-back" &&
+                ` (rolled back at wave ${rollout.currentWaveSequence})`}
+            </div>
+          )}
+        </div>
+        <span className={`badge ${rollout.status}`}>{rollout.status}</span>
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+        {rollout.waves.map((w) => (
+          <div
+            key={w.waveId}
+            className="consumer-row"
+            style={{
+              outline:
+                w.sequence === rollout.currentWaveSequence && !terminal
+                  ? "1px solid var(--blue)"
+                  : "none",
+            }}
+          >
+            <div>
+              <div className="consumer-id">
+                #{w.sequence} {w.environment}{" "}
+                <span style={{ color: "var(--muted)" }}>/{w.adapter}</span>
+              </div>
+              <div className="consumer-detail">
+                attempts {w.attempts}
+                {w.lastResult &&
+                  ` · last: ${w.lastResult} — ${w.lastMessage ?? ""}`}
+              </div>
+            </div>
+            <span className={`badge ${w.status}`}>{w.status}</span>
+          </div>
+        ))}
+      </div>
+
+      {error && (
+        <div className="blocker" style={{ marginTop: 10 }}>
+          <span className="code">ERROR</span>
+          {error}
+        </div>
+      )}
+
+      {!terminal && (
+        <div style={{ marginTop: 12 }}>
+          <div className="form-row">
+            <div className="field">
+              <label>Operator</label>
+              <input
+                value={operator}
+                onChange={(e) => onOperator(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label>Receipt idempotency key</label>
+              <input
+                value={receiptKey}
+                onChange={(e) => onReceiptKey(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="form-row">
+            <div className="field">
+              <label>Wave #</label>
+              <input
+                type="number"
+                value={receiptWave}
+                onChange={(e) => onReceiptWave(Number(e.target.value))}
+              />
+            </div>
+            <div className="field">
+              <label>Result</label>
+              <select
+                value={receiptResult}
+                onChange={(e) =>
+                  onReceiptResult(
+                    e.target.value as "success" | "failure" | "unknown",
+                  )
+                }
+              >
+                <option value="success">success</option>
+                <option value="failure">failure</option>
+                <option value="unknown">unknown</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Message</label>
+              <input
+                value={receiptMsg}
+                onChange={(e) => onReceiptMsg(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="actions">
+            <button
+              disabled={busy}
+              onClick={() =>
+                onAction(async () => {
+                  await api.reportReceipt(rollout.rolloutId, {
+                    waveSequence: receiptWave,
+                    result: receiptResult,
+                    message: receiptMsg,
+                    idempotencyKey: receiptKey,
+                  });
+                })
+              }
+            >
+              Send receipt
+            </button>
+            {rollout.status === "active" && (
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() =>
+                  onAction(async () => {
+                    await api.pauseRollout(rollout.rolloutId, operator);
+                  })
+                }
+              >
+                Pause
+              </button>
+            )}
+            {rollout.status === "paused" && (
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() =>
+                  onAction(async () => {
+                    await api.resumeRollout(rollout.rolloutId, operator);
+                  })
+                }
+              >
+                Resume
+              </button>
+            )}
+            {current &&
+              (current.status === "failed" || current.status === "unknown") && (
+                <button
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() =>
+                    onAction(async () => {
+                      await api.retryWave(
+                        rollout.rolloutId,
+                        current.sequence,
+                        operator,
+                      );
+                    })
+                  }
+                >
+                  Retry wave #{current.sequence}
+                </button>
+              )}
+            <button
+              className="reject"
+              disabled={busy}
+              onClick={() =>
+                onAction(async () => {
+                  await api.rollbackRollout(
+                    rollout.rolloutId,
+                    operator,
+                    `rollback to ${rollout.previousVersion ?? "previous version"}`,
+                  );
+                })
+              }
+            >
+              Rollback
+            </button>
+          </div>
+        </div>
+      )}
+
+      {rollout.receipts.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <h4>Receipts ({rollout.receipts.length})</h4>
+          {rollout.receipts.map((rc) => (
+            <div key={rc.receiptId} className="consumer-row">
+              <div>
+                <div className="consumer-id">
+                  wave #{rc.waveSequence} · {rc.result}
+                </div>
+                <div className="consumer-detail">
+                  {rc.message} · key {rc.idempotencyKey} · run {rc.adapterRunId}
+                </div>
+              </div>
+              <span className={`badge ${rc.result}`}>{rc.result}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LineageBanner({
   proposal,
   onNavigate,
@@ -731,11 +1163,10 @@ function LineageBanner({
 
       {isSuperseded && (
         <div style={{ marginTop: 8, fontSize: 12, color: "var(--amber)" }}>
-          This proposal is superseded and closed. Late verification results
-          that arrive here are recorded as <code>proposal-superseded</code> on
-          this proposal and cannot release the successor. The successor starts
-          with a fresh candidate digest and carries over no evidence or
-          exemptions.
+          This proposal is superseded and closed. Late verification results that
+          arrive here are recorded as <code>proposal-superseded</code> on this
+          proposal and cannot release the successor. The successor starts with a
+          fresh candidate digest and carries over no evidence or exemptions.
           {lineage.note && (
             <div style={{ marginTop: 4, color: "var(--muted)" }}>
               note: {lineage.note}
@@ -785,7 +1216,9 @@ function LineageBanner({
           )}
           <div className="actions">
             <button disabled={busy} onClick={() => void createSuccessor()}>
-              {busy ? "Creating…" : "Create successor & supersede this proposal"}
+              {busy
+                ? "Creating…"
+                : "Create successor & supersede this proposal"}
             </button>
           </div>
         </div>

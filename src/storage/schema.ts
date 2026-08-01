@@ -93,6 +93,44 @@ function migrate(db: DB): void {
     );
     CREATE INDEX IF NOT EXISTS idx_exemptions_proposal ON exemptions(proposal_id);
     CREATE INDEX IF NOT EXISTS idx_exemptions_scope ON exemptions(candidate_digest, consumer_id, environment, direction, status);
+
+    CREATE TABLE IF NOT EXISTS rollouts (
+      rollout_id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL REFERENCES proposals(proposal_id),
+      topic TEXT NOT NULL,
+      status TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      started_at INTEGER,
+      paused_at INTEGER,
+      finished_at INTEGER,
+      current_wave_sequence INTEGER NOT NULL DEFAULT 0,
+      previous_version TEXT,
+      rollback_target_wave_id TEXT,
+      rolled_back_at INTEGER,
+      note TEXT,
+      snapshot_json TEXT NOT NULL,
+      waves_json TEXT NOT NULL,
+      expected_version INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_rollouts_proposal ON rollouts(proposal_id);
+    CREATE INDEX IF NOT EXISTS idx_rollouts_status ON rollouts(status);
+
+    CREATE TABLE IF NOT EXISTS rollout_receipts (
+      receipt_id TEXT PRIMARY KEY,
+      rollout_id TEXT NOT NULL REFERENCES rollouts(rollout_id),
+      wave_id TEXT NOT NULL,
+      wave_sequence INTEGER NOT NULL,
+      result TEXT NOT NULL,
+      message TEXT NOT NULL,
+      reported_at INTEGER NOT NULL,
+      received_at INTEGER NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      adapter_run_id TEXT NOT NULL,
+      UNIQUE(rollout_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON rollout_receipts(rollout_id);
+    CREATE INDEX IF NOT EXISTS idx_receipts_wave ON rollout_receipts(rollout_id, wave_sequence);
   `);
 
   ensureColumn(db, "proposals", "predecessor_id", "TEXT");

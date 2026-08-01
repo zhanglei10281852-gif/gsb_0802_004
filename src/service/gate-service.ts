@@ -10,12 +10,19 @@ import {
   type RequestExemptionInput,
   type ReviewExemptionInput,
 } from "../storage/exemption-repository.js";
+import {
+  RolloutRepository,
+  type ReceiptResult2,
+} from "../storage/rollout-repository.js";
 import type {
   CausalEvent,
+  CreateRolloutInput,
   ExemptionRecord,
   GateView,
   ProposalInput,
+  ReceiptInput,
   StoredProposal,
+  StoredRollout,
   SuccessorInput,
 } from "../core/types.js";
 import {
@@ -39,6 +46,7 @@ export type OnEvent = (event: CausalEvent) => void;
 export class GateService {
   readonly repo: ProposalRepository;
   readonly exemptions: ExemptionRepository;
+  readonly rollouts: RolloutRepository;
   constructor(
     private readonly db: DB,
     private readonly clock: Clock,
@@ -47,12 +55,19 @@ export class GateService {
   ) {
     this.repo = new ProposalRepository(db, clock);
     this.exemptions = new ExemptionRepository(db, clock, this.repo.events);
+    this.rollouts = new RolloutRepository(
+      db,
+      clock,
+      this.repo,
+      this.repo.events,
+    );
     this.repo.setExemptionRepository(this.exemptions);
   }
 
   private publishDrained(): void {
     for (const e of this.repo.drainEvents()) this.onEvent(e);
     for (const e of this.exemptions.drainEvents()) this.onEvent(e);
+    for (const e of this.rollouts.drainEvents()) this.onEvent(e);
   }
 
   submitProposal(input: ProposalInput): {
@@ -185,10 +200,78 @@ export class GateService {
       appliedExemptions: evaluation.appliedExemptions,
       environment,
       eventLog: this.repo.events.readForProposal(proposalId),
+      rollouts: this.rollouts.listForProposal(proposalId),
     };
   }
 
   listProposals(): StoredProposal[] {
     return this.repo.list();
+  }
+
+  createRollout(input: CreateRolloutInput): {
+    rollout: StoredRollout;
+    proposal: StoredProposal;
+  } {
+    const result = this.rollouts.create(input);
+    this.publishDrained();
+    return result;
+  }
+
+  startRollout(rolloutId: string): StoredRollout {
+    const rollout = this.rollouts.start(rolloutId);
+    this.publishDrained();
+    return rollout;
+  }
+
+  pauseRollout(rolloutId: string, pausedBy: string): StoredRollout {
+    const rollout = this.rollouts.pause(rolloutId, pausedBy);
+    this.publishDrained();
+    return rollout;
+  }
+
+  resumeRollout(rolloutId: string, resumedBy: string): StoredRollout {
+    const rollout = this.rollouts.resume(rolloutId, resumedBy);
+    this.publishDrained();
+    return rollout;
+  }
+
+  retryRolloutWave(
+    rolloutId: string,
+    waveSequence: number,
+    retriedBy: string,
+  ): StoredRollout {
+    const rollout = this.rollouts.retry(rolloutId, waveSequence, retriedBy);
+    this.publishDrained();
+    return rollout;
+  }
+
+  rollbackRollout(
+    rolloutId: string,
+    rolledBackBy: string,
+    note: string,
+  ): StoredRollout {
+    const rollout = this.rollouts.rollback(rolloutId, rolledBackBy, note);
+    this.publishDrained();
+    return rollout;
+  }
+
+  reportReceipt(input: ReceiptInput): ReceiptResult2 {
+    if (this.faults.shouldCrashAfterWrite?.("before-receipt-insert")) {
+      this.simulateCrash();
+    }
+    const result = this.rollouts.reportReceipt(input);
+    if (this.faults.shouldCrashAfterWrite?.("after-receipt-insert")) {
+      this.simulateCrash();
+    }
+    this.publishDrained();
+    return result;
+  }
+
+  getRollout(rolloutId: string): StoredRollout {
+    return this.rollouts.requireById(rolloutId);
+  }
+
+  listRolloutsForProposal(proposalId: string): StoredRollout[] {
+    return this.rollouts.listForProposal(proposalId);
   }
 }

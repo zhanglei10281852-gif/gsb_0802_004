@@ -145,6 +145,7 @@ export interface GateView {
   appliedExemptions: AppliedExemption[];
   environment: string;
   eventLog: CausalEvent[];
+  rollouts: StoredRollout[];
 }
 
 export interface DecisionSnapshot {
@@ -171,4 +172,82 @@ export interface DecisionSnapshot {
     status: ProposalStatus;
   };
   lastEventId: number;
+}
+
+export type RolloutStatus =
+  | "planned"
+  | "active"
+  | "paused"
+  | "completed"
+  | "rolled-back"
+  | "failed";
+
+export type WaveStatus =
+  | "pending"
+  | "deploying"
+  | "succeeded"
+  | "failed"
+  | "unknown"
+  | "rolled-back";
+
+export type ReceiptResult = "success" | "failure" | "unknown";
+
+export interface Wave {
+  waveId: string;
+  sequence: number;
+  environment: string;
+  adapter: string;
+  status: WaveStatus;
+  attempts: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  lastReceiptId: string | null;
+  lastResult: ReceiptResult | null;
+  lastMessage: string | null;
+  lastReceivedAt: number | null;
+}
+
+export interface ReceiptRecord {
+  receiptId: string;
+  rolloutId: string;
+  waveId: string;
+  waveSequence: number;
+  result: ReceiptResult;
+  message: string;
+  reportedAt: number;
+  receivedAt: number;
+  idempotencyKey: string;
+  adapterRunId: string;
+}
+
+export interface RolloutSnapshot {
+  proposalId: string;
+  candidateDigest: string;
+  decisionKind: "approve" | "reject";
+  decidedAt: number;
+  decider: string;
+  evidenceDigest: string;
+  compatibilityDigest: string;
+  exemptionsDigest: string;
+  lastEventId: number;
+}
+
+export interface StoredRollout {
+  rolloutId: string;
+  proposalId: string;
+  topic: string;
+  status: RolloutStatus;
+  owner: string;
+  createdAt: number;
+  startedAt: number | null;
+  pausedAt: number | null;
+  finishedAt: number | null;
+  currentWaveSequence: number;
+  previousVersion: string | null;
+  rollbackTargetWaveId: string | null;
+  rolledBackAt: number | null;
+  note: string | null;
+  snapshot: RolloutSnapshot;
+  waves: Wave[];
+  receipts: ReceiptRecord[];
 }

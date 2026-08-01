@@ -188,6 +188,7 @@ export interface GateView {
   appliedExemptions: AppliedExemption[];
   environment: string;
   eventLog: CausalEvent[];
+  rollouts: StoredRollout[];
 }
 
 export interface Blocker {
@@ -210,6 +211,112 @@ export interface FreshnessInfo {
   ttlMs: number;
 }
 
+export type RolloutId = string;
+export type WaveId = string;
+export type ReceiptId = string;
+
+export type RolloutStatus =
+  | "planned"
+  | "active"
+  | "paused"
+  | "completed"
+  | "rolled-back"
+  | "failed";
+
+export type WaveStatus =
+  | "pending"
+  | "deploying"
+  | "succeeded"
+  | "failed"
+  | "unknown"
+  | "rolled-back";
+
+export type ReceiptResult = "success" | "failure" | "unknown";
+
+export interface WaveSpec {
+  environment: string;
+  adapter: string;
+}
+
+export interface Wave {
+  waveId: WaveId;
+  sequence: number;
+  environment: string;
+  adapter: string;
+  status: WaveStatus;
+  attempts: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  lastReceiptId: ReceiptId | null;
+  lastResult: ReceiptResult | null;
+  lastMessage: string | null;
+  lastReceivedAt: number | null;
+}
+
+export interface ReceiptRecord {
+  receiptId: ReceiptId;
+  rolloutId: RolloutId;
+  waveId: WaveId;
+  waveSequence: number;
+  result: ReceiptResult;
+  message: string;
+  reportedAt: number;
+  receivedAt: number;
+  idempotencyKey: string;
+  adapterRunId: string;
+}
+
+export interface RolloutSnapshot {
+  proposalId: ProposalId;
+  candidateDigest: string;
+  decisionKind: DecisionKind;
+  decidedAt: number;
+  decider: string;
+  evidenceDigest: string;
+  compatibilityDigest: string;
+  exemptionsDigest: string;
+  lastEventId: number;
+}
+
+export interface StoredRollout {
+  rolloutId: RolloutId;
+  proposalId: ProposalId;
+  topic: string;
+  status: RolloutStatus;
+  owner: string;
+  createdAt: number;
+  startedAt: number | null;
+  pausedAt: number | null;
+  finishedAt: number | null;
+  currentWaveSequence: number;
+  previousVersion: string | null;
+  rollbackTargetWaveId: WaveId | null;
+  rolledBackAt: number | null;
+  note: string | null;
+  snapshot: RolloutSnapshot;
+  waves: Wave[];
+  receipts: ReceiptRecord[];
+}
+
+export interface CreateRolloutInput {
+  proposalId: ProposalId;
+  owner: string;
+  waves: WaveSpec[];
+  previousVersion?: string;
+  note?: string;
+  autoStart?: boolean;
+}
+
+export interface ReceiptInput {
+  rolloutId: RolloutId;
+  waveSequence: number;
+  result: ReceiptResult;
+  message: string;
+  reportedAt: number;
+  idempotencyKey: string;
+  adapterRunId: string;
+}
+
 export type CausalEvent =
   | ProposalCreatedEvent
   | EvidenceAcceptedEvent
@@ -220,7 +327,18 @@ export type CausalEvent =
   | ExemptionRequestedEvent
   | ExemptionApprovedEvent
   | ExemptionRejectedEvent
-  | ExemptionRevokedEvent;
+  | ExemptionRevokedEvent
+  | RolloutCreatedEvent
+  | RolloutStartedEvent
+  | RolloutPausedEvent
+  | RolloutResumedEvent
+  | RolloutCompletedEvent
+  | RolloutFailedEvent
+  | WaveDeployingEvent
+  | WaveResultEvent
+  | WaveRetriedEvent
+  | ReceiptRejectedEvent
+  | RolloutRolledBackEvent;
 
 export interface BaseEvent {
   eventId: number;
@@ -341,5 +459,132 @@ export interface ExemptionRevokedEvent extends BaseEvent {
     exemptionId: ExemptionId;
     revokedBy: string;
     reason: string;
+  };
+}
+
+export interface RolloutCreatedEvent extends BaseEvent {
+  eventType: "rollout-created";
+  payload: {
+    rolloutId: RolloutId;
+    owner: string;
+    waveCount: number;
+    environments: string[];
+    candidateDigest: string;
+    previousVersion: string | null;
+  };
+}
+
+export interface RolloutStartedEvent extends BaseEvent {
+  eventType: "rollout-started";
+  payload: {
+    rolloutId: RolloutId;
+    firstWaveSequence: number;
+    environment: string;
+  };
+}
+
+export interface RolloutPausedEvent extends BaseEvent {
+  eventType: "rollout-paused";
+  payload: {
+    rolloutId: RolloutId;
+    pausedBy: string;
+    atWaveSequence: number;
+  };
+}
+
+export interface RolloutResumedEvent extends BaseEvent {
+  eventType: "rollout-resumed";
+  payload: {
+    rolloutId: RolloutId;
+    resumedBy: string;
+    atWaveSequence: number;
+  };
+}
+
+export interface RolloutCompletedEvent extends BaseEvent {
+  eventType: "rollout-completed";
+  payload: {
+    rolloutId: RolloutId;
+    waveCount: number;
+    candidateDigest: string;
+  };
+}
+
+export interface RolloutFailedEvent extends BaseEvent {
+  eventType: "rollout-failed";
+  payload: {
+    rolloutId: RolloutId;
+    waveSequence: number;
+    environment: string;
+    message: string;
+  };
+}
+
+export interface WaveDeployingEvent extends BaseEvent {
+  eventType: "wave-deploying";
+  payload: {
+    rolloutId: RolloutId;
+    waveId: WaveId;
+    waveSequence: number;
+    environment: string;
+    attempt: number;
+  };
+}
+
+export interface WaveResultEvent extends BaseEvent {
+  eventType: "wave-result";
+  payload: {
+    rolloutId: RolloutId;
+    waveId: WaveId;
+    waveSequence: number;
+    environment: string;
+    result: ReceiptResult;
+    message: string;
+    receiptId: ReceiptId;
+    idempotencyKey: string;
+    advanced: boolean;
+    nextWaveSequence: number | null;
+  };
+}
+
+export interface WaveRetriedEvent extends BaseEvent {
+  eventType: "wave-retried";
+  payload: {
+    rolloutId: RolloutId;
+    waveId: WaveId;
+    waveSequence: number;
+    environment: string;
+    attempt: number;
+    retriedBy: string;
+  };
+}
+
+export interface ReceiptRejectedEvent extends BaseEvent {
+  eventType: "receipt-rejected";
+  payload: {
+    rolloutId: RolloutId;
+    reason:
+      | "duplicate-idempotency-key"
+      | "rollout-not-active"
+      | "wave-not-current"
+      | "unknown-wave"
+      | "invalid-payload";
+    waveSequence?: number;
+    idempotencyKey?: string;
+    result?: ReceiptResult;
+    currentWaveSequence?: number;
+    rolloutStatus?: RolloutStatus;
+  };
+}
+
+export interface RolloutRolledBackEvent extends BaseEvent {
+  eventType: "rollout-rolled-back";
+  payload: {
+    rolloutId: RolloutId;
+    rolledBackBy: string;
+    fromWaveSequence: number;
+    targetWaveId: WaveId | null;
+    previousVersion: string | null;
+    note: string;
   };
 }

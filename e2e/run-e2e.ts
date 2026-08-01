@@ -27,6 +27,10 @@ const scenarios = [
   "exemption-scope-mismatch",
   "lineage-successor",
   "lineage-recovery",
+  "rollout-phased",
+  "rollout-duplicate-out-of-order",
+  "rollout-pause-retry-rollback",
+  "rollout-receipt-loss-recovery",
 ];
 
 function runScenario(name: string, port: number): Promise<ScenarioResult> {

@@ -73,12 +73,15 @@ export async function registerRoutes(
         });
         return;
       }
-      const { predecessor, successor } = service.createSuccessor(req.params.id, {
-        candidate: candidate as Record<string, unknown>,
-        author: String(body.author ?? "unknown"),
-        ttlMs: body.ttlMs ? Number(body.ttlMs) : undefined,
-        note: body.note ? String(body.note) : undefined,
-      });
+      const { predecessor, successor } = service.createSuccessor(
+        req.params.id,
+        {
+          candidate: candidate as Record<string, unknown>,
+          author: String(body.author ?? "unknown"),
+          ttlMs: body.ttlMs ? Number(body.ttlMs) : undefined,
+          note: body.note ? String(body.note) : undefined,
+        },
+      );
       reply.status(201).send({ predecessor, successor });
     },
   );
@@ -199,6 +202,138 @@ export async function registerRoutes(
         String(body.revokedBy ?? "unknown"),
       );
       reply.status(200).send(record);
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
+    "/api/proposals/:id/rollouts",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const waves = Array.isArray(body.waves) ? body.waves : [];
+      const { rollout, proposal } = service.createRollout({
+        proposalId: req.params.id,
+        owner: String(body.owner ?? "release-manager"),
+        waves: waves as { environment: string; adapter: string }[],
+        previousVersion: body.previousVersion
+          ? String(body.previousVersion)
+          : undefined,
+        note: body.note ? String(body.note) : undefined,
+        autoStart: body.autoStart === false ? false : true,
+      });
+      reply.status(201).send({ rollout, proposal });
+    },
+  );
+
+  app.get<{ Params: { id: string } }>(
+    "/api/proposals/:id/rollouts",
+    async (req) => {
+      return { rollouts: service.listRolloutsForProposal(req.params.id) };
+    },
+  );
+
+  app.get<{ Params: { rolloutId: string } }>(
+    "/api/rollouts/:rolloutId",
+    async (req) => {
+      return service.getRollout(req.params.rolloutId);
+    },
+  );
+
+  app.post<{ Params: { rolloutId: string }; Body: Record<string, unknown> }>(
+    "/api/rollouts/:rolloutId/start",
+    async (req) => {
+      return service.startRollout(req.params.rolloutId);
+    },
+  );
+
+  app.post<{ Params: { rolloutId: string }; Body: Record<string, unknown> }>(
+    "/api/rollouts/:rolloutId/pause",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      reply
+        .status(200)
+        .send(
+          service.pauseRollout(
+            req.params.rolloutId,
+            String(body.pausedBy ?? "operator"),
+          ),
+        );
+    },
+  );
+
+  app.post<{ Params: { rolloutId: string }; Body: Record<string, unknown> }>(
+    "/api/rollouts/:rolloutId/resume",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      reply
+        .status(200)
+        .send(
+          service.resumeRollout(
+            req.params.rolloutId,
+            String(body.resumedBy ?? "operator"),
+          ),
+        );
+    },
+  );
+
+  app.post<{
+    Params: { rolloutId: string; waveSequence: string };
+    Body: Record<string, unknown>;
+  }>(
+    "/api/rollouts/:rolloutId/waves/:waveSequence/retry",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      reply
+        .status(200)
+        .send(
+          service.retryRolloutWave(
+            req.params.rolloutId,
+            Number(req.params.waveSequence),
+            String(body.retriedBy ?? "operator"),
+          ),
+        );
+    },
+  );
+
+  app.post<{ Params: { rolloutId: string }; Body: Record<string, unknown> }>(
+    "/api/rollouts/:rolloutId/rollback",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      reply
+        .status(200)
+        .send(
+          service.rollbackRollout(
+            req.params.rolloutId,
+            String(body.rolledBackBy ?? "operator"),
+            String(body.note ?? "rollback to previous known good version"),
+          ),
+        );
+    },
+  );
+
+  app.post<{ Params: { rolloutId: string }; Body: Record<string, unknown> }>(
+    "/api/rollouts/:rolloutId/receipts",
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const idempotencyKey = String(
+        req.headers["idempotency-key"] ?? body.idempotencyKey ?? "",
+      );
+      if (!idempotencyKey) {
+        reply.status(400).send({
+          error: "IDEMPOTENCY_KEY_REQUIRED",
+          message: "provide Idempotency-Key header",
+        });
+        return;
+      }
+      const result = service.reportReceipt({
+        rolloutId: req.params.rolloutId,
+        waveSequence: Number(body.waveSequence ?? 0),
+        result: body.result as "success" | "failure" | "unknown",
+        message: String(body.message ?? ""),
+        reportedAt: Number(body.reportedAt ?? Date.now()),
+        idempotencyKey,
+        adapterRunId: String(body.adapterRunId ?? "unknown"),
+      });
+      reply.status(result.accepted ? 202 : 409).send(result);
     },
   );
 

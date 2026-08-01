@@ -71,9 +71,12 @@ receives a `409 CONFLICT`. The database is the single source of truth, not in-pr
 
 Every state change (`proposal-created`, `evidence-accepted`, `evidence-rejected`, `gate-advanced`,
 `decision-recorded`, `proposal-superseded`, `exemption-requested`, `exemption-approved`,
-`exemption-rejected`, `exemption-revoked`) is appended to an append-only `event_log`. Each event's hash
-commits to the previous event's hash (`prev_hash`), forming a tamper-evident chain. The chain can be
-verified with `EventLog.verifyChain(proposalId)`.
+`exemption-rejected`, `exemption-revoked`, `rollout-created`, `rollout-started`, `rollout-paused`,
+`rollout-resumed`, `rollout-completed`, `rollout-failed`, `wave-deploying`, `wave-result`,
+`wave-retried`, `receipt-rejected`, `rollout-rolled-back`) is appended to an append-only `event_log`.
+Each event's hash commits to the previous event's hash (`prev_hash`), forming a tamper-evident chain.
+Rollout events are written to the **bound proposal's** chain, so a proposal's full history — gate,
+exemptions, lineage and staged rollout — verifies as one chain with `EventLog.verifyChain(proposalId)`.
 
 ### 9. Time-boxed, two-reviewer exemptions (豁免)
 
@@ -133,6 +136,40 @@ A `superseded` proposal is terminal: it cannot be decided or superseded again, a
 workbench shows predecessor/successor navigation, a superseded banner explaining the isolation rules,
 and a "create successor" form pre-filled with the current candidate.
 
+### 11. Phased rollout of an approved candidate
+
+Once a proposal is **approved**, its immutable decision snapshot can be bound to a staged rollout.
+A release owner schedules a sequence of environment **waves** (e.g. `canary` then `prod`), each
+deployed by a named adapter. The rollout is a separate aggregate but is **bound to the exact decision
+snapshot** (candidate digest, evidence/compatibility/exemptions digests, decider, `lastEventId`).
+
+- **Waves advance in order.** A wave starts `deploying`; an adapter reports a receipt of `success`,
+  `failure`, or `unknown`. A `success` marks the wave `succeeded` and starts the next wave; the last
+  `success` completes the rollout. A `failure` fails the rollout. `unknown` leaves the wave retriable
+  without failing the whole rollout.
+- **Receipts are idempotent and only affect the current wave.** Adapters MUST send an
+  `Idempotency-Key`. Duplicate keys return the original result (`deduped: true`) and never double-count.
+  A receipt for a non-current wave (out of order), an unknown/non-deploying wave, or a non-active
+  rollout is rejected (`wave-not-current` / `rollout-not-active`) and recorded as a
+  `receipt-rejected` event — it never advances or pollutes the rollout.
+- **Pause / resume.** A release owner can pause an active rollout. A `success` received while paused is
+  recorded but does **not** advance to the next wave until the rollout is resumed (resume advances the
+  next wave if the current one succeeded).
+- **Retry.** A wave in `failed` or `unknown` state can be retried, which resets it to `deploying` and
+  increments its attempt counter.
+- **Rollback to the previous known version.** An active/failed/paused rollout can be rolled back to its
+  recorded `previousVersion`. In-progress and completed waves are marked `rolled-back` and the rollout
+  becomes terminal. Rollback is a **deployment** operation only: it does not change the contract
+  decision, does not mutate the decision snapshot, and does **not** revive expired or revoked
+  exemptions. An already `completed`/`rolled-back` rollout cannot be rolled back again.
+- Only one non-terminal rollout may exist per proposal, and a rollout cannot be created from a rejected
+  or un-approved proposal.
+
+The workbench adds a **Rollout** tab on approved proposals: schedule waves, watch each wave's status
+and attempts, send test receipts, and pause/resume/retry/rollback. The adapter simulator covers the
+happy-path phased rollout, duplicate and out-of-order receipts, pause/retry/rollback, and receipt loss
+(hard crash after the receipt is committed but before the reply, then restart + idempotent retry).
+
 ---
 
 ## Failure & Recovery Boundaries
@@ -153,13 +190,21 @@ and a "create successor" form pre-filled with the current candidate.
 | Exemption revoked                                        | Status becomes `revoked`; it stops gating immediately. Revocation after a decision is rejected so the snapshot stays stable.                                                                                |
 | Exemption requested for wrong scope/env/candidate        | It stays active in its own scope but never applies to another environment/consumer/candidate.                                                                                                               |
 | Same reviewer reviews twice / requester self-reviews     | Rejected with 409; only two _distinct_ approvals count.                                                                                                                                                     |
-| Process restart                                          | All proposals, evidence, decisions, exemptions and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`.                            |
+| Duplicate adapter receipt (same Idempotency-Key)         | Original result returned (`deduped: true`); no second receipt row, wave does not double-advance.                                                                                                            |
+| Out-of-order / early receipt for a future wave           | Rejected as `wave-not-current` and recorded as `receipt-rejected`; it cannot start a future wave early.                                                                                                     |
+| Receipt arrives after rollout completes/is rolled back   | Rejected as `rollout-not-active`; terminal rollout is unchanged.                                                                                                                                            |
+| Adapter reports `failure` / `unknown`                    | `failure` fails the rollout (retryable via a new rollout after rollback); `unknown` leaves the wave retriable without failing the rollout. `retry` resets it to `deploying` and bumps attempts.             |
+| Server commits a receipt, then crashes before replying   | Receipt + wave result + events are committed in one transaction; on restart the adapter retries with the same key and is deduped. The `rollout-receipt-loss-recovery` e2e scenario exercises this.          |
+| Rollback requested                                       | In-progress/succeeded waves marked `rolled-back`, rollout becomes terminal; the bound decision snapshot and any expired/revoked exemptions are unchanged.                                                   |
+| Process restart                                          | All proposals, evidence, decisions, exemptions, rollouts, receipts and the event log are reloaded from SQLite (WAL mode, `synchronous=FULL`). SSE reconnects replay from `Last-Event-ID`/`?after=N`.        |
 | Clock skew / real-time waiting in tests                  | The clock is injectable. With `VIRTUAL_CLOCK=1` the server uses a manual clock advanced over `POST /api/debug/clock/advance`, so freshness scenarios run instantly.                                         |
 | Tampering with the event log                             | Hash chain verification fails.                                                                                                                                                                              |
 
 **Transaction boundary:** evidence insert + its event append happen in one SQLite transaction;
 status transition + its event append happen in one transaction; decision row update + its event
-append happen in one transaction. A crash cannot leave state without its causal record.
+append happen in one transaction; successor creation (insert + supersede + exemption revocations +
+events) is one transaction; receipt insert + wave/rollout update + events happen in one transaction.
+A crash cannot leave state without its causal record.
 
 ---
 
@@ -199,12 +244,11 @@ Environment variables: `PORT` (default 3000), `HOST` (default 127.0.0.1), `DB_PA
 npm run e2e
 ```
 
-This runs thirteen real-subprocess scenarios covering the happy path, duplicate/stale/wrong-digest/
-unknown-consumer evidence, crash-after-write recovery, the two-reviewer exemption lifecycle (approval,
-expiry, revocation, rejection, scope mismatch), and proposal lineage (`lineage-successor` proves
-isolation and late-evidence attribution; `lineage-recovery` proves lineage survives a hard crash and
-restart). Each boots the compiled `dist/server/main.js` with a virtual clock and drives it over real
-HTTP.
+This runs seventeen real-subprocess scenarios covering evidence (happy path, duplicate, stale,
+crash-after-write, wrong/unknown), the two-reviewer exemption lifecycle, proposal lineage, and the
+staged rollout (`rollout-phased`, `rollout-duplicate-out-of-order`, `rollout-pause-retry-rollback`,
+and `rollout-receipt-loss-recovery` with a hard crash + restart + idempotent retry). Each boots the
+compiled `dist/server/main.js` with a virtual clock and drives it over real HTTP.
 
 ### Run a single simulator scenario manually
 
@@ -225,19 +269,28 @@ npx vite             # UI on :5173, proxies /api and /events to :3000
 
 ## HTTP API
 
-| Method | Path                                                | Purpose                                                                                                                                  |
-| ------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/api/proposals`                                    | Submit baseline + candidate + consumers; returns digest + compatibility.                                                                 |
-| `GET`  | `/api/proposals`                                    | List proposals.                                                                                                                          |
-| `GET`  | `/api/proposals/:id?environment=prod`               | Full gate view: proposal, evidence, blockers, freshness, applied exemptions, event log.                                                  |
-| `POST` | `/api/proposals/:id/successor`                      | Create a successor from a revised `{candidate, author, ttlMs?, note?}`; predecessor is atomically superseded and its exemptions revoked. |
-| `POST` | `/api/proposals/:id/evidence`                       | Agent reports evidence (requires `Idempotency-Key`).                                                                                     |
-| `POST` | `/api/proposals/:id/decision`                       | `{kind: approve\|reject, decider, rationale, environment?}`. Approve requires zero blockers (exemptions applied for that environment).   |
-| `POST` | `/api/proposals/:id/exemptions`                     | Request a scoped, time-boxed exemption (`consumerId, environment, direction, reason, requestedBy, ttlMs`).                               |
-| `GET`  | `/api/proposals/:id/exemptions`                     | List exemptions for a proposal.                                                                                                          |
-| `POST` | `/api/proposals/:id/exemptions/:exemptionId/review` | `{reviewer, approved, comment}`; needs two distinct approvals; requester cannot review.                                                  |
-| `POST` | `/api/proposals/:id/exemptions/:exemptionId/revoke` | `{revokedBy}`; revokes an active/pending exemption.                                                                                      |
-| `GET`  | `/api/events?after=N`                               | Server-Sent Events; replays events after id `N`, then streams live.                                                                      |
+| Method | Path                                                | Purpose                                                                                                                                     |
+| ------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/proposals`                                    | Submit baseline + candidate + consumers; returns digest + compatibility.                                                                    |
+| `GET`  | `/api/proposals`                                    | List proposals.                                                                                                                             |
+| `GET`  | `/api/proposals/:id?environment=prod`               | Full gate view: proposal, evidence, blockers, freshness, applied exemptions, event log.                                                     |
+| `POST` | `/api/proposals/:id/successor`                      | Create a successor from a revised `{candidate, author, ttlMs?, note?}`; predecessor is atomically superseded and its exemptions revoked.    |
+| `POST` | `/api/proposals/:id/evidence`                       | Agent reports evidence (requires `Idempotency-Key`).                                                                                        |
+| `POST` | `/api/proposals/:id/decision`                       | `{kind: approve\|reject, decider, rationale, environment?}`. Approve requires zero blockers (exemptions applied for that environment).      |
+| `POST` | `/api/proposals/:id/exemptions`                     | Request a scoped, time-boxed exemption (`consumerId, environment, direction, reason, requestedBy, ttlMs`).                                  |
+| `GET`  | `/api/proposals/:id/exemptions`                     | List exemptions for a proposal.                                                                                                             |
+| `POST` | `/api/proposals/:id/exemptions/:exemptionId/review` | `{reviewer, approved, comment}`; needs two distinct approvals; requester cannot review.                                                     |
+| `POST` | `/api/proposals/:id/exemptions/:exemptionId/revoke` | `{revokedBy}`; revokes an active/pending exemption.                                                                                         |
+| `POST` | `/api/proposals/:id/rollouts`                       | Start a phased rollout from an approved proposal: `{owner, waves:[{environment, adapter}], previousVersion?, note?, autoStart?}`.           |
+| `GET`  | `/api/proposals/:id/rollouts`                       | List rollouts for a proposal.                                                                                                               |
+| `GET`  | `/api/rollouts/:rolloutId`                          | Get a rollout with its waves and receipts.                                                                                                  |
+| `POST` | `/api/rollouts/:rolloutId/start`                    | Start a planned rollout (first wave begins deploying).                                                                                      |
+| `POST` | `/api/rollouts/:rolloutId/pause`                    | `{pausedBy}`; pause advancement (receipts are recorded but do not advance).                                                                 |
+| `POST` | `/api/rollouts/:rolloutId/resume`                   | `{resumedBy}`; resume; advances the next wave if the current one already succeeded.                                                         |
+| `POST` | `/api/rollouts/:rolloutId/waves/:n/retry`           | `{retriedBy}`; retry a `failed`/`unknown` wave (resets to deploying, bumps attempt).                                                        |
+| `POST` | `/api/rollouts/:rolloutId/rollback`                 | `{rolledBackBy, note}`; roll back to the previous known version without altering the decision.                                              |
+| `POST` | `/api/rollouts/:rolloutId/receipts`                 | Adapter receipt `{waveSequence, result: success\|failure\|unknown, message, ...}` (requires `Idempotency-Key`); only advances current wave. |
+| `GET`  | `/api/events?after=N`                               | Server-Sent Events; replays events after id `N`, then streams live.                                                                         |
 
 The web workbench connects to `/api/events`, and on any (re)connect first fetches the authoritative
 `GET /api/proposals/:id` snapshot, then resumes streaming from the last event id — so a reconnect
@@ -248,15 +301,15 @@ never relies on in-process-only state.
 ## Layout
 
 ```
-src/core/        Pure domain: types, digest, compatibility (JSON Schema 2020-12), gate state machine, clock, errors
-src/storage/     SQLite schema, hash-chained event log, repository (transactions, idempotency, CAS decisions)
-src/service/     GateService orchestrating repository + injectable clock/faults
+src/core/        Pure domain: types, digest, compatibility (JSON Schema 2020-12), gate & rollout state machines, clock, errors
+src/storage/     SQLite schema, hash-chained event log, proposal/exemption/rollout repositories (transactions, idempotency, CAS)
+src/service/     GateService orchestrating repositories + injectable clock/faults
 src/server/      Fastify app, routes, SSE, debug clock/fault control
 src/web/         React workbench (Vite)
-src/agent/       Build-agent simulator + scriptable scenarios
+src/agent/       Build-agent + deployment-adapter simulator with scriptable scenarios
 e2e/             Compiled end-to-end runner (boots real servers + simulator)
-test/            Integration tests (repository concurrency/dedup/recovery, HTTP via inject)
+test/            Integration tests (repository concurrency/dedup/recovery, rollout, lineage, HTTP)
 ```
 
 The core modules have zero imports from `src/server`, `src/storage`, `src/web`, or `src/agent` —
-this is what keeps contract compatibility and the gate state machine independent of adapters.
+this is what keeps the compatibility, gate and rollout state machines independent of adapters.

@@ -28,15 +28,24 @@ export interface ScenarioStep {
     | "revoke-exemption"
     | "create-successor"
     | "report-to-predecessor"
-    | "expect-status";
+    | "expect-status"
+    | "create-rollout"
+    | "rollout-receipt"
+    | "pause-rollout"
+    | "resume-rollout"
+    | "retry-wave"
+    | "rollback-rollout"
+    | "expect-rollout-status"
+    | "expect-wave-status";
   consumerId?: string;
-  result?: EvidenceStatus;
+  result?: EvidenceStatus | "success" | "failure" | "unknown";
   detail?: string;
   duplicate?: boolean;
   wrongDigest?: boolean;
   unknownConsumer?: boolean;
   oldDigest?: string;
   crashAfterWrite?: boolean;
+  crashAfterReceipt?: boolean;
   ms?: number;
   minBlockers?: number;
   maxBlockers?: number;
@@ -63,6 +72,23 @@ export interface ScenarioStep {
   targetProposal?: string;
   expectedStatus?: string;
   expectRejectedReason?: string;
+  owner?: string;
+  waves?: { environment: string; adapter: string }[];
+  previousVersion?: string;
+  captureRolloutAs?: string;
+  targetRollout?: string;
+  rolloutId?: string;
+  waveSequence?: number;
+  idempotencyKey?: string;
+  adapterRunId?: string;
+  pausedBy?: string;
+  resumedBy?: string;
+  retriedBy?: string;
+  rolledBackBy?: string;
+  rollbackNote?: string;
+  expectedWaveStatus?: string;
+  expectAccepted?: boolean;
+  expectDeduped?: boolean;
 }
 
 export interface Scenario {

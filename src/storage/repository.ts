@@ -38,6 +38,10 @@ import {
 import type { ExemptionRecord } from "../core/types.js";
 import type { ExemptionRepository } from "./exemption-repository.js";
 
+function randomNonce(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
 export interface EvidenceInput {
   proposalId: ProposalId;
   candidateDigest: string;
@@ -224,6 +228,7 @@ export class ProposalRepository {
       {
         t: now,
         a: input.author,
+        n: randomNonce(),
       },
     )}`;
 
@@ -290,7 +295,7 @@ export class ProposalRepository {
     const now = this.clock.now();
     const ttlMs = input.ttlMs ?? predecessor.ttlMs;
     const successorId = `${predecessor.topic}-${shortDigest(input.candidate)}-${shortDigest(
-      { t: now, a: input.author, p: predecessorId },
+      { t: now, a: input.author, p: predecessorId, n: randomNonce() },
     )}`;
 
     const events: CausalEvent[] = [];

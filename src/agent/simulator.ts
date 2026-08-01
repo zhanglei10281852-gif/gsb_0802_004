@@ -79,7 +79,9 @@ export class AgentSimulator {
   async armCrashAfterWrite(
     stage:
       | "after-evidence-insert"
-      | "before-evidence-insert" = "after-evidence-insert",
+      | "before-evidence-insert"
+      | "after-receipt-insert"
+      | "before-receipt-insert" = "after-evidence-insert",
   ): Promise<void> {
     const res = await fetch(
       new URL("/api/debug/faults/crash-after-write", this.opts.baseUrl),
@@ -144,6 +146,8 @@ export class AgentSimulator {
 
     let runCounter = 0;
     const captured = new Map<string, string>();
+    const capturedRollouts = new Map<string, string>();
+    let activeRolloutId: string | null = null;
 
     const resolveTarget = (step: { targetProposal?: string }): string => {
       if (step.targetProposal) {
@@ -154,12 +158,25 @@ export class AgentSimulator {
       return activeProposalId;
     };
 
+    const resolveRollout = (step: {
+      targetRollout?: string;
+      rolloutId?: string;
+    }): string => {
+      if (step.rolloutId) return step.rolloutId;
+      if (step.targetRollout) {
+        return capturedRollouts.get(step.targetRollout) ?? step.targetRollout;
+      }
+      if (activeRolloutId) return activeRolloutId;
+      throw new Error("no active rollout; create a rollout first");
+    };
+
     for (const step of scenario.steps) {
       switch (step.action) {
         case "report": {
           runCounter++;
           const targetId = resolveTarget(step);
           const key = `${step.consumerId}-${targetId}-run${runCounter}`;
+          const evStatus = (step.result ?? "pass") as "pass" | "fail" | "error";
           const digest = step.wrongDigest
             ? "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
             : step.targetProposal === "root"
@@ -178,8 +195,8 @@ export class AgentSimulator {
                 proposalId: targetId,
                 candidateDigest: digest,
                 consumerId: consumer!,
-                status: step.result ?? "pass",
-                detail: step.detail ?? `${step.result} result`,
+                status: evStatus,
+                detail: step.detail ?? `${evStatus} result`,
                 reportedAt: Date.now(),
                 idempotencyKey: key,
                 agentRunId: `run-${runCounter}`,
@@ -198,8 +215,8 @@ export class AgentSimulator {
               proposalId: targetId,
               candidateDigest: digest,
               consumerId: consumer!,
-              status: step.result ?? "pass",
-              detail: step.detail ?? `${step.result} result`,
+              status: evStatus,
+              detail: step.detail ?? `${evStatus} result`,
               reportedAt: Date.now(),
               idempotencyKey: key,
               agentRunId: `run-${runCounter}`,
@@ -222,8 +239,8 @@ export class AgentSimulator {
                 proposalId: targetId,
                 candidateDigest: digest,
                 consumerId: consumer!,
-                status: step.result ?? "pass",
-                detail: step.detail ?? `${step.result} result`,
+                status: evStatus,
+                detail: step.detail ?? `${evStatus} result`,
                 reportedAt: Date.now(),
                 idempotencyKey: key,
                 agentRunId: `run-${runCounter}`,
@@ -275,7 +292,7 @@ export class AgentSimulator {
             proposalId: predecessorId,
             candidateDigest: proposal.candidateDigest,
             consumerId: step.consumerId!,
-            status: step.result ?? "pass",
+            status: (step.result ?? "pass") as "pass" | "fail" | "error",
             detail: step.detail ?? "late result for old candidate",
             reportedAt: Date.now(),
             idempotencyKey: key,
@@ -439,6 +456,155 @@ export class AgentSimulator {
             step.revokedBy ?? step.reviewer ?? "reviewer",
           );
           this.logger.log(`revoked exemption -> status=${rec.status}`);
+          break;
+        }
+        case "create-rollout": {
+          const waves = step.waves ?? [
+            { environment: "canary", adapter: "canary-adapter" },
+            { environment: "prod", adapter: "prod-adapter" },
+          ];
+          const { rollout } = await this.client.createRollout(
+            resolveTarget(step),
+            {
+              owner: step.owner ?? "release-mgr",
+              waves,
+              previousVersion: step.previousVersion ?? "v1.0.0",
+              note: step.note,
+              autoStart: true,
+            },
+          );
+          activeRolloutId = rollout.rolloutId;
+          if (step.captureRolloutAs)
+            capturedRollouts.set(step.captureRolloutAs, rollout.rolloutId);
+          this.logger.log(
+            `created rollout ${rollout.rolloutId} status=${rollout.status} waves=${rollout.waves.length} bound to ${rollout.snapshot.candidateDigest.slice(0, 12)}…`,
+          );
+          break;
+        }
+        case "rollout-receipt": {
+          const rid = resolveRollout(step);
+          const key =
+            step.idempotencyKey ??
+            `rcpt-${rid}-w${step.waveSequence}-run${runCounter + 1}`;
+          if (step.crashAfterReceipt) {
+            await this.armCrashAfterWrite("after-receipt-insert");
+            this.logger.log(
+              `sending receipt for wave ${step.waveSequence} with crash-after-receipt armed`,
+            );
+            try {
+              await this.client.reportReceipt(rid, {
+                waveSequence: step.waveSequence ?? 1,
+                result:
+                  (step.result as "success" | "failure" | "unknown") ??
+                  "success",
+                message: step.detail ?? "deployed",
+                idempotencyKey: key,
+                adapterRunId: step.adapterRunId ?? `adapter-${runCounter}`,
+              });
+            } catch (e) {
+              this.logger.log(
+                `connection reset as expected (process crashed after receipt write): ${(e as Error).message}`,
+              );
+            }
+            this.proc = null;
+          } else {
+            const res = await this.client.reportReceipt(rid, {
+              waveSequence: step.waveSequence ?? 1,
+              result:
+                (step.result as "success" | "failure" | "unknown") ?? "success",
+              message: step.detail ?? "deployed",
+              idempotencyKey: key,
+              adapterRunId: step.adapterRunId ?? `adapter-${runCounter}`,
+            });
+            this.logger.log(
+              `receipt wave=${step.waveSequence} result=${step.result} accepted=${res.accepted} deduped=${res.deduped} reason=${res.reason ?? "n/a"}`,
+            );
+            if (
+              step.expectAccepted !== undefined &&
+              res.accepted !== step.expectAccepted
+            ) {
+              throw new Error(
+                `expected accepted=${step.expectAccepted}, got ${res.accepted} (reason=${res.reason})`,
+              );
+            }
+            if (
+              step.expectDeduped !== undefined &&
+              res.deduped !== step.expectDeduped
+            ) {
+              throw new Error(
+                `expected deduped=${step.expectDeduped}, got ${res.deduped}`,
+              );
+            }
+          }
+          break;
+        }
+        case "pause-rollout": {
+          const rid = resolveRollout(step);
+          const r = await this.client.pauseRollout(
+            rid,
+            step.pausedBy ?? "operator",
+          );
+          this.logger.log(`rollout paused -> status=${r.status}`);
+          break;
+        }
+        case "resume-rollout": {
+          const rid = resolveRollout(step);
+          const r = await this.client.resumeRollout(
+            rid,
+            step.resumedBy ?? "operator",
+          );
+          this.logger.log(`rollout resumed -> status=${r.status}`);
+          break;
+        }
+        case "retry-wave": {
+          const rid = resolveRollout(step);
+          const seq = step.waveSequence ?? 1;
+          const r = await this.client.retryWave(
+            rid,
+            seq,
+            step.retriedBy ?? "operator",
+          );
+          this.logger.log(
+            `wave ${seq} retried -> attempts=${r.waves.find((w) => w.sequence === seq)?.attempts}`,
+          );
+          break;
+        }
+        case "rollback-rollout": {
+          const rid = resolveRollout(step);
+          const r = await this.client.rollbackRollout(
+            rid,
+            step.rolledBackBy ?? "operator",
+            step.rollbackNote ?? "rollback after failure",
+          );
+          this.logger.log(`rollout rolled back -> status=${r.status}`);
+          break;
+        }
+        case "expect-rollout-status": {
+          const rid = resolveRollout(step);
+          const r = await this.client.getRollout(rid);
+          this.logger.log(
+            `rollout status=${r.status} expected=${step.expectedStatus}`,
+          );
+          if (r.status !== step.expectedStatus) {
+            throw new Error(
+              `expected rollout status ${step.expectedStatus}, got ${r.status}`,
+            );
+          }
+          break;
+        }
+        case "expect-wave-status": {
+          const rid = resolveRollout(step);
+          const r = await this.client.getRollout(rid);
+          const wave = r.waves.find((w) => w.sequence === step.waveSequence);
+          if (!wave) throw new Error(`wave ${step.waveSequence} not found`);
+          this.logger.log(
+            `wave ${step.waveSequence} status=${wave.status} expected=${step.expectedWaveStatus}`,
+          );
+          if (wave.status !== step.expectedWaveStatus) {
+            throw new Error(
+              `expected wave ${step.waveSequence} status ${step.expectedWaveStatus}, got ${wave.status}`,
+            );
+          }
           break;
         }
       }

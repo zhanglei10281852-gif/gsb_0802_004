@@ -138,6 +138,104 @@ export class GateClient {
     );
   }
 
+  async createRollout(
+    proposalId: string,
+    body: {
+      owner: string;
+      waves: { environment: string; adapter: string }[];
+      previousVersion?: string;
+      note?: string;
+      autoStart?: boolean;
+    },
+  ): Promise<{ rollout: import("../web/types").StoredRollout; proposal: StoredProposal }> {
+    return this.request(
+      "POST",
+      `/api/proposals/${encodeURIComponent(proposalId)}/rollouts`,
+      body,
+    );
+  }
+
+  async getRollout(
+    rolloutId: string,
+  ): Promise<import("../web/types").StoredRollout> {
+    return this.request("GET", `/api/rollouts/${encodeURIComponent(rolloutId)}`);
+  }
+
+  async pauseRollout(
+    rolloutId: string,
+    pausedBy: string,
+  ): Promise<import("../web/types").StoredRollout> {
+    return this.request(
+      "POST",
+      `/api/rollouts/${encodeURIComponent(rolloutId)}/pause`,
+      { pausedBy },
+    );
+  }
+
+  async resumeRollout(
+    rolloutId: string,
+    resumedBy: string,
+  ): Promise<import("../web/types").StoredRollout> {
+    return this.request(
+      "POST",
+      `/api/rollouts/${encodeURIComponent(rolloutId)}/resume`,
+      { resumedBy },
+    );
+  }
+
+  async retryWave(
+    rolloutId: string,
+    waveSequence: number,
+    retriedBy: string,
+  ): Promise<import("../web/types").StoredRollout> {
+    return this.request(
+      "POST",
+      `/api/rollouts/${encodeURIComponent(rolloutId)}/waves/${waveSequence}/retry`,
+      { retriedBy },
+    );
+  }
+
+  async rollbackRollout(
+    rolloutId: string,
+    rolledBackBy: string,
+    note: string,
+  ): Promise<import("../web/types").StoredRollout> {
+    return this.request(
+      "POST",
+      `/api/rollouts/${encodeURIComponent(rolloutId)}/rollback`,
+      { rolledBackBy, note },
+    );
+  }
+
+  async reportReceipt(
+    rolloutId: string,
+    body: {
+      waveSequence: number;
+      result: "success" | "failure" | "unknown";
+      message: string;
+      reportedAt?: number;
+      adapterRunId?: string;
+      idempotencyKey: string;
+    },
+  ): Promise<{ accepted: boolean; deduped: boolean; reason?: string }> {
+    const { idempotencyKey, ...payload } = body;
+    const res = await fetch(
+      new URL(
+        `/api/rollouts/${encodeURIComponent(rolloutId)}/receipts`,
+        this.baseUrl,
+      ),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify(payload),
+      },
+    );
+    return (await res.json()) as never;
+  }
+
   private async request<T>(
     method: string,
     path: string,
