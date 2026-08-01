@@ -130,6 +130,24 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     return reply.status(201).send({ decision });
   });
 
+  /** 从当前提案派生后继提案（谱系）：新候选新摘要，原提案开放则替代关闭。 */
+  app.post('/api/proposals/:id/successors', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body)) throw new StoreError('BAD_REQUEST', 400, '请求体必须是 JSON 对象');
+    assertValidSchema(body.candidate, 'candidate');
+    const successor = store.createSuccessor(id, {
+      candidate: body.candidate,
+      createdBy: typeof body.createdBy === 'string' ? body.createdBy : undefined,
+      title: typeof body.title === 'string' ? body.title : undefined,
+      consumers: Array.isArray(body.consumers) ? body.consumers.map(String) : undefined,
+      environment: typeof body.environment === 'string' ? body.environment : undefined,
+      evidenceTtlMs: typeof body.evidenceTtlMs === 'number' ? body.evidenceTtlMs : undefined,
+      reason: typeof body.reason === 'string' ? body.reason : undefined,
+    });
+    return reply.status(201).send(successor);
+  });
+
   /** 申请限时豁免：仅覆盖当前候选摘要 + 指定消费方/环境/兼容方向。 */
   app.post('/api/proposals/:id/exemptions', async (req, reply) => {
     const { id } = req.params as { id: string };

@@ -82,10 +82,16 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_proposal ON events(proposal_id);
 `);
 
-  // 轻量迁移：为既有库补充 proposals.environment 列。
+  // 轻量迁移：为既有库补充 proposals.environment / 谱系列。
   const cols = db.prepare(`PRAGMA table_info(proposals)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === 'environment')) {
     db.exec(`ALTER TABLE proposals ADD COLUMN environment TEXT NOT NULL DEFAULT 'prod'`);
+  }
+  if (!cols.some((c) => c.name === 'predecessor_id')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN predecessor_id TEXT`);
+  }
+  if (!cols.some((c) => c.name === 'superseded_by_id')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN superseded_by_id TEXT`);
   }
   return db;
 }

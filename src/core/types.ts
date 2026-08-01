@@ -1,5 +1,6 @@
 export type Verdict = 'pass' | 'fail';
-export type ProposalStatus = 'open' | 'approved' | 'rejected';
+/** superseded 为派生状态：status 仍为 open 但已被后继提案替代关闭。 */
+export type ProposalStatus = 'open' | 'approved' | 'rejected' | 'superseded';
 export type DecisionAction = 'approve' | 'reject';
 
 export interface CompatFinding {
@@ -157,6 +158,10 @@ export interface ProposalDetail {
   evidence: EvidenceRecord[];
   gate: GateResult;
   exemptions: ExemptionView[];
+  /** 谱系：由哪个提案派生而来（无则 null）。 */
+  predecessorId: string | null;
+  /** 谱系：被哪个后继提案替代/派生（无则 null）。 */
+  supersededById: string | null;
   decision: Decision | null;
   events: DomainEvent[];
 }

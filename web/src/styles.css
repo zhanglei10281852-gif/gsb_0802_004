@@ -248,6 +248,7 @@ body {
   background: rgba(224, 108, 117, 0.12);
 }
 
+.badge-status-superseded,
 .badge-exemption-revoked,
 .badge-exemption-expired {
   color: var(--text-muted);
@@ -478,6 +479,42 @@ textarea {
   flex: 1 1 100%;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 谱系链接 */
+.lineage-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.lineage-link-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.lineage-link-card:hover {
+  border-color: var(--accent);
+}
+
+.lineage-link-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.lineage-link-title {
+  font-weight: 600;
+  word-break: break-all;
 }
 
 /* 限时豁免 */

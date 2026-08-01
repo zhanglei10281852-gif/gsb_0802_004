@@ -12,6 +12,7 @@ export const PROPOSAL_STATUS_LABEL: Record<ProposalDetail['status'], string> = {
   open: '开放',
   approved: '已批准',
   rejected: '已拒绝',
+  superseded: '已替代',
 };
 
 export const COMPAT_STATUS_LABEL: Record<CompatResult['status'], string> = {
@@ -50,4 +51,6 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   EXEMPTION_REJECTED: '豁免被拒绝',
   EXEMPTION_REVOKED: '豁免被撤销',
   EXEMPTION_EXPIRED: '豁免到期',
+  PROPOSAL_SUPERSEDED: '提案被替代',
+  EVIDENCE_LATE: '迟到证据被隔离',
 };

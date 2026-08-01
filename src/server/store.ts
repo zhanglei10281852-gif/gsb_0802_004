@@ -39,6 +39,18 @@ export interface CreateProposalInput {
   consumers: string[];
   evidenceTtlMs?: number;
   environment?: string;
+  /** 内部使用：谱系中的上一版提案。 */
+  predecessorId?: string;
+}
+
+export interface CreateSuccessorInput {
+  candidate: unknown;
+  createdBy?: string;
+  title?: string;
+  consumers?: string[];
+  environment?: string;
+  evidenceTtlMs?: number;
+  reason?: string;
 }
 
 export interface RequestExemptionInput {
@@ -85,6 +97,8 @@ interface ProposalRow {
   created_at: number;
   updated_at: number;
   decision_id: string | null;
+  predecessor_id: string | null;
+  superseded_by_id: string | null;
 }
 
 interface EvidenceRow {
@@ -183,8 +197,8 @@ export class Store {
         .prepare(
           `INSERT INTO proposals (id, title, status, version, baseline_json, baseline_digest,
              candidate_json, candidate_digest, compat_json, consumers_json, environment, evidence_ttl_ms,
-             created_at, updated_at, decision_id)
-           VALUES (?, ?, 'open', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+             created_at, updated_at, decision_id, predecessor_id, superseded_by_id)
+           VALUES (?, ?, 'open', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)`,
         )
         .run(
           id,
@@ -199,6 +213,7 @@ export class Store {
           ttl,
           now,
           now,
+          input.predecessorId ?? null,
         );
       created = [
         this.appendEvent(id, 'PROPOSAL_CREATED', {
@@ -210,6 +225,7 @@ export class Store {
           consumers,
           environment,
           evidenceTtlMs: ttl,
+          predecessorId: input.predecessorId ?? null,
         }),
       ];
     });
@@ -218,10 +234,110 @@ export class Store {
     return this.getProposal(id)!;
   }
 
+  /**
+   * 从当前提案派生后继提案：继承基线（标题/消费方/环境/TTL 可覆盖），
+   * 新候选产生新摘要并重新计算兼容性。原提案仍开放则在同一事务内被替代关闭
+   * （superseded）；已决策的原提案保持原结论，仅记录谱系链接。
+   * 原提案的构建证据与豁免按原精确作用域留在原提案，绝不因名称相同而继承。
+   * CAS 保证同一提案只能有一个后继（线性谱系）。
+   */
+  createSuccessor(proposalId: string, input: CreateSuccessorInput): ProposalDetail {
+    this.sweepExpiredExemptions();
+    let successorId = '';
+    let events: { proposalId: string; ev: DomainEvent }[] = [];
+    const tx = this.db.transaction(() => {
+      const p = this.mustGetRow(proposalId);
+      const now = this.clock.now();
+      const baseline = JSON.parse(p.baseline_json) as unknown;
+      const candidate = input.candidate;
+      const consumers =
+        input.consumers && input.consumers.length > 0
+          ? input.consumers.map((c) => String(c).trim()).filter(Boolean)
+          : (JSON.parse(p.consumers_json) as string[]);
+      if (new Set(consumers).size !== consumers.length || consumers.length === 0) {
+        throw new StoreError('BAD_REQUEST', 400, 'consumers 存在重复或空项');
+      }
+      const compat = checkCompatibility(baseline, candidate);
+      successorId = `prp_${randomUUID()}`;
+      const digest = stableDigest(candidate);
+      const baselineDigest = stableDigest(baseline);
+      const ttl = input.evidenceTtlMs && input.evidenceTtlMs > 0 ? Math.floor(input.evidenceTtlMs) : p.evidence_ttl_ms;
+      const environment = input.environment && input.environment.trim() ? input.environment.trim() : p.environment;
+      const title = input.title && input.title.trim() ? input.title.trim() : p.title;
+      // CAS：同一提案只允许一个后继（无论其当前状态），并发派生只有一个成功。
+      const res = this.db
+        .prepare('UPDATE proposals SET superseded_by_id = ?, updated_at = ? WHERE id = ? AND superseded_by_id IS NULL')
+        .run(successorId, now, proposalId);
+      if (res.changes !== 1) {
+        throw new StoreError('ALREADY_SUPERSEDED', 409, `提案 ${proposalId} 已存在后继 ${p.superseded_by_id}，谱系必须保持线性`);
+      }
+      this.db
+        .prepare(
+          `INSERT INTO proposals (id, title, status, version, baseline_json, baseline_digest,
+             candidate_json, candidate_digest, compat_json, consumers_json, environment, evidence_ttl_ms,
+             created_at, updated_at, decision_id, predecessor_id, superseded_by_id)
+           VALUES (?, ?, 'open', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)`,
+        )
+        .run(
+          successorId,
+          title,
+          JSON.stringify(baseline),
+          baselineDigest,
+          JSON.stringify(candidate),
+          digest,
+          JSON.stringify(compat),
+          JSON.stringify(consumers),
+          environment,
+          ttl,
+          now,
+          now,
+          proposalId,
+        );
+      events = [
+        {
+          proposalId,
+          ev: this.appendEvent(proposalId, 'PROPOSAL_SUPERSEDED', {
+            successorId,
+            successorDigest: digest,
+            reason: input.reason ?? null,
+            closedByReplacement: p.status === 'open',
+            previousStatus: p.status,
+          }),
+        },
+        {
+          proposalId: successorId,
+          ev: this.appendEvent(successorId, 'PROPOSAL_CREATED', {
+            title,
+            createdBy: input.createdBy ?? null,
+            baselineDigest,
+            candidateDigest: digest,
+            compatStatus: compat.status,
+            consumers,
+            environment,
+            evidenceTtlMs: ttl,
+            predecessorId: proposalId,
+            predecessorDigest: p.candidate_digest,
+          }),
+        },
+      ];
+    });
+    tx();
+    this.emit(events.map((e) => e.ev));
+    return this.getProposal(successorId)!;
+  }
+
+  /** 开放的判定：未被决策且未被替代。 */
+  private isOpenRow(p: ProposalRow): boolean {
+    return p.status === 'open' && p.superseded_by_id === null;
+  }
+
   addRevision(proposalId: string, candidate: unknown, expectedVersion: number): ProposalDetail {
     let events: DomainEvent[] = [];
     const tx = this.db.transaction(() => {
       const p = this.mustGetRow(proposalId);
+      if (p.superseded_by_id !== null) {
+        throw new StoreError('PROPOSAL_SUPERSEDED', 409, `提案已被后继 ${p.superseded_by_id} 替代，不能再修订候选`);
+      }
       if (p.status !== 'open') {
         throw new StoreError('PROPOSAL_CLOSED', 409, `提案已${p.status === 'approved' ? '批准' : '驳回'}，不能再修订候选`);
       }
@@ -293,9 +409,12 @@ export class Store {
       if (input.verdict !== 'pass' && input.verdict !== 'fail') {
         throw new StoreError('BAD_REQUEST', 400, 'verdict 必须是 pass 或 fail');
       }
-      const applies = p.status === 'open' && input.candidateDigest === p.candidate_digest;
-      const outcome: EvidenceResult['outcome'] =
-        p.status !== 'open' ? 'closed' : input.candidateDigest !== p.candidate_digest ? 'stale_candidate' : 'recorded';
+      const applies = this.isOpenRow(p) && input.candidateDigest === p.candidate_digest;
+      const outcome: EvidenceResult['outcome'] = !this.isOpenRow(p)
+        ? 'closed'
+        : input.candidateDigest !== p.candidate_digest
+          ? 'stale_candidate'
+          : 'recorded';
       const recordedAt = this.clock.now();
       const ins = this.db
         .prepare(
@@ -327,6 +446,22 @@ export class Store {
           appliesToCurrent: applies,
         }),
       ];
+      // 迟到报送（旧候选或已关闭/被替代提案）显式写入因果记录：归入原提案但被隔离。
+      if (outcome !== 'recorded') {
+        events.push(
+          this.appendEvent(proposalId, 'EVIDENCE_LATE', {
+            evidenceId: row.id,
+            outcome,
+            consumerId: input.consumerId,
+            candidateDigest: input.candidateDigest,
+            currentCandidateDigest: p.candidate_digest,
+            reason:
+              outcome === 'stale_candidate'
+                ? '候选摘要与当前候选不一致，按迟到结果隔离，不参与门禁'
+                : '提案已关闭或已被替代，证据归入原提案存档，不参与门禁',
+          }),
+        );
+      }
     });
     tx();
     this.emit(events);
@@ -566,6 +701,9 @@ export class Store {
       if (p.version !== input.expectedVersion) {
         throw new StoreError('VERSION_CONFLICT', 409, `版本冲突：期望 ${input.expectedVersion}，当前 ${p.version}`);
       }
+      if (p.superseded_by_id !== null) {
+        throw new StoreError('PROPOSAL_SUPERSEDED', 409, `提案已被后继 ${p.superseded_by_id} 替代，不能决策；请在后继提案上操作`);
+      }
       if (p.status !== 'open') {
         throw new StoreError('DECISION_ALREADY_MADE', 409, `提案已存在有效决策（${p.status}），不能重复决策`);
       }
@@ -648,7 +786,7 @@ export class Store {
 
   listProposals(): ProposalDetail[] {
     this.sweepExpiredExemptions();
-    const rows = this.db.prepare('SELECT * FROM proposals ORDER BY created_at, id').all() as ProposalRow[];
+    const rows = this.db.prepare('SELECT * FROM proposals ORDER BY created_at, rowid').all() as ProposalRow[];
     return rows.map((r) => this.assemble(r));
   }
 
@@ -738,7 +876,7 @@ export class Store {
     return {
       id: row.id,
       title: row.title,
-      status: row.status,
+      status: row.status === 'open' && row.superseded_by_id !== null ? 'superseded' : row.status,
       version: row.version,
       baseline: JSON.parse(row.baseline_json),
       candidate: JSON.parse(row.candidate_json),
@@ -753,6 +891,8 @@ export class Store {
       evidence,
       gate,
       exemptions: exemptions.map((r) => this.viewExemption(r)),
+      predecessorId: row.predecessor_id,
+      supersededById: row.superseded_by_id,
       decision,
       events: this.eventsSinceFor(row.id),
     };

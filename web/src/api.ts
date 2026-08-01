@@ -95,8 +95,10 @@ export interface DomainEvent {
 export interface ProposalDetail {
   id: string;
   title: string;
-  status: 'open' | 'approved' | 'rejected';
+  status: 'open' | 'approved' | 'rejected' | 'superseded';
   version: number;
+  predecessorId: string | null;
+  supersededById: string | null;
   baselineDigest: string;
   candidateDigest: string;
   baseline: unknown;
@@ -164,6 +166,16 @@ export interface SubmitDecisionBody {
   expectedVersion: number;
   rationale?: string;
   acknowledgeBreaking?: boolean;
+}
+
+export interface CreateSuccessorBody {
+  candidate: unknown;
+  title?: string;
+  consumers?: string[];
+  environment?: string;
+  evidenceTtlMs?: number;
+  reason?: string;
+  createdBy?: string;
 }
 
 interface ApiErrorShape {
@@ -239,6 +251,13 @@ export function submitRevision(id: string, body: SubmitRevisionBody): Promise<Pr
 
 export function submitDecision(id: string, body: SubmitDecisionBody): Promise<{ decision: Decision }> {
   return request<{ decision: Decision }>(`/api/proposals/${encodeURIComponent(id)}/decisions`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function createSuccessor(id: string, body: CreateSuccessorBody): Promise<ProposalDetail> {
+  return request<ProposalDetail>(`/api/proposals/${encodeURIComponent(id)}/successors`, {
     method: 'POST',
     body: JSON.stringify(body),
   });

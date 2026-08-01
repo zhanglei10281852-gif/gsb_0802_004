@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
-import { ApiError, submitDecision, submitRevision } from '../api';
+import { ApiError, createSuccessor, submitDecision, submitRevision } from '../api';
 import type { Blocker, EvidenceRecord, ProposalDetail, WaivedBlocker } from '../api';
 import {
   BLOCKER_CODE_LABEL,
@@ -15,8 +15,34 @@ import { ExemptionSection } from './ExemptionSection';
 
 interface ProposalDetailViewProps {
   proposal: ProposalDetail;
+  proposals: ProposalDetail[];
   serverTime: number;
   onRefresh: () => Promise<void>;
+  onSelectProposal?: (id: string) => void;
+}
+
+interface LineageLinkProps {
+  label: string;
+  targetId: string;
+  proposals: ProposalDetail[];
+  onSelect?: (id: string) => void;
+}
+
+function LineageLink({ label, targetId, proposals, onSelect }: LineageLinkProps) {
+  const target = proposals.find((p) => p.id === targetId) ?? null;
+  return (
+    <button type="button" className="lineage-link-card" title={targetId} onClick={() => onSelect?.(targetId)}>
+      <span className="lineage-link-label">{label}</span>
+      {target ? (
+        <>
+          <span className="lineage-link-title">{target.title}</span>
+          <span className={`badge badge-status-${target.status}`}>{PROPOSAL_STATUS_LABEL[target.status]}</span>
+        </>
+      ) : (
+        <span className="mono lineage-link-title">{shortDigest(targetId)}</span>
+      )}
+    </button>
+  );
 }
 
 function BlockerList({ blockers }: { blockers: Blocker[] }) {
@@ -54,7 +80,7 @@ function WaivedList({ waived }: { waived: WaivedBlocker[] }) {
   );
 }
 
-export function ProposalDetailView({ proposal, serverTime, onRefresh }: ProposalDetailViewProps) {
+export function ProposalDetailView({ proposal, proposals, serverTime, onRefresh, onSelectProposal }: ProposalDetailViewProps) {
   const [decidedBy, setDecidedBy] = useState('');
   const [rationale, setRationale] = useState('');
   const [acknowledged, setAcknowledged] = useState(false);
@@ -67,6 +93,14 @@ export function ProposalDetailView({ proposal, serverTime, onRefresh }: Proposal
   const [revisionBusy, setRevisionBusy] = useState(false);
   const [revisionError, setRevisionError] = useState<string | null>(null);
   const [revisionNotice, setRevisionNotice] = useState<string | null>(null);
+
+  const [successorCandidateText, setSuccessorCandidateText] = useState('');
+  const [successorTitle, setSuccessorTitle] = useState('');
+  const [successorConsumers, setSuccessorConsumers] = useState('');
+  const [successorEnvironment, setSuccessorEnvironment] = useState('');
+  const [successorReason, setSuccessorReason] = useState('');
+  const [successorBusy, setSuccessorBusy] = useState(false);
+  const [successorError, setSuccessorError] = useState<string | null>(null);
 
   const gateReady = proposal.gate.status === 'ready';
   const isBreaking = proposal.compat.status === 'breaking';
@@ -167,6 +201,45 @@ export function ProposalDetailView({ proposal, serverTime, onRefresh }: Proposal
     }
   }
 
+  async function handleSuccessorSubmit(e: FormEvent) {
+    e.preventDefault();
+    setSuccessorError(null);
+    let candidate: unknown;
+    try {
+      candidate = JSON.parse(successorCandidateText);
+    } catch {
+      setSuccessorError('新候选 JSON 非法，请检查后再提交。');
+      return;
+    }
+    const consumers = successorConsumers
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+    setSuccessorBusy(true);
+    try {
+      const created = await createSuccessor(proposal.id, {
+        candidate,
+        title: successorTitle.trim() === '' ? undefined : successorTitle.trim(),
+        consumers: consumers.length === 0 ? undefined : consumers,
+        environment: successorEnvironment.trim() === '' ? undefined : successorEnvironment.trim(),
+        reason: successorReason.trim() === '' ? undefined : successorReason.trim(),
+      });
+      await onRefresh();
+      onSelectProposal?.(created.id);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setSuccessorError('该提案已有后继。');
+        await onRefresh();
+      } else if (err instanceof ApiError && err.status === 422) {
+        setSuccessorError(err.errorMessage ?? '请求参数校验失败。');
+      } else {
+        setSuccessorError('创建后继提案失败，请稍后重试。');
+      }
+    } finally {
+      setSuccessorBusy(false);
+    }
+  }
+
   return (
     <div className="detail">
       <header className="detail-header">
@@ -217,6 +290,29 @@ export function ProposalDetailView({ proposal, serverTime, onRefresh }: Proposal
             <dd>{formatTime(proposal.updatedAt)}</dd>
           </div>
         </dl>
+        {(proposal.predecessorId !== null || proposal.supersededById !== null) && (
+          <div>
+            <h3 className="panel-subtitle">谱系</h3>
+            <div className="lineage-links">
+              {proposal.predecessorId !== null && (
+                <LineageLink
+                  label="上一版提案"
+                  targetId={proposal.predecessorId}
+                  proposals={proposals}
+                  onSelect={onSelectProposal}
+                />
+              )}
+              {proposal.supersededById !== null && (
+                <LineageLink
+                  label="后继提案"
+                  targetId={proposal.supersededById}
+                  proposals={proposals}
+                  onSelect={onSelectProposal}
+                />
+              )}
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="panel">
@@ -451,6 +547,72 @@ export function ProposalDetailView({ proposal, serverTime, onRefresh }: Proposal
             <div className="button-row">
               <button type="submit" className="btn" disabled={revisionBusy}>
                 {revisionBusy ? '提交中…' : '提交新修订'}
+              </button>
+            </div>
+          </form>
+        </section>
+      )}
+
+      {proposal.supersededById === null && (
+        <section className="panel">
+          <h2 className="panel-title">创建后继提案</h2>
+          <p className="muted">
+            后继提案继承基线与（可选覆盖的）标题/消费方/环境；新候选产生新摘要。原提案的构建证据与豁免按原精确作用域保留在原提案，不会因名称相同而继承到后继。
+          </p>
+          <form
+            onSubmit={(e) => {
+              void handleSuccessorSubmit(e);
+            }}
+          >
+            <label className="field">
+              <span className="field-label">新候选 JSON</span>
+              <textarea
+                rows={8}
+                value={successorCandidateText}
+                onChange={(e) => setSuccessorCandidateText(e.target.value)}
+                placeholder='{"type":"object","properties":{}}'
+              />
+            </label>
+            <label className="field">
+              <span className="field-label">标题</span>
+              <input
+                type="text"
+                value={successorTitle}
+                onChange={(e) => setSuccessorTitle(e.target.value)}
+                placeholder="留空沿用原标题"
+              />
+            </label>
+            <label className="field">
+              <span className="field-label">消费方（逗号分隔）</span>
+              <input
+                type="text"
+                value={successorConsumers}
+                onChange={(e) => setSuccessorConsumers(e.target.value)}
+                placeholder="留空沿用原消费方"
+              />
+            </label>
+            <label className="field">
+              <span className="field-label">环境</span>
+              <input
+                type="text"
+                value={successorEnvironment}
+                onChange={(e) => setSuccessorEnvironment(e.target.value)}
+                placeholder="留空沿用原环境"
+              />
+            </label>
+            <label className="field">
+              <span className="field-label">替代原因</span>
+              <input
+                type="text"
+                value={successorReason}
+                onChange={(e) => setSuccessorReason(e.target.value)}
+                placeholder="可空"
+              />
+            </label>
+            {successorError && <div className="alert alert-error">{successorError}</div>}
+            <div className="button-row">
+              <button type="submit" className="btn" disabled={successorBusy}>
+                {successorBusy ? '提交中…' : '创建后继提案'}
               </button>
             </div>
           </form>

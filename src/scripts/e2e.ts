@@ -359,6 +359,74 @@ async function main(): Promise<void> {
     });
     check(dec4.status === 201, '离线消费方恢复报送后正常批准');
 
+    // ---- 阶段 F：提案谱系（后继提案 / 证据与豁免不继承 / 迟到归入原提案） ----
+    console.log('[e2e] 阶段 F：提案谱系');
+    const created5 = await req('POST', `${BASE}/api/proposals`, {
+      title: 'order-events v6（将被替代）',
+      baseline: BASELINE,
+      candidate: COMPATIBLE_CANDIDATE,
+      consumers: ['billing', 'offline-x'],
+      evidenceTtlMs: TTL_MS,
+    });
+    const p5 = created5.body;
+    await req('POST', `${BASE}/api/proposals/${p5.id}/evidence`, {
+      consumerId: 'billing', candidateDigest: p5.candidateDigest, verdict: 'pass', runId: 'run-b-p5', idempotencyKey: 'k5-billing',
+    });
+    const exm5 = await req('POST', `${BASE}/api/proposals/${p5.id}/exemptions`, {
+      consumerId: 'offline-x', direction: 'backward', reason: '离线', requestedBy: 'release-mgr', ttlMs: 60000,
+    });
+    await req('POST', `${BASE}/api/exemptions/${exm5.body.id}/confirm`, { by: 'reviewer-a' });
+    await req('POST', `${BASE}/api/exemptions/${exm5.body.id}/confirm`, { by: 'reviewer-b' });
+    check((await req('GET', `${BASE}/api/proposals/${p5.id}`)).body.gate.status === 'ready', 'P5 凭豁免就绪');
+    const succ6 = await req('POST', `${BASE}/api/proposals/${p5.id}/successors`, {
+      candidate: { ...COMPATIBLE_CANDIDATE, properties: { ...COMPATIBLE_CANDIDATE.properties, orderId: { type: 'string', minLength: 6 } } },
+      reason: '上游修正候选', createdBy: 'dev',
+    });
+    check(succ6.status === 201, '后继提案 P6 创建成功');
+    const p6 = succ6.body;
+    check(p6.predecessorId === p5.id && p6.candidateDigest !== p5.candidateDigest, 'P6 谱系链接与新候选摘要');
+    const p5After = (await req('GET', `${BASE}/api/proposals/${p5.id}`)).body;
+    check(p5After.status === 'superseded' && p5After.supersededById === p6.id, 'P5 被替代关闭');
+    check(p5After.events.some((e: any) => e.type === 'PROPOSAL_SUPERSEDED'), '替代已写入 P5 因果记录');
+    check(p6.evidence.length === 0 && p6.gate.blockers.filter((b: any) => b.code === 'missing_evidence').length === 2, '旧提案证据不沿用到 P6');
+    check(p6.exemptions.length === 0 && p6.gate.waived.length === 0, '同名消费方的豁免不继承到 P6');
+    const lateP5 = await req('POST', `${BASE}/api/proposals/${p5.id}/evidence`, {
+      consumerId: 'offline-x', candidateDigest: p5.candidateDigest, verdict: 'pass', runId: 'late-p5', idempotencyKey: 'k5-late',
+    });
+    check(lateP5.status === 200 && lateP5.body.outcome === 'closed', '旧候选迟到结果归入原提案并隔离', lateP5.body);
+    const p5Late = (await req('GET', `${BASE}/api/proposals/${p5.id}`)).body;
+    check(p5Late.events.some((e: any) => e.type === 'EVIDENCE_LATE' && e.payload.outcome === 'closed'), '迟到报送已写入因果记录');
+    const wrongTarget = await req('POST', `${BASE}/api/proposals/${p6.id}/evidence`, {
+      consumerId: 'offline-x', candidateDigest: p5.candidateDigest, verdict: 'pass', runId: 'late-p6', idempotencyKey: 'k6-wrong-digest',
+    });
+    check(wrongTarget.body.outcome === 'stale_candidate', '旧摘要发往后继按 stale_candidate 隔离');
+    const p6Gate = (await req('GET', `${BASE}/api/proposals/${p6.id}`)).body;
+    check(p6Gate.gate.status === 'blocked' && p6Gate.gate.blockers.filter((b: any) => b.code === 'missing_evidence').length === 2, '迟到结果不得放行后继提案');
+    const decideOld = await req('POST', `${BASE}/api/proposals/${p5.id}/decisions`, {
+      action: 'approve', decidedBy: 'lead-a', expectedVersion: p5.version,
+    });
+    check(decideOld.status === 409 && decideOld.body.error.code === 'PROPOSAL_SUPERSEDED', '被替代提案不能决策');
+    const fork = await req('POST', `${BASE}/api/proposals/${p5.id}/successors`, { candidate: COMPATIBLE_CANDIDATE });
+    check(fork.status === 409 && fork.body.error.code === 'ALREADY_SUPERSEDED', '谱系保持线性（禁止重复派生）');
+    // 已批准提案也可派生下一轮：P1 保持原结论
+    const succ7 = await req('POST', `${BASE}/api/proposals/${p1.id}/successors`, {
+      candidate: COMPATIBLE_CANDIDATE, title: 'order-events v2 下一轮', reason: '下一轮迭代',
+    });
+    check(succ7.status === 201 && succ7.body.predecessorId === p1.id, '已批准提案派生 P7');
+    const p1Keep = (await req('GET', `${BASE}/api/proposals/${p1.id}`)).body;
+    check(p1Keep.status === 'approved' && JSON.stringify(p1Keep.decision.snapshot) === snapshotP1, 'P1 原结论与快照不变');
+    // P6 补齐证据后正常批准
+    for (const c of ['billing', 'offline-x']) {
+      await req('POST', `${BASE}/api/proposals/${p6.id}/evidence`, {
+        consumerId: c, candidateDigest: p6.candidateDigest, verdict: 'pass', runId: `run-${c}-p6`, idempotencyKey: `k6-${c}`,
+      });
+    }
+    const p6Final = (await req('GET', `${BASE}/api/proposals/${p6.id}`)).body;
+    const dec6 = await req('POST', `${BASE}/api/proposals/${p6.id}/decisions`, {
+      action: 'approve', decidedBy: 'lead-a', expectedVersion: p6Final.version,
+    });
+    check(dec6.status === 201, 'P6 补齐证据后正常批准');
+
     // ---- 阶段 D：重启恢复与 SSE 重放 ----
     console.log('[e2e] 阶段 D：重启恢复');
     const before = (await req('GET', `${BASE}/api/snapshot`)).body;
@@ -367,19 +435,26 @@ async function main(): Promise<void> {
     server = startServer(dbPath);
     await waitHealthy();
     const after = (await req('GET', `${BASE}/api/snapshot`)).body;
-    check(after.proposals.length === 4, '重启后提案数量完整');
+    check(after.proposals.length === 7, '重启后提案数量完整');
     const p1r = after.proposals.find((p: any) => p.id === p1.id);
     const p2r = after.proposals.find((p: any) => p.id === p2.id);
     const p3r = after.proposals.find((p: any) => p.id === p3.id);
     const p4r = after.proposals.find((p: any) => p.id === p4.id);
+    const p5r = after.proposals.find((p: any) => p.id === p5.id);
+    const p6r = after.proposals.find((p: any) => p.id === p6.id);
+    const p7r = after.proposals.find((p: any) => p.id === succ7.body.id);
     check(p1r?.status === 'approved' && JSON.stringify(p1r.decision.snapshot) === snapshotP1, 'P1 决策快照在重启后一致');
     check(p2r?.status === 'approved' && JSON.stringify(p2r.decision.snapshot) === snapshotP2, 'P2 决策快照在重启后一致');
     check(p3r?.status === 'approved' && JSON.stringify(p3r.decision.snapshot) === snapshotP3, 'P3（含豁免）决策快照在重启后一致');
     check(p3r?.exemptions[0]?.effectiveStatus === 'revoked', 'P3 豁免撤销状态在重启后保留');
     check(p4r?.status === 'approved', 'P4 在重启后保持已批准');
     check(p4r?.exemptions.some((x: any) => x.effectiveStatus === 'expired') && p4r?.exemptions.some((x: any) => x.effectiveStatus === 'rejected'), 'P4 豁免到期/拒绝状态在重启后保留');
+    check(p5r?.status === 'superseded' && p5r?.supersededById === p6.id && p6r?.predecessorId === p5.id, '谱系与替代状态在重启后保留');
+    check(p5r?.events.some((e: any) => e.type === 'EVIDENCE_LATE'), '迟到因果记录在重启后保留');
+    check(p6r?.status === 'approved', 'P6 在重启后保持已批准');
+    check(p7r?.status === 'open' && p7r?.predecessorId === p1.id, 'P7 谱系在重启后保留');
     check(after.eventCursor >= before.eventCursor, '事件游标连续（重启不丢事件）', { before: before.eventCursor, after: after.eventCursor });
-    check(p1r.events.length === p1.events.length + 1, '因果事件记录完整（含迟到证据事件）');
+    check(p1r.events.length === p1.events.length + 3, '因果事件记录完整（迟到证据 + 迟到隔离 + 替代事件）');
 
     const sseOk = await new Promise<boolean>((resolve) => {
       const ctrl = new AbortController();

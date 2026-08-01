@@ -119,8 +119,10 @@ export default function App() {
             <ProposalDetailView
               key={selected.id}
               proposal={selected}
+              proposals={snapshot.proposals}
               serverTime={snapshot.serverTime}
               onRefresh={handleRefresh}
+              onSelectProposal={setSelectedId}
             />
           ) : (
             <div className="panel empty-detail">{snapshot ? '暂无提案，请在左侧新建。' : '正在加载快照…'}</div>

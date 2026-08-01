@@ -47,6 +47,14 @@ examples/      演示场景
 - **限时与退出**：豁免必须携带 `ttlMs`；到期后由过期扫描物化为 `expired` 并把到期原因写入审计链（`EXEMPTION_EXPIRED`），也可随时 `revoke`。过期、被撤销、被拒绝的豁免**不再参与任何新决策**。
 - **快照不可变**：决策快照逐条拷贝决策时实际使用的豁免（`exemptionsUsed`，含复核人），此后豁免被撤销或到期都不改变已形成的历史结论。
 
+**提案谱系**（上游在等待期间修正候选契约时）：
+
+- `POST /api/proposals/:id/successors` 从当前提案派生后继：继承基线（标题/消费方/环境/TTL 可覆盖），新候选产生**新的候选摘要**并重新计算兼容性。
+- 原提案仍开放时在同一事务内被**替代关闭**（`superseded`，写入 `PROPOSAL_SUPERSEDED` 因果事件）；已决策的原提案保持原结论与快照，仅记录谱系链接（`predecessorId` / `supersededById`）。
+- **不继承**：原提案的构建证据按提案与摘要双重作用域留在原提案，绝不自动沿用；上一轮的豁免绑定原精确四元组，**不会因为消费方名称相同而继承**到后继。
+- **迟到隔离**：并发到达的旧候选结果 POST 到原提案时归入原提案存档（`closed`，附 `EVIDENCE_LATE` 因果事件），发往后继时按 `stale_candidate` 隔离——两条路径都不参与后继的门禁，**不得放行后继提案**。
+- 谱系保持线性：同一提案只允许一个后继（`superseded_by_id IS NULL` CAS，并发派生返回 409 `ALREADY_SUPERSEDED`）；被替代的提案不能修订也不能决策（409 `PROPOSAL_SUPERSEDED`）。
+
 **决策**：`POST /api/proposals/:id/decisions` 携带 `expectedVersion` 做乐观并发控制。门禁评估、版本 CAS、快照落库在同一 SQLite 事务内完成；并发审批恰好一个生效，其余收到 409。决策快照逐条拷贝当时采用的证据、兼容性结论与门禁结果，落库后无任何更新路径——提案已关闭后到达的证据标记为 `closed`、旧候选证据标记为 `stale_candidate`，都会被记录审计但永远不参与门禁。
 
 ## 故障恢复边界
@@ -96,6 +104,7 @@ examples/      演示场景
 | --- | --- |
 | `POST /api/proposals` | 创建提案（基线+候选+消费方清单，可选 environment），返回摘要、兼容性与门禁 |
 | `POST /api/proposals/:id/revisions` | 提交新候选修订（`expectedVersion` 乐观锁） |
+| `POST /api/proposals/:id/successors` | 派生后继提案（谱系链接；原提案开放则替代关闭；证据/豁免不继承） |
 | `POST /api/proposals/:id/evidence` | 代理报送证据（幂等键去重；旧候选/已关闭隔离记录） |
 | `POST /api/proposals/:id/decisions` | 门禁通过后决策并保存不可变快照（CAS） |
 | `POST /api/proposals/:id/exemptions` | 申请限时豁免（当前候选+消费方+环境+兼容方向，必须 ttlMs） |

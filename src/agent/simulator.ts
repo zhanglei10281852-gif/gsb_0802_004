@@ -149,6 +149,32 @@ async function runStep(step: Step, ctx: Ctx): Promise<void> {
       }
       return;
     }
+    case 'successor': {
+      const p = await getProposal(ctx, String(step.proposal));
+      const res = await req('POST', `${ctx.base}/api/proposals/${p.id}/successors`, {
+        candidate: step.candidate,
+        title: step.title,
+        consumers: step.consumers,
+        environment: step.environment,
+        reason: step.reason,
+        createdBy: step.createdBy ?? 'simulator',
+      });
+      const body = res.body as { id?: string; candidateDigest?: string; version?: number; error?: { code?: string } };
+      log({ step: 'successor', from: p.id, status: res.status, id: body.id });
+      if (step.expectStatus !== undefined) {
+        expect(res.status === Number(step.expectStatus), `后继期望状态 ${String(step.expectStatus)}，实际 ${res.status}`, ctx);
+      } else {
+        expect(res.status === 201, `创建后继失败: ${JSON.stringify(res.body)}`, ctx);
+      }
+      if (body.id) {
+        ctx.proposals[String(step.as ?? 'default')] = {
+          id: body.id,
+          candidateDigest: body.candidateDigest ?? '',
+          version: body.version ?? 1,
+        };
+      }
+      return;
+    }
     case 'evidence':
       await stepEvidence(step, ctx);
       return;
