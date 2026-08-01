@@ -92,6 +92,54 @@ export interface DomainEvent {
   payload: unknown;
 }
 
+export type RolloutStatus = 'active' | 'paused' | 'completed' | 'rolled_back';
+export type WaveStatus = 'pending' | 'deploying' | 'succeeded' | 'failed' | 'unknown' | 'rolled_back';
+export type ReceiptResult = 'success' | 'failure' | 'unknown';
+export type ReceiptOutcome = 'applied' | 'duplicate' | 'stale_decision' | 'stale_wave' | 'paused' | 'closed';
+
+export interface Wave {
+  id: string;
+  rolloutId: string;
+  ordinal: number;
+  name: string;
+  environment: string;
+  status: WaveStatus;
+  retryCount: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+export interface Receipt {
+  id: number;
+  rolloutId: string;
+  waveId: string;
+  decisionId: string;
+  result: ReceiptResult;
+  receiptKey: string;
+  detail?: unknown;
+  receivedAt: number;
+  applied: boolean;
+  outcome: ReceiptOutcome;
+}
+
+export interface RolloutDetail {
+  id: string;
+  proposalId: string;
+  decisionId: string;
+  candidateDigest: string;
+  status: RolloutStatus;
+  currentOrdinal: number;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  rolledBackTo: number | null;
+  rollbackReason: string | null;
+  rolledBackBy: string | null;
+  rolledBackAt: number | null;
+  waves: Wave[];
+  receipts: Receipt[];
+}
+
 export interface ProposalDetail {
   id: string;
   title: string;
@@ -113,6 +161,7 @@ export interface ProposalDetail {
   gate: GateResult;
   exemptions: ExemptionView[];
   decision: Decision | null;
+  rollout: RolloutDetail | null;
   events: DomainEvent[];
 }
 
@@ -176,6 +225,34 @@ export interface CreateSuccessorBody {
   evidenceTtlMs?: number;
   reason?: string;
   createdBy?: string;
+}
+
+export interface CreateRolloutBody {
+  waves: { name: string; environment: string }[];
+  createdBy: string;
+}
+
+export interface RolloutActionBody {
+  by: string;
+}
+
+export interface RollbackRolloutBody {
+  toWaveOrdinal: number;
+  by: string;
+  reason?: string;
+}
+
+export interface RecordReceiptBody {
+  waveId: string;
+  decisionId: string;
+  result: ReceiptResult;
+  receiptKey: string;
+  detail?: unknown;
+}
+
+export interface RecordReceiptResponse {
+  outcome: ReceiptOutcome;
+  receipt: Receipt;
 }
 
 interface ApiErrorShape {
@@ -286,6 +363,55 @@ export function rejectExemption(id: string, body: RejectExemptionBody): Promise<
 
 export function revokeExemption(id: string, body: RevokeExemptionBody): Promise<ExemptionView> {
   return request<ExemptionView>(`/api/exemptions/${encodeURIComponent(id)}/revoke`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function createRollout(proposalId: string, body: CreateRolloutBody): Promise<RolloutDetail> {
+  return request<RolloutDetail>(`/api/proposals/${encodeURIComponent(proposalId)}/rollouts`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function fetchRollout(id: string): Promise<RolloutDetail> {
+  return request<RolloutDetail>(`/api/rollouts/${encodeURIComponent(id)}`);
+}
+
+export function pauseRollout(id: string, body: RolloutActionBody): Promise<RolloutDetail> {
+  return request<RolloutDetail>(`/api/rollouts/${encodeURIComponent(id)}/pause`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function resumeRollout(id: string, body: RolloutActionBody): Promise<RolloutDetail> {
+  return request<RolloutDetail>(`/api/rollouts/${encodeURIComponent(id)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function retryWave(id: string, waveId: string, body: RolloutActionBody): Promise<RolloutDetail> {
+  return request<RolloutDetail>(
+    `/api/rollouts/${encodeURIComponent(id)}/waves/${encodeURIComponent(waveId)}/retry`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export function rollbackRollout(id: string, body: RollbackRolloutBody): Promise<RolloutDetail> {
+  return request<RolloutDetail>(`/api/rollouts/${encodeURIComponent(id)}/rollback`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function recordReceipt(id: string, body: RecordReceiptBody): Promise<RecordReceiptResponse> {
+  return request<RecordReceiptResponse>(`/api/rollouts/${encodeURIComponent(id)}/receipts`, {
     method: 'POST',
     body: JSON.stringify(body),
   });

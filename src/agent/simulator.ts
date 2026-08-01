@@ -21,6 +21,7 @@ interface Ctx {
   base: string;
   realTime: boolean;
   proposals: Record<string, { id: string; candidateDigest: string; version: number }>;
+  rollouts: Record<string, { id: string; decisionId: string; waves: { id: string; ordinal: number }[] }>;
   failed: number;
 }
 
@@ -215,6 +216,87 @@ async function runStep(step: Step, ctx: Ctx): Promise<void> {
       log({ step: 'advanceClock', status: res.status, body: res.body });
       return;
     }
+    case 'rollout': {
+      const p = step.proposalId
+        ? { id: String(step.proposalId), candidateDigest: '', version: 0 }
+        : await getProposal(ctx, String(step.proposal));
+      const res = await req('POST', `${ctx.base}/api/proposals/${p.id}/rollouts`, {
+        waves: step.waves,
+        createdBy: String(step.by ?? 'simulator'),
+      });
+      const body = res.body as { id?: string; decisionId?: string; waves?: { id: string; ordinal: number }[] };
+      log({ step: 'rollout', status: res.status, id: body.id });
+      expect(res.status === 201, `创建发布失败: ${JSON.stringify(res.body)}`, ctx);
+      if (body.id) {
+        ctx.rollouts[String(step.as ?? 'default')] = {
+          id: body.id,
+          decisionId: body.decisionId ?? '',
+          waves: (body.waves ?? []).map((w) => ({ id: w.id, ordinal: w.ordinal })),
+        };
+      }
+      return;
+    }
+    case 'receipt': {
+      const ro = ctx.rollouts[String(step.rollout)];
+      if (!ro) throw new Error(`未知发布别名 ${String(step.rollout)}`);
+      // 刷新发布状态（适配器重启后从服务端恢复上下文）
+      const fresh = await req('GET', `${ctx.base}/api/rollouts/${ro.id}`);
+      const fb = fresh.body as { decisionId: string; waves: { id: string; ordinal: number }[] };
+      ro.decisionId = fb.decisionId;
+      ro.waves = fb.waves.map((w) => ({ id: w.id, ordinal: w.ordinal }));
+      const wave = ro.waves.find((w) => w.ordinal === Number(step.wave));
+      if (!wave) throw new Error(`发布 ${String(step.rollout)} 没有序号 ${String(step.wave)} 的波次`);
+      const decisionSpec = String(step.decision ?? 'current');
+      const decisionId = decisionSpec === 'current' ? ro.decisionId : decisionSpec === 'stale' ? 'dec_stale_unknown' : decisionSpec;
+      const payload = {
+        waveId: wave.id,
+        decisionId,
+        result: (step.result as string) ?? 'success',
+        receiptKey: String(step.key ?? randomUUID()),
+        detail: (step.detail as unknown) ?? { simulator: true },
+      };
+      const repeat = Number(step.repeat ?? 1);
+      for (let i = 0; i < repeat; i++) {
+        const url = `${ctx.base}/api/rollouts/${ro.id}/receipts`;
+        if (step.loseResponse === true && i === 0) {
+          // 回执丢失：适配器发出回执后进程崩溃/响应丢失，随后用相同幂等键重发。
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload),
+          }).catch(() => undefined);
+          log({ step: 'receipt', wave: wave.ordinal, key: payload.receiptKey, note: '回执丢失（模拟崩溃），将重发' });
+          continue;
+        }
+        const res = await req('POST', url, payload);
+        const body = res.body as { outcome?: string; error?: { code?: string } };
+        log({ step: 'receipt', wave: wave.ordinal, key: payload.receiptKey, attempt: i + 1, status: res.status, outcome: body.outcome ?? body.error?.code });
+        if (step.expectOutcome !== undefined) expect(body.outcome === step.expectOutcome, `期望 outcome ${String(step.expectOutcome)}，实际 ${String(body.outcome)}`, ctx);
+        if (step.expectStatus !== undefined) expect(res.status === Number(step.expectStatus), `期望状态 ${String(step.expectStatus)}，实际 ${res.status}`, ctx);
+      }
+      return;
+    }
+    case 'rolloutControl': {
+      const ro = ctx.rollouts[String(step.rollout)];
+      if (!ro) throw new Error(`未知发布别名 ${String(step.rollout)}`);
+      const action = String(step.action);
+      let url = `${ctx.base}/api/rollouts/${ro.id}`;
+      let body: Record<string, unknown> = { by: String(step.by ?? 'simulator') };
+      if (action === 'retry') {
+        const wave = ro.waves.find((w) => w.ordinal === Number(step.wave));
+        if (!wave) throw new Error(`没有序号 ${String(step.wave)} 的波次`);
+        url += `/waves/${wave.id}/retry`;
+      } else if (action === 'rollback') {
+        url += '/rollback';
+        body = { ...body, toWaveOrdinal: Number(step.toWaveOrdinal ?? 0), reason: step.reason };
+      } else {
+        url += `/${action}`;
+      }
+      const res = await req('POST', url, body);
+      log({ step: 'rolloutControl', action, status: res.status });
+      if (step.expectStatus !== undefined) expect(res.status === Number(step.expectStatus), `期望状态 ${String(step.expectStatus)}，实际 ${res.status}`, ctx);
+      return;
+    }
     case 'snapshot': {
       const res = await req('GET', `${ctx.base}/api/snapshot`);
       const body = res.body as { serverTime: number; eventCursor: number; proposals: unknown[] };
@@ -238,6 +320,7 @@ async function main(): Promise<void> {
     base: scenario.server.replace(/\/$/, ''),
     realTime: args.includes('--real-time'),
     proposals: {},
+    rollouts: {},
     failed: 0,
   };
   log({ step: 'start', server: ctx.base, steps: scenario.steps.length, realTime: ctx.realTime });

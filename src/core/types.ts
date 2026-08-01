@@ -102,6 +102,62 @@ export interface ExemptionView extends Exemption {
   effectiveStatus: ExemptionStatus;
 }
 
+// ---- 分阶段发布 ----
+
+export type RolloutStatus = 'active' | 'paused' | 'completed' | 'rolled_back';
+export type WaveStatus = 'pending' | 'deploying' | 'succeeded' | 'failed' | 'unknown' | 'rolled_back';
+export type ReceiptResult = 'success' | 'failure' | 'unknown';
+/** 回执处理结果：只有 applied 推进了波次，其余均被幂等/隔离。 */
+export type ReceiptOutcome = 'applied' | 'duplicate' | 'stale_decision' | 'stale_wave' | 'paused' | 'closed';
+
+export interface Wave {
+  id: string;
+  rolloutId: string;
+  ordinal: number;
+  name: string;
+  environment: string;
+  status: WaveStatus;
+  retryCount: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+export interface Receipt {
+  id: number;
+  rolloutId: string;
+  waveId: string;
+  decisionId: string;
+  result: ReceiptResult;
+  receiptKey: string;
+  detail?: unknown;
+  receivedAt: number;
+  /** 是否真正推进了波次（重复/乱序/迟到回执为 false）。 */
+  applied: boolean;
+  outcome: ReceiptOutcome;
+}
+
+export interface Rollout {
+  id: string;
+  proposalId: string;
+  /** 绑定的决策快照：回执必须携带同一 decisionId 才能推进。 */
+  decisionId: string;
+  candidateDigest: string;
+  status: RolloutStatus;
+  currentOrdinal: number;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  rolledBackTo: number | null;
+  rollbackReason: string | null;
+  rolledBackBy: string | null;
+  rolledBackAt: number | null;
+}
+
+export interface RolloutDetail extends Rollout {
+  waves: Wave[];
+  receipts: Receipt[];
+}
+
 /** 决策时刻冻结的不可变快照。之后到达的证据/豁免变更不会改变其内容。 */
 export interface DecisionSnapshot {
   proposalId: string;
@@ -162,6 +218,8 @@ export interface ProposalDetail {
   predecessorId: string | null;
   /** 谱系：被哪个后继提案替代/派生（无则 null）。 */
   supersededById: string | null;
+  /** 分阶段发布（每个提案至多一个发布）。 */
+  rollout: RolloutDetail | null;
   decision: Decision | null;
   events: DomainEvent[];
 }

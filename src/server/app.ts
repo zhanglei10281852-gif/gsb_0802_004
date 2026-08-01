@@ -183,6 +183,69 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   app.post('/api/exemptions/:id/reject', exemptionAction((id, by, reason) => store.rejectExemption(id, by, reason)));
   app.post('/api/exemptions/:id/revoke', exemptionAction((id, by, reason) => store.revokeExemption(id, by, reason)));
 
+  // ---- 分阶段发布 ----
+
+  app.post('/api/proposals/:id/rollouts', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body) || !Array.isArray(body.waves)) throw new StoreError('BAD_REQUEST', 400, 'waves 必须是数组');
+    const rollout = store.createRollout(id, {
+      waves: body.waves.map((w: unknown) => {
+        const wave = isObj(w) ? w : {};
+        return { name: String(wave.name ?? ''), environment: String(wave.environment ?? '') };
+      }),
+      createdBy: String(body.createdBy ?? ''),
+    });
+    return reply.status(201).send(rollout);
+  });
+
+  app.get('/api/rollouts/:id', async (req) => {
+    const { id } = req.params as { id: string };
+    const rollout = store.getRollout(id);
+    if (!rollout) throw new StoreError('NOT_FOUND', 404, `发布 ${id} 不存在`);
+    return rollout;
+  });
+
+  /** 部署适配器回执：幂等键去重，仅绑定同一决策快照的当前波次回执可推进。 */
+  app.post('/api/rollouts/:id/receipts', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body)) throw new StoreError('BAD_REQUEST', 400, '请求体必须是 JSON 对象');
+    for (const f of ['waveId', 'decisionId', 'receiptKey'] as const) {
+      if (typeof body[f] !== 'string' || body[f] === '') {
+        throw new StoreError('BAD_REQUEST', 400, `${f} 必须是非空字符串`);
+      }
+    }
+    return store.recordReceipt(id, {
+      waveId: body.waveId as string,
+      decisionId: body.decisionId as string,
+      result: body.result as 'success' | 'failure' | 'unknown',
+      receiptKey: body.receiptKey as string,
+      detail: body.detail,
+    });
+  });
+
+  app.post('/api/rollouts/:id/pause', exemptionAction((id, by) => store.pauseRollout(id, by)));
+  app.post('/api/rollouts/:id/resume', exemptionAction((id, by) => store.resumeRollout(id, by)));
+  app.post('/api/rollouts/:id/waves/:waveId/retry', async (req) => {
+    const { id, waveId } = req.params as { id: string; waveId: string };
+    const body = req.body;
+    if (!isObj(body)) throw new StoreError('BAD_REQUEST', 400, '请求体必须是 JSON 对象');
+    return store.retryWave(id, waveId, String(body.by ?? ''));
+  });
+  app.post('/api/rollouts/:id/rollback', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = req.body;
+    if (!isObj(body) || typeof body.toWaveOrdinal !== 'number') {
+      throw new StoreError('BAD_REQUEST', 400, 'toWaveOrdinal 必须是数字（0 表示回到发布前）');
+    }
+    return store.rollbackRollout(id, {
+      toWaveOrdinal: body.toWaveOrdinal,
+      by: String(body.by ?? ''),
+      reason: typeof body.reason === 'string' ? body.reason : undefined,
+    });
+  });
+
   /** 一致快照：网页重连后以此为准，而不是依赖进程内事件。 */
   app.get('/api/snapshot', async () => store.snapshot());
 

@@ -12,6 +12,7 @@ import {
   shortDigest,
 } from '../format';
 import { ExemptionSection } from './ExemptionSection';
+import { RolloutSection } from './RolloutSection';
 
 interface ProposalDetailViewProps {
   proposal: ProposalDetail;
@@ -498,6 +499,8 @@ export function ProposalDetailView({ proposal, proposals, serverTime, onRefresh,
           {decisionBlockers.length > 0 && <BlockerList blockers={decisionBlockers} />}
         </section>
       )}
+
+      <RolloutSection proposal={proposal} onRefresh={onRefresh} />
 
       {proposal.decision && (
         <section className="panel">

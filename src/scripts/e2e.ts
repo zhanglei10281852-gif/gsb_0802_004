@@ -426,6 +426,91 @@ async function main(): Promise<void> {
       action: 'approve', decidedBy: 'lead-a', expectedVersion: p6Final.version,
     });
     check(dec6.status === 201, 'P6 补齐证据后正常批准');
+    const snapshotP6 = JSON.stringify(dec6.body.decision.snapshot);
+
+    // ---- 阶段 G：分阶段发布（适配器模拟器：回执丢失 / 乱序 / 中途重启 / 回退） ----
+    console.log('[e2e] 阶段 G：分阶段发布');
+    const scenarioB = {
+      server: BASE,
+      steps: [
+        { do: 'rollout', proposalId: p6.id, as: 'ro6', by: 'release-lead', waves: [
+          { name: 'w1-预发', environment: 'staging' },
+          { name: 'w2-灰度', environment: 'prod' },
+          { name: 'w3-全量', environment: 'prod' },
+        ] },
+        { do: 'receipt', rollout: 'ro6', wave: 1, result: 'success', key: 'rc6-w1', loseResponse: true, repeat: 2 },
+        { do: 'receipt', rollout: 'ro6', wave: 2, result: 'success', key: 'rc6-bad-dec', decision: 'stale', expectOutcome: 'stale_decision' },
+        { do: 'receipt', rollout: 'ro6', wave: 3, result: 'success', key: 'rc6-ooo', expectOutcome: 'stale_wave' },
+        { do: 'receipt', rollout: 'ro6', wave: 2, result: 'success', key: 'rc6-w2', expectOutcome: 'applied' },
+        { do: 'receipt', rollout: 'ro6', wave: 3, result: 'failure', key: 'rc6-w3', expectOutcome: 'applied' },
+      ],
+    };
+    const scenarioBPath = path.join(dir, 'scenarioB.json');
+    writeFileSync(scenarioBPath, JSON.stringify(scenarioB, null, 2));
+    check((await runSimulator(scenarioBPath)) === 0, '适配器模拟器（回执丢失/乱序）断言通过');
+    let ro6 = (await req('GET', `${BASE}/api/proposals/${p6.id}`)).body.rollout;
+    check(ro6.status === 'paused' && ro6.waves[2].status === 'failed', '波次 3 失败后发布自动暂停');
+    check(ro6.receipts.find((r: any) => r.receiptKey === 'rc6-w1') !== undefined && ro6.receipts.filter((r: any) => r.receiptKey === 'rc6-w1').length === 1, '丢失回执重发只生效一次');
+    check(ro6.receipts.some((r: any) => r.outcome === 'stale_decision') && ro6.receipts.some((r: any) => r.outcome === 'stale_wave'), '决策不匹配与乱序回执被隔离记录');
+    // 中途重启：发布状态从 SQLite 恢复，波次 3 保持失败
+    await stopServer(server);
+    server = startServer(dbPath);
+    await waitHealthy();
+    ro6 = (await req('GET', `${BASE}/api/proposals/${p6.id}`)).body.rollout;
+    check(ro6.status === 'paused' && ro6.currentOrdinal === 3, '重启后发布状态完整恢复');
+    const retryW3 = await req('POST', `${BASE}/api/rollouts/${ro6.id}/waves/${ro6.waves[2].id}/retry`, { by: 'release-lead' });
+    check(retryW3.status === 200 && retryW3.body.status === 'active' && retryW3.body.waves[2].retryCount === 1, '重试失败波次');
+    await req('POST', `${BASE}/api/rollouts/${ro6.id}/receipts`, {
+      waveId: ro6.waves[2].id, decisionId: ro6.decisionId, result: 'success', receiptKey: 'rc6-w3-retry',
+    });
+    ro6 = (await req('GET', `${BASE}/api/proposals/${p6.id}`)).body.rollout;
+    check(ro6.status === 'completed' && ro6.waves.every((w: any) => w.status === 'succeeded'), 'P6 发布完成');
+    const p6Keep = (await req('GET', `${BASE}/api/proposals/${p6.id}`)).body;
+    check(JSON.stringify(p6Keep.decision.snapshot) === snapshotP6, '发布推进不改写原契约决策快照');
+
+    // 回退：P7 批准后创建发布，完成后回退到已知版本
+    for (const c of ['billing', 'search', 'risk']) {
+      await req('POST', `${BASE}/api/proposals/${succ7.body.id}/evidence`, {
+        consumerId: c, candidateDigest: succ7.body.candidateDigest, verdict: 'pass', runId: `run-${c}-p7`, idempotencyKey: `k7-${c}`,
+      });
+    }
+    const p7Fresh = (await req('GET', `${BASE}/api/proposals/${succ7.body.id}`)).body;
+    const dec7 = await req('POST', `${BASE}/api/proposals/${succ7.body.id}/decisions`, {
+      action: 'approve', decidedBy: 'lead-a', expectedVersion: p7Fresh.version,
+    });
+    check(dec7.status === 201, 'P7 批准');
+    const snapshotP7 = JSON.stringify(dec7.body.decision.snapshot);
+    const ro7created = await req('POST', `${BASE}/api/proposals/${succ7.body.id}/rollouts`, {
+      waves: [{ name: 'w1-预发', environment: 'staging' }, { name: 'w2-全量', environment: 'prod' }],
+      createdBy: 'release-lead',
+    });
+    check(ro7created.status === 201 && ro7created.body.status === 'active', 'P7 发布创建');
+    const ro7 = ro7created.body;
+    // 暂停期间回执被隔离
+    await req('POST', `${BASE}/api/rollouts/${ro7.id}/pause`, { by: 'ops' });
+    const pausedReceipt = await req('POST', `${BASE}/api/rollouts/${ro7.id}/receipts`, {
+      waveId: ro7.waves[0].id, decisionId: ro7.decisionId, result: 'success', receiptKey: 'rc7-paused',
+    });
+    check(pausedReceipt.body.outcome === 'paused', '暂停期间回执不推进波次');
+    await req('POST', `${BASE}/api/rollouts/${ro7.id}/resume`, { by: 'ops' });
+    for (const [i, w] of ro7.waves.entries()) {
+      await req('POST', `${BASE}/api/rollouts/${ro7.id}/receipts`, {
+        waveId: w.id, decisionId: ro7.decisionId, result: 'success', receiptKey: `rc7-w${i + 1}`,
+      });
+    }
+    const ro7Done = (await req('GET', `${BASE}/api/rollouts/${ro7.id}`)).body;
+    check(ro7Done.status === 'completed', 'P7 发布完成');
+    const rollback = await req('POST', `${BASE}/api/rollouts/${ro7.id}/rollback`, {
+      toWaveOrdinal: 1, by: 'ops', reason: '全量后指标异常，回到预发版本',
+    });
+    check(rollback.status === 200 && rollback.body.status === 'rolled_back' && rollback.body.rolledBackTo === 1, '回退到已知版本（波次 1）');
+    check(rollback.body.waves.map((w: any) => w.status).join(',') === 'succeeded,rolled_back', '后续波次标记已回退');
+    const p7After = (await req('GET', `${BASE}/api/proposals/${succ7.body.id}`)).body;
+    check(JSON.stringify(p7After.decision.snapshot) === snapshotP7, '回退不改写原契约决策快照');
+    const p3Check = (await req('GET', `${BASE}/api/proposals/${p3.id}`)).body;
+    check(p3Check.exemptions[0]?.effectiveStatus === 'revoked', '回退不复活已失效豁免');
+    const badRollback = await req('POST', `${BASE}/api/rollouts/${ro7.id}/rollback`, { toWaveOrdinal: 0, by: 'ops' });
+    check(badRollback.status === 409, '不能重复回退');
 
     // ---- 阶段 D：重启恢复与 SSE 重放 ----
     console.log('[e2e] 阶段 D：重启恢复');
@@ -452,7 +537,9 @@ async function main(): Promise<void> {
     check(p5r?.status === 'superseded' && p5r?.supersededById === p6.id && p6r?.predecessorId === p5.id, '谱系与替代状态在重启后保留');
     check(p5r?.events.some((e: any) => e.type === 'EVIDENCE_LATE'), '迟到因果记录在重启后保留');
     check(p6r?.status === 'approved', 'P6 在重启后保持已批准');
-    check(p7r?.status === 'open' && p7r?.predecessorId === p1.id, 'P7 谱系在重启后保留');
+    check(p6r?.rollout?.status === 'completed' && p6r?.rollout?.receipts?.length === 6, 'P6 发布完成状态与回执在重启后保留');
+    check(p7r?.rollout?.status === 'rolled_back' && p7r?.rollout?.rolledBackTo === 1, 'P7 回退状态在重启后保留');
+    check(p7r?.rollout?.receipts?.some((r: any) => r.outcome === 'paused'), '暂停期回执隔离记录在重启后保留');
     check(after.eventCursor >= before.eventCursor, '事件游标连续（重启不丢事件）', { before: before.eventCursor, after: after.eventCursor });
     check(p1r.events.length === p1.events.length + 3, '因果事件记录完整（迟到证据 + 迟到隔离 + 替代事件）');
 

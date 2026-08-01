@@ -72,6 +72,47 @@ CREATE TABLE IF NOT EXISTS exemptions (
   revoke_reason    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_exemptions_proposal ON exemptions(proposal_id);
+CREATE TABLE IF NOT EXISTS rollouts (
+  id               TEXT PRIMARY KEY,
+  proposal_id      TEXT NOT NULL REFERENCES proposals(id),
+  decision_id      TEXT NOT NULL REFERENCES decisions(id),
+  candidate_digest TEXT NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('active','paused','completed','rolled_back')),
+  current_ordinal  INTEGER NOT NULL,
+  created_by       TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  rolled_back_to   INTEGER,
+  rollback_reason  TEXT,
+  rolled_back_by   TEXT,
+  rolled_back_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_rollouts_proposal ON rollouts(proposal_id);
+CREATE TABLE IF NOT EXISTS waves (
+  id           TEXT PRIMARY KEY,
+  rollout_id   TEXT NOT NULL REFERENCES rollouts(id),
+  ordinal      INTEGER NOT NULL,
+  name         TEXT NOT NULL,
+  environment  TEXT NOT NULL,
+  status       TEXT NOT NULL CHECK (status IN ('pending','deploying','succeeded','failed','unknown','rolled_back')),
+  retry_count  INTEGER NOT NULL DEFAULT 0,
+  started_at   INTEGER,
+  finished_at  INTEGER,
+  UNIQUE(rollout_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS receipts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  rollout_id   TEXT NOT NULL REFERENCES rollouts(id),
+  wave_id      TEXT NOT NULL REFERENCES waves(id),
+  decision_id  TEXT NOT NULL,
+  result       TEXT NOT NULL CHECK (result IN ('success','failure','unknown')),
+  receipt_key  TEXT NOT NULL UNIQUE,
+  detail_json  TEXT,
+  received_at  INTEGER NOT NULL,
+  applied      INTEGER NOT NULL,
+  outcome      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON receipts(rollout_id);
 CREATE TABLE IF NOT EXISTS events (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           INTEGER NOT NULL,

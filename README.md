@@ -55,6 +55,14 @@ examples/      演示场景
 - **迟到隔离**：并发到达的旧候选结果 POST 到原提案时归入原提案存档（`closed`，附 `EVIDENCE_LATE` 因果事件），发往后继时按 `stale_candidate` 隔离——两条路径都不参与后继的门禁，**不得放行后继提案**。
 - 谱系保持线性：同一提案只允许一个后继（`superseded_by_id IS NULL` CAS，并发派生返回 409 `ALREADY_SUPERSEDED`）；被替代的提案不能修订也不能决策（409 `PROPOSAL_SUPERSEDED`）。
 
+**分阶段发布**（通过门禁的候选接入部署流程）：
+
+- 已批准的提案可创建一次发布：负责人按环境安排**连续波次**（每波次名称+环境），发布绑定**当时的决策快照**（`decisionId` + 候选摘要），第一波次立即进入部署中。
+- 部署适配器回传**成功/失败/未知**回执，携带幂等键与决策快照 id。只有绑定同一决策快照、且指向**当前波次**（部署中）的回执才能推进：成功 → 下一波次开始部署（末波次后发布完成）；失败/未知 → 发布自动暂停等待人工处理。
+- **隔离语义**（与证据一致）：重复回执按幂等键去重（`duplicate`）；决策快照不匹配（`stale_decision`）、非当前波次的乱序/迟到回执（`stale_wave`）、暂停期间到达（`paused`）、发布已关闭（`closed`）的回执都被记录但永不推进，并写入 `RECEIPT_LATE` 因果事件。
+- **暂停/恢复**：人工暂停期间回执不推进（恢复后需适配器重发）。**重试**：仅失败/结果未知的当前波次可重试（retryCount 递增，发布回到进行中）。**回退**：目标必须是已知版本（已成功的波次，或 0 表示发布前），后续波次标记 `rolled_back`；回退**只改发布/波次状态**——不改写原契约决策快照，也不触碰任何豁免（已失效豁免不会被复活）。
+- 适配器模拟器步骤：`rollout`（创建发布）、`receipt`（回执，支持 `loseResponse` 回执丢失重发、`decision:'stale'` 伪造旧决策、`expectOutcome` 断言）、`rolloutControl`（pause/resume/retry/rollback）。e2e 覆盖回执丢失、乱序隔离与**进程重启后从 SQLite 恢复发布状态**。
+
 **决策**：`POST /api/proposals/:id/decisions` 携带 `expectedVersion` 做乐观并发控制。门禁评估、版本 CAS、快照落库在同一 SQLite 事务内完成；并发审批恰好一个生效，其余收到 409。决策快照逐条拷贝当时采用的证据、兼容性结论与门禁结果，落库后无任何更新路径——提案已关闭后到达的证据标记为 `closed`、旧候选证据标记为 `stale_candidate`，都会被记录审计但永远不参与门禁。
 
 ## 故障恢复边界
@@ -111,6 +119,12 @@ examples/      演示场景
 | `POST /api/exemptions/:id/confirm` | 审核人确认；两名不同审核人确认后生效（申请人除外） |
 | `POST /api/exemptions/:id/reject` | 拒绝待复核豁免（注明原因） |
 | `POST /api/exemptions/:id/revoke` | 撤销生效中豁免（立即退出新决策，历史快照不变） |
+| `POST /api/proposals/:id/rollouts` | 为已批准提案创建分阶段发布（绑定决策快照，每提案至多一个） |
+| `POST /api/rollouts/:id/receipts` | 适配器回执（幂等去重；仅当前波次+同决策快照可推进） |
+| `POST /api/rollouts/:id/pause` `/resume` | 暂停 / 恢复发布 |
+| `POST /api/rollouts/:id/waves/:waveId/retry` | 重试失败/结果未知的当前波次 |
+| `POST /api/rollouts/:id/rollback` | 回退到已知版本（已成功波次或 0=发布前；不改决策、不复活豁免） |
+| `GET /api/rollouts/:id` | 发布详情（波次、回执、状态） |
 | `GET /api/proposals[/:id]` | 列表 / 详情（含证据、阻塞原因、决策快照、事件） |
 | `GET /api/snapshot` | 一致快照（单事务），供网页重连恢复 |
 | `GET /api/events?since=` | SSE：先重放 SQLite 历史事件再实时推送 |

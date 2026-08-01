@@ -4,6 +4,7 @@ import { stableDigest } from '../core/canonical.js';
 import { checkCompatibility } from '../core/compat.js';
 import { REQUIRED_CONFIRMS, effectiveExemptionStatus } from '../core/exemption.js';
 import { decisionBlockers, evaluateGate, latestApplicableEvidence } from '../core/gate.js';
+import { classifyReceipt, isKnownRollbackTarget, waveStatusForResult } from '../core/rollout.js';
 import type {
   CompatResult,
   Decision,
@@ -16,6 +17,12 @@ import type {
   ExemptionDirection,
   ExemptionView,
   ProposalDetail,
+  Receipt,
+  ReceiptOutcome,
+  ReceiptResult,
+  Rollout,
+  RolloutDetail,
+  Wave,
 } from '../core/types.js';
 import { openDatabase, type Db } from './db.js';
 
@@ -51,6 +58,19 @@ export interface CreateSuccessorInput {
   environment?: string;
   evidenceTtlMs?: number;
   reason?: string;
+}
+
+export interface CreateRolloutInput {
+  waves: { name: string; environment: string }[];
+  createdBy: string;
+}
+
+export interface ReceiptInput {
+  waveId: string;
+  decisionId: string;
+  result: ReceiptResult;
+  receiptKey: string;
+  detail?: unknown;
 }
 
 export interface RequestExemptionInput {
@@ -134,6 +154,47 @@ interface ExemptionRow {
   revoked_by: string | null;
   revoked_at: number | null;
   revoke_reason: string | null;
+}
+
+interface RolloutRow {
+  id: string;
+  proposal_id: string;
+  decision_id: string;
+  candidate_digest: string;
+  status: 'active' | 'paused' | 'completed' | 'rolled_back';
+  current_ordinal: number;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  rolled_back_to: number | null;
+  rollback_reason: string | null;
+  rolled_back_by: string | null;
+  rolled_back_at: number | null;
+}
+
+interface WaveRow {
+  id: string;
+  rollout_id: string;
+  ordinal: number;
+  name: string;
+  environment: string;
+  status: 'pending' | 'deploying' | 'succeeded' | 'failed' | 'unknown' | 'rolled_back';
+  retry_count: number;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+interface ReceiptRow {
+  id: number;
+  rollout_id: string;
+  wave_id: string;
+  decision_id: string;
+  result: 'success' | 'failure' | 'unknown';
+  receipt_key: string;
+  detail_json: string | null;
+  received_at: number;
+  applied: number;
+  outcome: string;
 }
 
 export class Store {
@@ -621,6 +682,365 @@ export class Store {
     return row ? this.viewExemption(row) : null;
   }
 
+  // ---- 分阶段发布 ----
+
+  /**
+   * 为已通过门禁（已批准）的提案创建分阶段发布：绑定当时的决策快照，
+   * 波次按顺序连续部署，第一波次立即进入部署中。每个提案至多一个发布。
+   */
+  createRollout(proposalId: string, input: CreateRolloutInput): RolloutDetail {
+    if (!input.createdBy) throw new StoreError('BAD_REQUEST', 400, 'createdBy 不能为空');
+    if (!Array.isArray(input.waves) || input.waves.length === 0) {
+      throw new StoreError('BAD_REQUEST', 400, 'waves 必须是非空数组');
+    }
+    for (const [i, w] of input.waves.entries()) {
+      if (!w.name?.trim() || !w.environment?.trim()) {
+        throw new StoreError('BAD_REQUEST', 400, `第 ${i + 1} 个波次的 name 与 environment 不能为空`);
+      }
+    }
+    let rolloutId = '';
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const p = this.mustGetRow(proposalId);
+      if (p.status !== 'approved' || !p.decision_id) {
+        throw new StoreError('PROPOSAL_NOT_APPROVED', 422, '只有已批准（通过门禁）的提案才能创建发布');
+      }
+      const existing = this.db.prepare('SELECT id FROM rollouts WHERE proposal_id = ?').get(proposalId) as
+        | { id: string }
+        | undefined;
+      if (existing) {
+        throw new StoreError('ROLLOUT_EXISTS', 409, `提案已存在发布 ${existing.id}`);
+      }
+      const now = this.clock.now();
+      rolloutId = `ro_${randomUUID()}`;
+      this.db
+        .prepare(
+          `INSERT INTO rollouts (id, proposal_id, decision_id, candidate_digest, status, current_ordinal,
+             created_by, created_at, updated_at, rolled_back_to, rollback_reason, rolled_back_by, rolled_back_at)
+           VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?, NULL, NULL, NULL, NULL)`,
+        )
+        .run(rolloutId, proposalId, p.decision_id, p.candidate_digest, input.createdBy, now, now);
+      input.waves.forEach((w, i) => {
+        const ordinal = i + 1;
+        this.db
+          .prepare(
+            `INSERT INTO waves (id, rollout_id, ordinal, name, environment, status, retry_count, started_at, finished_at)
+             VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL)`,
+          )
+          .run(`wv_${randomUUID()}`, rolloutId, ordinal, w.name.trim(), w.environment.trim(), ordinal === 1 ? 'deploying' : 'pending', ordinal === 1 ? now : null);
+      });
+      events = [
+        this.appendEvent(proposalId, 'ROLLOUT_CREATED', {
+          rolloutId,
+          decisionId: p.decision_id,
+          candidateDigest: p.candidate_digest,
+          waves: input.waves.map((w, i) => ({ ordinal: i + 1, name: w.name.trim(), environment: w.environment.trim() })),
+          createdBy: input.createdBy,
+        }),
+        this.appendEvent(proposalId, 'WAVE_DEPLOYING', {
+          rolloutId,
+          waveOrdinal: 1,
+          name: input.waves[0].name.trim(),
+          environment: input.waves[0].environment.trim(),
+          retry: 0,
+        }),
+      ];
+    });
+    tx();
+    this.emit(events);
+    return this.getRollout(rolloutId)!;
+  }
+
+  /**
+   * 部署适配器回执。幂等键去重；只有绑定同一决策快照、指向当前波次
+   * （部署中）的回执才会推进；重复、乱序、决策不匹配、暂停中与已关闭
+   * 的回执都被记录但隔离（附 RECEIPT_LATE 因果事件）。
+   */
+  recordReceipt(rolloutId: string, input: ReceiptInput): { outcome: ReceiptOutcome; receipt: Receipt } {
+    if (!input.receiptKey) throw new StoreError('BAD_REQUEST', 400, 'receiptKey 不能为空');
+    if (input.result !== 'success' && input.result !== 'failure' && input.result !== 'unknown') {
+      throw new StoreError('BAD_REQUEST', 400, "result 必须是 success / failure / unknown");
+    }
+    let result!: { outcome: ReceiptOutcome; receipt: Receipt };
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const rollout = this.mustGetRolloutRow(rolloutId);
+      const existing = this.db.prepare('SELECT * FROM receipts WHERE receipt_key = ?').get(input.receiptKey) as
+        | ReceiptRow
+        | undefined;
+      if (existing) {
+        if (existing.rollout_id !== rolloutId || existing.wave_id !== input.waveId || existing.result !== input.result) {
+          throw new StoreError('IDEMPOTENCY_CONFLICT', 409, `回执幂等键 ${input.receiptKey} 已被不同内容占用`);
+        }
+        result = { outcome: 'duplicate', receipt: this.mapReceipt(existing) };
+        return;
+      }
+      const wave = this.db.prepare('SELECT * FROM waves WHERE id = ?').get(input.waveId) as WaveRow | undefined;
+      if (!wave || wave.rollout_id !== rolloutId) {
+        throw new StoreError('UNKNOWN_WAVE', 422, `波次 ${input.waveId} 不属于发布 ${rolloutId}`);
+      }
+      const outcome = classifyReceipt(this.mapRollout(rollout), this.mapWave(wave), input.decisionId);
+      const applied = outcome === 'applied';
+      const now = this.clock.now();
+      const ins = this.db
+        .prepare(
+          `INSERT INTO receipts (rollout_id, wave_id, decision_id, result, receipt_key, detail_json, received_at, applied, outcome)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(rolloutId, input.waveId, input.decisionId, input.result, input.receiptKey, input.detail === undefined ? null : JSON.stringify(input.detail), now, applied ? 1 : 0, outcome);
+      const receipt = this.mapReceipt(this.db.prepare('SELECT * FROM receipts WHERE id = ?').get(ins.lastInsertRowid) as ReceiptRow);
+      result = { outcome, receipt };
+      events = [
+        this.appendEvent(rollout.proposal_id, 'RECEIPT_RECORDED', {
+          receiptId: receipt.id,
+          rolloutId,
+          waveOrdinal: wave.ordinal,
+          result: input.result,
+          outcome,
+          decisionId: input.decisionId,
+        }),
+      ];
+      if (!applied) {
+        events.push(
+          this.appendEvent(rollout.proposal_id, 'RECEIPT_LATE', {
+            receiptId: receipt.id,
+            rolloutId,
+            waveOrdinal: wave.ordinal,
+            outcome,
+            reason:
+              outcome === 'stale_decision'
+                ? '回执绑定的决策快照与发布不一致，被隔离'
+                : outcome === 'stale_wave'
+                  ? '回执指向非当前波次（乱序/迟到），被隔离'
+                  : outcome === 'paused'
+                    ? '发布已暂停，回执不推进波次；恢复后需重新报送'
+                    : '发布已完成或已回退，回执归档但不生效',
+          }),
+        );
+        return;
+      }
+      const waveStatus = waveStatusForResult(input.result);
+      this.db
+        .prepare('UPDATE waves SET status = ?, finished_at = ? WHERE id = ?')
+        .run(waveStatus, now, wave.id);
+      events.push(
+        this.appendEvent(rollout.proposal_id, `WAVE_${waveStatus === 'succeeded' ? 'SUCCEEDED' : waveStatus === 'failed' ? 'FAILED' : 'UNKNOWN'}`, {
+          rolloutId,
+          waveOrdinal: wave.ordinal,
+          result: input.result,
+        }),
+      );
+      if (waveStatus === 'succeeded') {
+        const next = this.db
+          .prepare('SELECT * FROM waves WHERE rollout_id = ? AND ordinal = ?')
+          .get(rolloutId, wave.ordinal + 1) as WaveRow | undefined;
+        if (next) {
+          this.db.prepare(`UPDATE waves SET status = 'deploying', started_at = ? WHERE id = ?`).run(now, next.id);
+          this.db.prepare(`UPDATE rollouts SET current_ordinal = ?, updated_at = ? WHERE id = ?`).run(wave.ordinal + 1, now, rolloutId);
+          events.push(
+            this.appendEvent(rollout.proposal_id, 'WAVE_DEPLOYING', {
+              rolloutId,
+              waveOrdinal: next.ordinal,
+              name: next.name,
+              environment: next.environment,
+              retry: 0,
+            }),
+          );
+        } else {
+          this.db.prepare(`UPDATE rollouts SET status = 'completed', updated_at = ? WHERE id = ?`).run(now, rolloutId);
+          events.push(this.appendEvent(rollout.proposal_id, 'ROLLOUT_COMPLETED', { rolloutId, waves: wave.ordinal }));
+        }
+      } else {
+        // 失败或未知：自动暂停，等待人工重试或回退。
+        this.db.prepare(`UPDATE rollouts SET status = 'paused', updated_at = ? WHERE id = ?`).run(now, rolloutId);
+        events.push(
+          this.appendEvent(rollout.proposal_id, 'ROLLOUT_PAUSED', {
+            rolloutId,
+            reason: waveStatus === 'failed' ? `波次 ${wave.ordinal} 部署失败` : `波次 ${wave.ordinal} 结果未知`,
+            waveOrdinal: wave.ordinal,
+          }),
+        );
+      }
+    });
+    tx();
+    this.emit(events);
+    return result;
+  }
+
+  pauseRollout(id: string, by: string): RolloutDetail {
+    if (!by) throw new StoreError('BAD_REQUEST', 400, '操作人 by 不能为空');
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const r = this.mustGetRolloutRow(id);
+      if (r.status !== 'active') throw new StoreError('ROLLOUT_STATE', 409, `发布状态为 ${r.status}，不能暂停`);
+      this.db.prepare(`UPDATE rollouts SET status = 'paused', updated_at = ? WHERE id = ?`).run(this.clock.now(), id);
+      events = [this.appendEvent(r.proposal_id, 'ROLLOUT_PAUSED', { rolloutId: id, by, reason: '人工暂停' })];
+    });
+    tx();
+    this.emit(events);
+    return this.getRollout(id)!;
+  }
+
+  resumeRollout(id: string, by: string): RolloutDetail {
+    if (!by) throw new StoreError('BAD_REQUEST', 400, '操作人 by 不能为空');
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const r = this.mustGetRolloutRow(id);
+      if (r.status !== 'paused') throw new StoreError('ROLLOUT_STATE', 409, `发布状态为 ${r.status}，不能恢复`);
+      this.db.prepare(`UPDATE rollouts SET status = 'active', updated_at = ? WHERE id = ?`).run(this.clock.now(), id);
+      events = [this.appendEvent(r.proposal_id, 'ROLLOUT_RESUMED', { rolloutId: id, by })];
+    });
+    tx();
+    this.emit(events);
+    return this.getRollout(id)!;
+  }
+
+  /** 重试当前波次（仅失败/结果未知的当前波次可重试），发布回到进行中。 */
+  retryWave(rolloutId: string, waveId: string, by: string): RolloutDetail {
+    if (!by) throw new StoreError('BAD_REQUEST', 400, '操作人 by 不能为空');
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const rollout = this.mustGetRolloutRow(rolloutId);
+      if (rollout.status !== 'paused' && rollout.status !== 'active') {
+        throw new StoreError('ROLLOUT_STATE', 409, `发布状态为 ${rollout.status}，不能重试波次`);
+      }
+      const wave = this.db.prepare('SELECT * FROM waves WHERE id = ?').get(waveId) as WaveRow | undefined;
+      if (!wave || wave.rollout_id !== rolloutId) throw new StoreError('UNKNOWN_WAVE', 422, `波次 ${waveId} 不属于发布 ${rolloutId}`);
+      if (wave.ordinal !== rollout.current_ordinal || (wave.status !== 'failed' && wave.status !== 'unknown')) {
+        throw new StoreError('WAVE_STATE', 409, '只有失败或结果未知的当前波次可以重试');
+      }
+      const now = this.clock.now();
+      this.db
+        .prepare(`UPDATE waves SET status = 'deploying', retry_count = retry_count + 1, started_at = ?, finished_at = NULL WHERE id = ?`)
+        .run(now, waveId);
+      this.db.prepare(`UPDATE rollouts SET status = 'active', updated_at = ? WHERE id = ?`).run(now, rolloutId);
+      events = [
+        this.appendEvent(rollout.proposal_id, 'WAVE_RETRIED', { rolloutId, waveOrdinal: wave.ordinal, by, retryCount: wave.retry_count + 1 }),
+        this.appendEvent(rollout.proposal_id, 'WAVE_DEPLOYING', { rolloutId, waveOrdinal: wave.ordinal, name: wave.name, environment: wave.environment, retry: wave.retry_count + 1 }),
+      ];
+    });
+    tx();
+    this.emit(events);
+    return this.getRollout(rolloutId)!;
+  }
+
+  /**
+   * 回退到上一个已知版本（已成功的波次，或 0 表示发布前）。
+   * 只改发布/波次状态：不改写原契约决策快照，也不触碰任何豁免
+   * （已失效的豁免不会被复活）。
+   */
+  rollbackRollout(id: string, input: { toWaveOrdinal: number; by: string; reason?: string }): RolloutDetail {
+    if (!input.by) throw new StoreError('BAD_REQUEST', 400, '操作人 by 不能为空');
+    let events: DomainEvent[] = [];
+    const tx = this.db.transaction(() => {
+      const rollout = this.mustGetRolloutRow(id);
+      if (rollout.status === 'rolled_back') {
+        throw new StoreError('ROLLOUT_STATE', 409, '发布已回退，不能重复回退');
+      }
+      const waves = this.waveRowsFor(id).map((w) => this.mapWave(w));
+      if (!isKnownRollbackTarget(waves, input.toWaveOrdinal)) {
+        throw new StoreError('NOT_A_KNOWN_VERSION', 422, `波次序号 ${input.toWaveOrdinal} 不是已知版本（必须已成功，或 0 表示发布前）`);
+      }
+      const now = this.clock.now();
+      const affected: number[] = [];
+      for (const w of waves) {
+        if (w.ordinal > input.toWaveOrdinal && w.status !== 'rolled_back') {
+          this.db.prepare(`UPDATE waves SET status = 'rolled_back', finished_at = ? WHERE id = ?`).run(now, w.id);
+          affected.push(w.ordinal);
+        }
+      }
+      this.db
+        .prepare(
+          `UPDATE rollouts SET status = 'rolled_back', current_ordinal = ?, rolled_back_to = ?,
+             rollback_reason = ?, rolled_back_by = ?, rolled_back_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(input.toWaveOrdinal, input.toWaveOrdinal, input.reason ?? null, input.by, now, now, id);
+      events = [
+        this.appendEvent(rollout.proposal_id, 'ROLLOUT_ROLLED_BACK', {
+          rolloutId: id,
+          toWaveOrdinal: input.toWaveOrdinal,
+          affectedWaves: affected,
+          by: input.by,
+          reason: input.reason ?? null,
+        }),
+      ];
+    });
+    tx();
+    this.emit(events);
+    return this.getRollout(id)!;
+  }
+
+  getRollout(id: string): RolloutDetail | null {
+    const row = this.db.prepare('SELECT * FROM rollouts WHERE id = ?').get(id) as RolloutRow | undefined;
+    return row ? this.assembleRollout(row) : null;
+  }
+
+  private mustGetRolloutRow(id: string): RolloutRow {
+    const row = this.db.prepare('SELECT * FROM rollouts WHERE id = ?').get(id) as RolloutRow | undefined;
+    if (!row) throw new StoreError('NOT_FOUND', 404, `发布 ${id} 不存在`);
+    return row;
+  }
+
+  private waveRowsFor(rolloutId: string): WaveRow[] {
+    return this.db.prepare('SELECT * FROM waves WHERE rollout_id = ? ORDER BY ordinal').all(rolloutId) as WaveRow[];
+  }
+
+  private mapRollout(r: RolloutRow): Rollout {
+    return {
+      id: r.id,
+      proposalId: r.proposal_id,
+      decisionId: r.decision_id,
+      candidateDigest: r.candidate_digest,
+      status: r.status,
+      currentOrdinal: r.current_ordinal,
+      createdBy: r.created_by,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      rolledBackTo: r.rolled_back_to,
+      rollbackReason: r.rollback_reason,
+      rolledBackBy: r.rolled_back_by,
+      rolledBackAt: r.rolled_back_at,
+    };
+  }
+
+  private mapWave(r: WaveRow): Wave {
+    return {
+      id: r.id,
+      rolloutId: r.rollout_id,
+      ordinal: r.ordinal,
+      name: r.name,
+      environment: r.environment,
+      status: r.status,
+      retryCount: r.retry_count,
+      startedAt: r.started_at,
+      finishedAt: r.finished_at,
+    };
+  }
+
+  private mapReceipt(r: ReceiptRow): Receipt {
+    return {
+      id: r.id,
+      rolloutId: r.rollout_id,
+      waveId: r.wave_id,
+      decisionId: r.decision_id,
+      result: r.result,
+      receiptKey: r.receipt_key,
+      detail: r.detail_json === null ? undefined : JSON.parse(r.detail_json),
+      receivedAt: r.received_at,
+      applied: r.applied === 1,
+      outcome: r.outcome as ReceiptOutcome,
+    };
+  }
+
+  private assembleRollout(row: RolloutRow): RolloutDetail {
+    const receipts = this.db.prepare('SELECT * FROM receipts WHERE rollout_id = ? ORDER BY id').all(row.id) as ReceiptRow[];
+    return {
+      ...this.mapRollout(row),
+      waves: this.waveRowsFor(row.id).map((w) => this.mapWave(w)),
+      receipts: receipts.map((r) => this.mapReceipt(r)),
+    };
+  }
+
   /**
    * 过期扫描：把已到期但仍标记 active 的豁免物化为 expired，并把到期原因写入审计链。
    * 在读写入口统一调用，保证“到期后不再参与新决策”且可追溯。
@@ -893,6 +1313,10 @@ export class Store {
       exemptions: exemptions.map((r) => this.viewExemption(r)),
       predecessorId: row.predecessor_id,
       supersededById: row.superseded_by_id,
+      rollout: (() => {
+        const ro = this.db.prepare('SELECT * FROM rollouts WHERE proposal_id = ?').get(row.id) as RolloutRow | undefined;
+        return ro ? this.assembleRollout(ro) : null;
+      })(),
       decision,
       events: this.eventsSinceFor(row.id),
     };
