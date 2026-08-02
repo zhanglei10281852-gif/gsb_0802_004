@@ -137,6 +137,27 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 
 ---
 
+## 分阶段发布（波次、绑定决策快照、暂停/重试/回退）
+
+候选一旦通过门禁并被**批准**，负责人就可以把它接到**分阶段发布流程**：按环境安排一串**连续波次**（canary → half → full 等）。部署适配器为每个波次尝试回传一条回执（`SUCCESS` / `FAILURE` / `UNKNOWN`）。纯领域规则在 `src/domain/rollout.ts`，服务编排在 `control-center-service.ts` 的发布相关方法。
+
+设计要点：
+
+- **绑定同一决策快照**：一个 rollout 从某个 `APPROVE` 决策创建，逐字绑定该决策快照的身份——`decisionId`、`proposalId`、`candidateDigest`、`evidenceFingerprint`、`environment`。每个 `(主题, 环境)` 至多有一个未终结的 rollout（SQLite 局部唯一索引 + 服务校验双重保证）。
+- **回执只推进当前波次尝试**：回执分类是纯函数（`classifyReceipt`）。**只有**同时满足「rollout 处于 `IN_PROGRESS`」「回执指纹等于所绑定决策指纹」「命中当前 `IN_PROGRESS` 的波次」「尝试号等于该波次的存活尝试号」的**首见**回执才会推进。其余一律为惰性：
+  - **重复**：同一 `receiptId` 至多生效一次（存储层按 id 幂等，重投返回既有记录）；
+  - **乱序 / 陈旧**：命中非当前波次、或旧 / 未来尝试号的回执，`applied=false` 存档并记录忽略原因；
+  - **指纹不匹配**：指向别的决策快照（因此也指向别的候选 / 后继）的回执**永远**不会推进本 rollout——后继提案有自己的决策与指纹，回执无法跨 rollout。
+- **`UNKNOWN` 非决定性**：适配器无法判定结果时回传 `UNKNOWN`，波次保持 `IN_PROGRESS`，等待负责人重试或后续确定性回执。
+- **连续波次**：一次只跑一个波次；仅当当前波次以 `SUCCESS` 结算后才能 `startNextWave` 启动下一个。最后一个波次成功即 rollout `COMPLETED`。
+- **暂停 / 重试**：`pauseRollout` 后所有回执惰性、不能启动新波次；`resumeRollout` 恢复。`retryWave` 把波次的 `attempt` **加一**并重开波次——由此**上一尝试的所有回执（含失败尝试的迟到重复）都按尝试号变陈旧**，无法结算重试后的波次。
+- **回退指向上一个已知版本（仅部署）**：`rollback` 面向「上一个已知良好」的候选摘要（该摘要须此前在同环境被 `APPROVE` 过），创建一个新的 `ROLLBACK` 类型 rollout 重新部署它，并把被它取代的 rollout 置为 `ROLLED_BACK`。**回退是纯部署动作**：它**不调用** `commitDecision`、**不改写**任何契约决策快照、**也不复活**任何已 `LAPSED`/`EXPIRED` 的豁免。原契约决策保持 `APPROVED` 原样。
+- **进程重启 + 回执丢失**：新增故障点 `rollout.receipt.after-write-before-reply`——回执在事务中持久化后、回复前崩溃。客户端得到 `503`（回执丢失）；重启后波次已按持久化状态结算，携带相同 `receiptId` 的重试命中幂等分支返回 `DUPLICATE`，效果只发生一次。全部 rollout / 波次 / 回执状态随 SQLite 完整恢复。
+
+发布生命周期写入因果链：`rollout.created`、`rollout.wave.started`、`rollout.receipt.applied`、`rollout.receipt.ignored`（含忽略原因）、`rollout.wave.retried`、`rollout.paused`、`rollout.resumed`、`rollout.rolled_back`。工作台按环境展示每个 rollout 的波次表、尝试号、部署回执（是否推进及原因）与暂停/重试/回退操作。
+
+---
+
 ## 故障恢复边界（明确说明能与不能）
 
 真实链路会重复、乱序、丢响应，服务也可能在**写入后、回复前崩溃**。系统的边界如下：
@@ -144,6 +165,7 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 - **崩溃点是可替换的故障点**：`src/ports/faults.ts` 定义了命名故障点，服务在「已持久化提交之后、回复之前」询问是否应崩溃。生产使用 `NoFaults`；测试 / e2e 使用 `ArmableFaults` 精确触发：
   - `evidence.after-write-before-reply`
   - `decision.after-commit-before-reply`
+  - `rollout.receipt.after-write-before-reply`
 - **写入后崩溃 → 重试收敛为一次效果**：证据写入在事务中提交后才可能崩溃。崩溃使客户端收到 `503`；重试携带相同 `reportId`，命中幂等分支返回 `DUPLICATE`——效果只发生一次。
 - **决策提交后崩溃 → 重试得到 CONFLICT**：决策已在事务中提交并关闭 proposal。重试发现 proposal 已终态，返回引用既有决策的 `CONFLICT`——**不会**产生第二个（可能矛盾的）决策。
 - **重启后从 SQLite 完整恢复**：状态与因果日志都在 SQLite 中（WAL 日志 + `synchronous=FULL`，可抵御硬杀进程）。重启后 `getProposalView` / `snapshot` / `events` 都从**持久化存储**重建，不依赖任何进程内内存。e2e 会**硬杀（SIGKILL）**服务进程再重启，断言已批准决策、决策快照与事件日志全部幸存。
@@ -173,6 +195,10 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 | `unknown-consumer-evidence-is-not-counted` | 未知消费方证据不计入门禁 |
 | `concurrent-approvals-yield-single-conclusion` | 并发审批只产生一个有效结论 |
 | `crash-after-write-then-retry-is-idempotent` | 写入后崩溃 + 重试收敛为一次效果 |
+| `dual-controlled-waiver-covers-offline-consumer-then-expires` | 双人复核豁免覆盖离线消费方，到期后历史决策不变 |
+| `waiver-cannot-mask-a-fail` | 豁免绝不掩盖真实 FAIL |
+| `successor-proposal-does-not-inherit-evidence-or-waivers` | 后继提案新摘要、不沿用证据、旧豁免按作用域失效、并发旧结果不放行后继 |
+| `staged-rollout-receipts-bound-to-decision-with-pause-retry-rollback` | 分阶段发布：回执绑定决策快照与波次尝试；重复/乱序/指纹不匹配惰性；暂停、失败重试、写入后崩溃幂等、回退到上一个已知版本且不改写契约决策 |
 
 对运行中的可控服务单独跑模拟器：
 
@@ -194,6 +220,7 @@ src/
     digest.ts             规范化 JSON + 稳定候选摘要
     compatibility.ts      JSON Schema 2020-12 静态兼容性分析器（纯函数）
     gate.ts               门禁评估与决策资格状态机（纯函数）
+    rollout.ts            分阶段发布回执分类（纯函数：绑定决策快照 + 当前波次尝试）
   ports/
     repository.ts         持久化端口（应用层只依赖它，不依赖 SQLite）
     faults.ts             故障注入端口（NoFaults / ArmableFaults）
@@ -230,12 +257,20 @@ tests/
 | `POST /api/waivers/:id/reject` | 第二名复核人拒绝：`{ rejectedBy, reason }` |
 | `POST /api/waivers/:id/revoke` | 撤销 ACTIVE 豁免：`{ revokedBy, reason }` |
 | `GET  /api/waivers/:id` | 单个豁免记录（完整生命周期） |
+| `POST /api/rollouts` | 从批准决策创建发布：`{ decisionId, waves[], createdBy, note? }`（绑定该决策快照） |
+| `POST /api/rollouts/:id/start-wave` | 启动下一个待发波次（须无进行中波次、未暂停） |
+| `POST /api/rollouts/:id/pause` / `.../resume` | 暂停 / 恢复发布 |
+| `POST /api/rollouts/:id/waves/:waveId/retry` | 重试波次（`attempt` 加一，使旧尝试回执陈旧） |
+| `POST /api/rollbacks` | 回退到上一个已知版本：`{ subjectId, environment?, targetDigest, waves[], createdBy, note? }`（仅部署，不改写决策/豁免） |
+| `POST /api/receipts` | 部署适配器回执：`{ receiptId, rolloutId, waveId, attempt, result, evidenceFingerprint, detail? }` |
+| `GET  /api/rollouts/:id` | 单个发布详情（rollout + 波次 + 回执） |
+| `GET  /api/subjects/:id/rollouts` | 某主题的全部发布 |
 | `GET  /api/proposals/:id?environment=` | 单个提案视图（含实时门禁、决策、豁免列表） |
 | `GET  /api/snapshot?environment=` | 一致快照（工作台使用，源自持久化存储） |
 | `GET  /api/events?since=<seq>` | 因果事件日志（增量） |
 | `*    /api/control/*` | **仅** `CONTROLLABLE=1` 时存在：逻辑时钟 / 故障点控制 |
 
-状态码约定：`201` 新建（提案 / 证据应用 / 决策成功 / 豁免状态转移成功）、`200` 幂等或忽略、`409` 冲突（决策竞争 / 已终态）、`422` 前置条件不满足（门禁未就绪 / 摘要或指纹不匹配 / 豁免被拒绝，如双人复核违规、作用域或方向不符、已过期）、`503` 注入崩溃。
+状态码约定：`201` 新建（提案 / 证据应用 / 决策成功 / 豁免状态转移成功 / 发布创建 / 波次启动 / 重试 / 回执推进）、`200` 幂等或忽略（含暂停/恢复成功、重复或惰性回执）、`409` 冲突（决策竞争 / 已终态）、`422` 前置条件不满足（门禁未就绪 / 摘要或指纹不匹配 / 豁免被拒绝，如双人复核违规、作用域或方向不符、已过期 / 发布操作被拒，如非 APPROVE 决策、已有进行中发布、波次不可重试、回退目标未曾批准）、`503` 注入崩溃。
 
 ---
 
@@ -248,11 +283,12 @@ tests/
 5. 工作台实时显示依赖消费方就绪度、证据新鲜度、阻塞原因；**批准按钮仅在门禁 `READY` 时可用**。
 6. 若某消费方在发布窗口内暂时离线（`MISSING`/`STALE`），复核人 A 可对精确作用域 `申请豁免`；复核人 B（不同人）`确认`后该消费方变为 `WAIVED`，门禁可达 `READY`。豁免不覆盖 `FAIL`，过期/撤销后自动退出。
 7. 发布负责人批准 / 驳回，结论以不可变快照落库（含依据的豁免）；之后的迟到证据或豁免到期/撤销都不改变结论。
-8. 需要复现异常时序时，用 `CONTROLLABLE=1` 启动并通过 `npm run e2e` 或模拟器 CLI 脚本化重放。
+8. 批准后，负责人在工作台「分阶段发布」区按环境安排连续波次；部署适配器 `POST /api/receipts` 回传每个波次尝试的结果。可暂停 / 恢复、失败重试（尝试号加一使旧回执陈旧），或**回退到上一个已知版本**（仅重新部署，不改写契约决策，也不复活已失效豁免）。
+9. 需要复现异常时序时，用 `CONTROLLABLE=1` 启动并通过 `npm run e2e` 或模拟器 CLI 脚本化重放。
 
 ---
 
 ## 测试与验证
 
-- `npm test`：60 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复；豁免：双人复核、精确作用域、绝不覆盖 FAIL、到期/撤销退出、决策快照不可变、审计链与重启恢复；后继提案：新摘要、证据不沿用、豁免按原作用域失效、并发旧结果不放行后继、`expectedPredecessorId` 冲突保护、替代/失效/迟到的因果记录与恢复。
-- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景（含 `dual-controlled-waiver-covers-offline-consumer-then-expires`、`waiver-cannot-mask-a-fail`、`successor-proposal-does-not-inherit-evidence-or-waivers`，全程逻辑时钟无真实等待），随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照。
+- `npm test`：79 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复；豁免：双人复核、精确作用域、绝不覆盖 FAIL、到期/撤销退出、决策快照不可变、审计链与重启恢复；后继提案：新摘要、证据不沿用、豁免按原作用域失效、并发旧结果不放行后继、`expectedPredecessorId` 冲突保护、替代/失效/迟到的因果记录与恢复；分阶段发布：纯回执分类、绑定决策快照、幂等/乱序/陈旧/指纹不匹配惰性、连续波次、暂停/重试、失败后重试使旧尝试回执陈旧、跨提案隔离、回退不改写契约决策/不复活豁免、回执写入后崩溃 + 重启幂等恢复。
+- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景（含 `dual-controlled-waiver-covers-offline-consumer-then-expires`、`waiver-cannot-mask-a-fail`、`successor-proposal-does-not-inherit-evidence-or-waivers`、`staged-rollout-receipts-bound-to-decision-with-pause-retry-rollback`，全程逻辑时钟无真实等待），随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照，并**专门覆盖发布回执写入后崩溃 / 回执丢失 + 进程重启**：波次按持久化状态结算、重投回执幂等为 `DUPLICATE`。

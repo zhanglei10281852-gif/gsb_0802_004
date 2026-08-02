@@ -1,4 +1,5 @@
 import type { CompatDirection, CompatReport, DecisionType, Environment, GateEvaluation, JsonSchema, Verdict, WaiverStatus } from '../domain/types.js';
+import type { ReceiptResult, RolloutKind, RolloutStatus, WaveStatus } from '../domain/rollout.js';
 
 /**
  * Persistence port.
@@ -125,6 +126,60 @@ export interface EventRecord {
   payload: unknown;
 }
 
+/**
+ * A staged rollout of an approved candidate. Bound to exactly one APPROVE
+ * decision snapshot (decisionId + proposalId + candidateDigest +
+ * evidenceFingerprint + environment). A ROLLBACK rollout points a deployment
+ * at a prior known-good digest; it is deployment-only and never rewrites the
+ * original contract decision.
+ */
+export interface RolloutRecord {
+  rolloutId: string;
+  subjectId: string;
+  environment: Environment;
+  kind: RolloutKind;
+  /** The decision this rollout deploys (RELEASE) — null for a ROLLBACK. */
+  decisionId: string | null;
+  proposalId: string | null;
+  candidateDigest: string;
+  /** The bound decision fingerprint receipts must match (ROLLBACK: the target's). */
+  evidenceFingerprint: string;
+  status: RolloutStatus;
+  createdAt: number;
+  createdBy: string;
+  /** For a ROLLBACK: the rollout it superseded and the digest it reverted to. */
+  supersedesRolloutId: string | null;
+  note: string | null;
+}
+
+export interface WaveRecord {
+  waveId: string;
+  rolloutId: string;
+  ordinal: number;
+  name: string;
+  status: WaveStatus;
+  /** Bumped on retry; only receipts for the live attempt advance the wave. */
+  attempt: number;
+  startedAt: number | null;
+  settledAt: number | null;
+}
+
+/** A receipt from a deployment adapter for a wave attempt. */
+export interface ReceiptRecord {
+  receiptId: string;
+  rolloutId: string;
+  waveId: string;
+  attempt: number;
+  result: ReceiptResult;
+  evidenceFingerprint: string;
+  receivedAt: number;
+  detail: string | null;
+  /** Whether this receipt advanced the current wave attempt. */
+  applied: boolean;
+  /** Why a receipt was not applied (duplicate / stale / mismatch). */
+  ignoredReason: string | null;
+}
+
 export interface Repository {
   // --- subjects ---
   upsertSubject(rec: SubjectRecord): void;
@@ -189,10 +244,59 @@ export interface Repository {
    */
   lapseWaiversForCandidate(subjectId: string, candidateDigest: string, at: number, reason: string): string[];
 
+  // --- rollouts / waves / receipts ---
+  /** Insert a rollout and its ordered waves atomically. */
+  insertRollout(rollout: RolloutRecord, waves: WaveRecord[]): void;
+  getRollout(rolloutId: string): RolloutRecord | undefined;
+  listRollouts(subjectId: string): RolloutRecord[];
+  /** The non-terminal rollout for a (subject, environment), if any. */
+  getActiveRollout(subjectId: string, environment: Environment): RolloutRecord | undefined;
+  listWaves(rolloutId: string): WaveRecord[];
+  getWave(waveId: string): WaveRecord | undefined;
+  getReceipt(receiptId: string): ReceiptRecord | undefined;
+  listReceipts(rolloutId: string): ReceiptRecord[];
+  /**
+   * Set a rollout's status only if it is currently one of `fromStatuses`
+   * (compare-and-set). Returns false on a lost race / wrong state. Appends an
+   * audit event with `eventType` when it succeeds.
+   */
+  setRolloutStatus(
+    rolloutId: string,
+    fromStatuses: RolloutStatus[],
+    toStatus: RolloutStatus,
+    at: number,
+    eventType: string,
+    payload: unknown
+  ): boolean;
+  /**
+   * Start the next PENDING wave (lowest ordinal) of an IN_PROGRESS/PENDING
+   * rollout, moving the rollout to IN_PROGRESS and the wave to IN_PROGRESS.
+   * Returns the started wave, or undefined if none is startable.
+   */
+  startNextWave(rolloutId: string, at: number): WaveRecord | undefined;
+  /**
+   * Record a receipt idempotently and, if it is decisive for the current wave
+   * attempt, settle that wave (and complete/keep the rollout). All in one
+   * transaction. The classification decision is passed in by the caller (pure
+   * domain), so this method only persists and applies it. Returns the stored
+   * receipt record.
+   */
+  applyReceipt(
+    receipt: ReceiptRecord,
+    settle: { waveId: string; toStatus: WaveStatus; rolloutToStatus: RolloutStatus | null } | null,
+    at: number
+  ): ReceiptRecord;
+  /**
+   * Bump a wave's attempt (retry) only if the rollout is PAUSED or the wave is
+   * FAILED/IN_PROGRESS, moving the wave back to IN_PROGRESS and the rollout to
+   * IN_PROGRESS. Older-attempt receipts thereby become stale. Returns the new
+   * attempt number, or undefined if not retryable.
+   */
+  retryWave(rolloutId: string, waveId: string, at: number): number | undefined;
+
   // --- events / causal log ---
   appendEvent(type: string, at: number, ids: { subjectId?: string | null; proposalId?: string | null }, payload: unknown): number;
   listEvents(sinceSeq?: number): EventRecord[];
-
   /** Run a set of mutations atomically. */
   transaction<T>(fn: () => T): T;
 

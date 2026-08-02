@@ -343,6 +343,169 @@ export function buildScenarios(): Scenario[] {
           check: (ctx) => expectSnapshotGate(ctx, 'payments', (g) => g.status === 'COLLECTING' && !g.canApprove, 'old-result-ignored')
         }
       ]
+    },
+
+    // 10) Staged rollout of an approved candidate: continuous waves advanced
+    //     only by receipts bound to the decision snapshot and the live wave
+    //     attempt. Covers duplicate + reordered + fingerprint-mismatched
+    //     receipts (all inert), a crash-after-write receipt (idempotent retry),
+    //     a dropped receipt, pause/resume, a failed wave + retry, then a
+    //     rollback to the prior known-good version that leaves the contract
+    //     decision and any lapsed waiver untouched.
+    {
+      name: 'staged-rollout-receipts-bound-to-decision-with-pause-retry-rollback',
+      steps: [
+        { kind: 'registerSubject', subjectId: 'checkout', requiredConsumers: ['cart'], freshnessWindowMs: 10_000_000 },
+        // First release v1 and approve it — this is the "prior known-good".
+        { kind: 'submitCandidate', subjectId: 'checkout', baselineSchema: baseline, candidateSchema: compatibleCandidate, submittedBy: 'dev', as: 'v1' },
+        { kind: 'report', reportId: 'ck-cart-v1', subjectId: 'checkout', targetRef: 'v1', consumerId: 'cart', verdict: 'PASS', producedAt: 0 },
+        { kind: 'decide', proposalRef: 'v1', expectedDigestRef: 'v1', useCurrentFingerprint: true, type: 'APPROVE', decidedBy: 'release-mgr', as: 'd-v1' },
+        // Fully roll out v1 so it becomes a completed, known-good deployment.
+        { kind: 'createRollout', as: 'ro-v1', decisionRef: 'd-v1', waves: ['canary', 'full'], createdBy: 'release-mgr' },
+        { kind: 'startWave', rolloutRef: 'ro-v1' },
+        { kind: 'reportReceipt', receiptId: 'rc-v1-canary', rolloutRef: 'ro-v1', waveIndex: 0, attempt: 1, result: 'SUCCESS' },
+        { kind: 'startWave', rolloutRef: 'ro-v1' },
+        { kind: 'reportReceipt', receiptId: 'rc-v1-full', rolloutRef: 'ro-v1', waveIndex: 1, attempt: 1, result: 'SUCCESS' },
+        {
+          kind: 'expect',
+          description: 'v1 rollout COMPLETED',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro-v1')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            if (r.body.rollout.status !== 'COMPLETED') throw new Error(`expected COMPLETED, got ${r.body.rollout.status}`);
+          }
+        },
+
+        // Now v2 is submitted (v1 is already approved/closed) and approved; roll it out with 3 waves.
+        { kind: 'submitCandidate', subjectId: 'checkout', baselineSchema: baseline, candidateSchema: correctedCandidate, submittedBy: 'dev', as: 'v2' },
+        { kind: 'report', reportId: 'ck-cart-v2', subjectId: 'checkout', targetRef: 'v2', consumerId: 'cart', verdict: 'PASS', producedAt: 0 },
+        { kind: 'decide', proposalRef: 'v2', expectedDigestRef: 'v2', useCurrentFingerprint: true, type: 'APPROVE', decidedBy: 'release-mgr', as: 'd-v2' },
+        { kind: 'createRollout', as: 'ro', decisionRef: 'd-v2', waves: ['canary', 'half', 'full'], createdBy: 'release-mgr' },
+
+        // Wave 0 (canary). A receipt bound to v1's fingerprint must be ignored;
+        // a duplicate delivery of the good receipt must apply exactly once.
+        { kind: 'startWave', rolloutRef: 'ro' },
+        {
+          kind: 'expect',
+          description: 'a receipt with a mismatched (v1) fingerprint does not advance the v2 rollout',
+          check: async (ctx) => {
+            const roV1 = ctx.rollouts.get('ro-v1')!;
+            const r = await ctx.client.reportReceipt({
+              receiptId: 'rc-mismatch',
+              rolloutId: ctx.rollouts.get('ro')!.rolloutId,
+              waveId: ctx.rollouts.get('ro')!.waveIds[0],
+              attempt: 1,
+              result: 'SUCCESS',
+              evidenceFingerprint: roV1.fingerprint // wrong snapshot
+            });
+            if (r.body.status !== 'IGNORED') throw new Error(`mismatched receipt should be IGNORED, was ${r.body.status}`);
+            const detail = await ctx.client.getRollout(ctx.rollouts.get('ro')!.rolloutId);
+            const canary = detail.body.waves.find((w: any) => w.ordinal === 1);
+            if (canary.status !== 'IN_PROGRESS') throw new Error('canary must still be IN_PROGRESS after a mismatched receipt');
+          }
+        },
+        // Reordered/stale receipt for a future attempt (attempt 2 before any
+        // retry) is inert; then the correct receipt, delivered twice, applies once.
+        { kind: 'reportReceipt', receiptId: 'rc-stale-attempt', rolloutRef: 'ro', waveIndex: 0, attempt: 2, result: 'SUCCESS' },
+        { kind: 'reportReceipt', receiptId: 'rc-canary', rolloutRef: 'ro', waveIndex: 0, attempt: 1, result: 'SUCCESS', repeat: 2 },
+        {
+          kind: 'expect',
+          description: 'canary SUCCEEDED once; stale/mismatch receipts recorded but not applied',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            const canary = r.body.waves.find((w: any) => w.ordinal === 1);
+            if (canary.status !== 'SUCCEEDED') throw new Error(`canary should be SUCCEEDED, was ${canary.status}`);
+            const applied = r.body.receipts.filter((x: any) => x.applied).length;
+            if (applied !== 1) throw new Error(`exactly one receipt should have applied, got ${applied}`);
+          }
+        },
+
+        // Wave 1 (half): pause mid-flight — a receipt during pause is ignored;
+        // resume, then a crash-after-write receipt reconciles idempotently.
+        { kind: 'startWave', rolloutRef: 'ro' },
+        { kind: 'pauseRollout', rolloutRef: 'ro' },
+        { kind: 'reportReceipt', receiptId: 'rc-during-pause', rolloutRef: 'ro', waveIndex: 1, attempt: 1, result: 'SUCCESS' },
+        {
+          kind: 'expect',
+          description: 'receipt during pause is ignored; half still IN_PROGRESS',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            const half = r.body.waves.find((w: any) => w.ordinal === 2);
+            if (half.status !== 'IN_PROGRESS') throw new Error('half must remain IN_PROGRESS through a pause');
+          }
+        },
+        { kind: 'resumeRollout', rolloutRef: 'ro' },
+        // Crash after durable write, before reply; the retry (repeat=2) sees the
+        // receipt already applied and reconciles as DUPLICATE — one effect.
+        { kind: 'reportReceipt', receiptId: 'rc-half', rolloutRef: 'ro', waveIndex: 1, attempt: 1, result: 'SUCCESS', crashAfterWrite: true, repeat: 2 },
+        {
+          kind: 'expect',
+          description: 'half SUCCEEDED exactly once after crash+retry',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            const half = r.body.waves.find((w: any) => w.ordinal === 2);
+            if (half.status !== 'SUCCEEDED') throw new Error(`half should be SUCCEEDED, was ${half.status}`);
+          }
+        },
+
+        // Wave 2 (full): a FAILURE fails the wave; retry bumps the attempt so a
+        // late duplicate of the failed attempt is stale, then a dropped receipt,
+        // then a definitive SUCCESS on the live attempt.
+        { kind: 'startWave', rolloutRef: 'ro' },
+        { kind: 'reportReceipt', receiptId: 'rc-full-fail', rolloutRef: 'ro', waveIndex: 2, attempt: 1, result: 'FAILURE', detail: 'deploy error' },
+        {
+          kind: 'expect',
+          description: 'full FAILED, rollout FAILED',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            if (r.body.rollout.status !== 'FAILED') throw new Error(`rollout should be FAILED, was ${r.body.rollout.status}`);
+          }
+        },
+        { kind: 'retryWave', rolloutRef: 'ro', waveIndex: 2 },
+        // A late duplicate for the old (attempt 1) is now stale by attempt.
+        { kind: 'reportReceipt', receiptId: 'rc-full-fail-late', rolloutRef: 'ro', waveIndex: 2, attempt: 1, result: 'SUCCESS' },
+        // A dropped response: we send but ignore the reply; the server still
+        // recorded it, so a later definitive receipt with a new id settles it.
+        { kind: 'reportReceipt', receiptId: 'rc-full-unknown', rolloutRef: 'ro', waveIndex: 2, attempt: 2, result: 'UNKNOWN', dropResponse: true },
+        { kind: 'reportReceipt', receiptId: 'rc-full-ok', rolloutRef: 'ro', waveIndex: 2, attempt: 2, result: 'SUCCESS' },
+        {
+          kind: 'expect',
+          description: 'full SUCCEEDED on attempt 2; rollout COMPLETED; stale attempt-1 receipt inert',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            if (r.body.rollout.status !== 'COMPLETED') throw new Error(`rollout should be COMPLETED, was ${r.body.rollout.status}`);
+            const full = r.body.waves.find((w: any) => w.ordinal === 3);
+            if (full.attempt !== 2 || full.status !== 'SUCCEEDED') throw new Error('full should be SUCCEEDED on attempt 2');
+            const staleApplied = r.body.receipts.find((x: any) => x.receiptId === 'rc-full-fail-late')?.applied;
+            if (staleApplied) throw new Error('a stale attempt-1 receipt must not apply after retry');
+          }
+        },
+
+        // Roll back checkout to the prior known-good v1 digest. Deployment only:
+        // the v2 contract decision must remain APPROVED and unchanged, and no
+        // lapsed/expired waiver is revived.
+        { kind: 'rollback', as: 'rb', subjectId: 'checkout', targetRef: 'v1', waves: ['revert'], createdBy: 'release-mgr' },
+        {
+          kind: 'expect',
+          description: 'rollback is a new ROLLBACK rollout to v1; v2 decision untouched',
+          check: async (ctx) => {
+            const rb = ctx.rollouts.get('rb')!;
+            const r = await ctx.client.getRollout(rb.rolloutId);
+            if (r.body.rollout.kind !== 'ROLLBACK') throw new Error('rollback must be a ROLLBACK rollout');
+            const v1 = ctx.candidates.get('v1')!;
+            if (r.body.rollout.candidateDigest !== v1.digest) throw new Error('rollback must target the v1 digest');
+            // v2's contract decision is still APPROVED and unmodified.
+            const v2 = ctx.candidates.get('v2')!;
+            const view = await ctx.client.getProposal(v2.proposalId);
+            if (view.body.proposal.state !== 'APPROVED') throw new Error('v2 decision must remain APPROVED after rollback');
+          }
+        }
+      ]
     }
   ];
 }

@@ -83,6 +83,52 @@ export interface ProposalView {
   };
 }
 
+export interface Rollout {
+  rolloutId: string;
+  subjectId: string;
+  environment: string;
+  kind: 'RELEASE' | 'ROLLBACK';
+  decisionId: string | null;
+  proposalId: string | null;
+  candidateDigest: string;
+  evidenceFingerprint: string;
+  status: 'PENDING' | 'IN_PROGRESS' | 'PAUSED' | 'COMPLETED' | 'FAILED' | 'ROLLED_BACK';
+  createdAt: number;
+  createdBy: string;
+  supersedesRolloutId: string | null;
+  note: string | null;
+}
+
+export interface Wave {
+  waveId: string;
+  rolloutId: string;
+  ordinal: number;
+  name: string;
+  status: 'PENDING' | 'IN_PROGRESS' | 'SUCCEEDED' | 'FAILED';
+  attempt: number;
+  startedAt: number | null;
+  settledAt: number | null;
+}
+
+export interface Receipt {
+  receiptId: string;
+  rolloutId: string;
+  waveId: string;
+  attempt: number;
+  result: 'SUCCESS' | 'FAILURE' | 'UNKNOWN';
+  evidenceFingerprint: string;
+  receivedAt: number;
+  detail: string | null;
+  applied: boolean;
+  ignoredReason: string | null;
+}
+
+export interface RolloutDetail {
+  rollout: Rollout;
+  waves: Wave[];
+  receipts: Receipt[];
+}
+
 export interface Snapshot {
   at: number;
   environment: string;
@@ -91,6 +137,7 @@ export interface Snapshot {
     subject: { subjectId: string; requiredConsumers: string[]; freshnessWindowMs: number };
     current: ProposalView | null;
     history: Array<{ proposalId: string; digest: string; state: string; seq: number; predecessorId: string | null; decision: any }>;
+    rollouts: RolloutDetail[];
   }>;
 }
 
@@ -148,4 +195,29 @@ export function rejectWaiver(waiverId: string, rejectedBy: string, reason: strin
 
 export function revokeWaiver(waiverId: string, revokedBy: string, reason: string) {
   return post(`/api/waivers/${encodeURIComponent(waiverId)}/revoke`, { revokedBy, reason });
+}
+
+// --- rollouts ---
+export function createRollout(input: { decisionId: string; waves: string[]; createdBy: string; note?: string }) {
+  return post('/api/rollouts', input);
+}
+
+export function startNextWave(rolloutId: string) {
+  return post(`/api/rollouts/${encodeURIComponent(rolloutId)}/start-wave`, {});
+}
+
+export function pauseRollout(rolloutId: string) {
+  return post(`/api/rollouts/${encodeURIComponent(rolloutId)}/pause`, {});
+}
+
+export function resumeRollout(rolloutId: string) {
+  return post(`/api/rollouts/${encodeURIComponent(rolloutId)}/resume`, {});
+}
+
+export function retryWave(rolloutId: string, waveId: string) {
+  return post(`/api/rollouts/${encodeURIComponent(rolloutId)}/waves/${encodeURIComponent(waveId)}/retry`, {});
+}
+
+export function rollback(input: { subjectId: string; environment: string; targetDigest: string; waves: string[]; createdBy: string; note?: string }) {
+  return post('/api/rollbacks', input);
 }

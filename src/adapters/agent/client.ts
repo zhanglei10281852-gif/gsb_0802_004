@@ -108,6 +108,57 @@ export class ControlCenterClient {
     return this.req<any>('GET', `/api/waivers/${encodeURIComponent(waiverId)}`);
   }
 
+  // --- rollouts ---
+  createRollout(input: { decisionId: string; waves: string[]; createdBy: string; note?: string }) {
+    return this.req<{ status: string; reason?: string; rollout?: any; waves?: any[] }>('POST', '/api/rollouts', input);
+  }
+
+  startNextWave(rolloutId: string) {
+    return this.req<{ status: string; reason?: string; wave?: any }>(
+      'POST',
+      `/api/rollouts/${encodeURIComponent(rolloutId)}/start-wave`
+    );
+  }
+
+  pauseRollout(rolloutId: string) {
+    return this.req<{ status: string; reason?: string }>('POST', `/api/rollouts/${encodeURIComponent(rolloutId)}/pause`);
+  }
+
+  resumeRollout(rolloutId: string) {
+    return this.req<{ status: string; reason?: string }>('POST', `/api/rollouts/${encodeURIComponent(rolloutId)}/resume`);
+  }
+
+  retryWave(rolloutId: string, waveId: string) {
+    return this.req<{ status: string; reason?: string; attempt?: number }>(
+      'POST',
+      `/api/rollouts/${encodeURIComponent(rolloutId)}/waves/${encodeURIComponent(waveId)}/retry`
+    );
+  }
+
+  rollback(input: { subjectId: string; environment?: string; targetDigest: string; waves: string[]; createdBy: string; note?: string }) {
+    return this.req<{ status: string; reason?: string; rollout?: any; waves?: any[] }>('POST', '/api/rollbacks', input);
+  }
+
+  reportReceipt(input: {
+    receiptId: string;
+    rolloutId: string;
+    waveId: string;
+    attempt: number;
+    result: 'SUCCESS' | 'FAILURE' | 'UNKNOWN';
+    evidenceFingerprint: string;
+    detail?: string;
+  }) {
+    return this.req<{ status: string; reason?: string; receipt?: any; result?: string }>('POST', '/api/receipts', input);
+  }
+
+  getRollout(rolloutId: string) {
+    return this.req<any>('GET', `/api/rollouts/${encodeURIComponent(rolloutId)}`);
+  }
+
+  listRollouts(subjectId: string) {
+    return this.req<{ rollouts: any[] }>('GET', `/api/subjects/${encodeURIComponent(subjectId)}/rollouts`);
+  }
+
   snapshot() {
     return this.req<any>('GET', '/api/snapshot');
   }

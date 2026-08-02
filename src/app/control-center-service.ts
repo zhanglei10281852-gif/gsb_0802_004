@@ -2,6 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { candidateDigest } from '../domain/digest.js';
 import { analyzeCompatibility } from '../domain/compatibility.js';
 import { evaluateGate } from '../domain/gate.js';
+import {
+  classifyReceipt,
+  nextWaveStatus,
+  type ReceiptResult,
+  type RolloutStatus,
+  type RolloutView,
+  type WaveStatus
+} from '../domain/rollout.js';
 import type { Clock } from '../domain/clock.js';
 import {
   DEFAULT_ENVIRONMENT,
@@ -16,8 +24,11 @@ import {
 import type {
   DecisionRecord,
   ProposalRecord,
+  ReceiptRecord,
   Repository,
-  WaiverRecord
+  RolloutRecord,
+  WaiverRecord,
+  WaveRecord
 } from '../ports/repository.js';
 import { InjectedCrash, NoFaults, type FaultInjector } from '../ports/faults.js';
 
@@ -129,6 +140,55 @@ export interface ProposalView {
     successorId: string | null;
     successorDigest: string | null;
   };
+}
+
+export interface CreateRolloutInput {
+  /** The APPROVE decision to deploy. The rollout binds to its snapshot. */
+  decisionId: string;
+  /** Ordered wave names for this environment (at least one). */
+  waves: string[];
+  createdBy: string;
+  note?: string;
+}
+
+export type RolloutOutcome =
+  | { status: 'CREATED'; rollout: RolloutRecord; waves: WaveRecord[] }
+  | { status: 'DENIED'; reason: string };
+
+export interface ReportReceiptInput {
+  receiptId: string;
+  rolloutId: string;
+  waveId: string;
+  attempt: number;
+  result: ReceiptResult;
+  /** The decision fingerprint the deployment adapter believes it is shipping. */
+  evidenceFingerprint: string;
+  detail?: string;
+}
+
+export type ReceiptOutcome =
+  | { status: 'ADVANCED'; receipt: ReceiptRecord; result: ReceiptResult }
+  | { status: 'DUPLICATE'; receipt: ReceiptRecord }
+  | { status: 'IGNORED'; receipt: ReceiptRecord; reason: string }
+  | { status: 'DENIED'; reason: string };
+
+export interface RollbackInput {
+  /** Environment whose active rollout is being rolled back. */
+  subjectId: string;
+  environment?: Environment;
+  /** The prior known-good candidate digest to redeploy. */
+  targetDigest: string;
+  /** Ordered wave names for the rollback deployment (at least one). */
+  waves: string[];
+  createdBy: string;
+  note?: string;
+}
+
+/** A rollout together with its waves and receipts, for read models. */
+export interface RolloutDetail {
+  rollout: RolloutRecord;
+  waves: WaveRecord[];
+  receipts: ReceiptRecord[];
 }
 
 export class ControlCenterService {
@@ -579,6 +639,354 @@ export class ControlCenterService {
     return this.repo.getWaiver(waiverId);
   }
 
+  // --- staged rollout ------------------------------------------------------
+
+  /**
+   * Create a staged rollout for an APPROVED candidate. The rollout is bound to
+   * the exact decision snapshot — decisionId, proposalId, candidateDigest,
+   * evidenceFingerprint and environment are copied from the committed decision
+   * and never derived from mutable state. Only receipts carrying that same
+   * fingerprint (and naming the live wave attempt) can ever advance it, which is
+   * what keeps a rollout tied to one decision and one successor. At most one
+   * non-terminal rollout may exist per (subject, environment).
+   */
+  createRollout(input: CreateRolloutInput): RolloutOutcome {
+    const waveNames = input.waves.map((w) => w.trim()).filter((w) => w.length > 0);
+    if (waveNames.length === 0) {
+      return { status: 'DENIED', reason: 'a rollout must schedule at least one wave' };
+    }
+
+    return this.repo.transaction<RolloutOutcome>(() => {
+      const decision = this.repo.getDecision(input.decisionId);
+      if (!decision) return { status: 'DENIED', reason: `unknown decision "${input.decisionId}"` };
+      if (decision.type !== 'APPROVE') {
+        return { status: 'DENIED', reason: `decision is a ${decision.type}; only an APPROVE can be rolled out` };
+      }
+
+      // One live rollout per (subject, environment). The DB also enforces this
+      // with a partial unique index; checking here yields a friendly message.
+      const active = this.repo.getActiveRollout(decision.subjectId, decision.environment);
+      if (active) {
+        return {
+          status: 'DENIED',
+          reason: `a rollout is already in progress for ${decision.subjectId} in ${decision.environment} (${active.rolloutId})`
+        };
+      }
+
+      const now = this.clock.now();
+      const rolloutId = randomUUID();
+      const rollout: RolloutRecord = {
+        rolloutId,
+        subjectId: decision.subjectId,
+        environment: decision.environment,
+        kind: 'RELEASE',
+        // Bind to the decision snapshot verbatim.
+        decisionId: decision.decisionId,
+        proposalId: decision.proposalId,
+        candidateDigest: decision.candidateDigest,
+        evidenceFingerprint: decision.evidenceFingerprint,
+        status: 'PENDING',
+        createdAt: now,
+        createdBy: input.createdBy,
+        supersedesRolloutId: null,
+        note: input.note ?? null
+      };
+      const waves: WaveRecord[] = waveNames.map((name, i) => ({
+        waveId: randomUUID(),
+        rolloutId,
+        ordinal: i + 1,
+        name,
+        status: 'PENDING' as WaveStatus,
+        attempt: 1,
+        startedAt: null,
+        settledAt: null
+      }));
+      this.repo.insertRollout(rollout, waves);
+      this.repo.appendEvent('rollout.created', now, { subjectId: decision.subjectId, proposalId: decision.proposalId }, {
+        rolloutId,
+        kind: 'RELEASE',
+        decisionId: decision.decisionId,
+        candidateDigest: decision.candidateDigest,
+        evidenceFingerprint: decision.evidenceFingerprint,
+        environment: decision.environment,
+        waves: waves.map((w) => ({ waveId: w.waveId, ordinal: w.ordinal, name: w.name }))
+      });
+      return { status: 'CREATED', rollout, waves };
+    });
+  }
+
+  /**
+   * Start the next PENDING wave (lowest ordinal). Refuses while a wave is still
+   * IN_PROGRESS or the rollout is PAUSED/terminal — waves are continuous, one at
+   * a time, and only advance on a decisive receipt.
+   */
+  startNextWave(rolloutId: string): { status: 'STARTED'; wave: WaveRecord } | { status: 'DENIED'; reason: string } {
+    const now = this.clock.now();
+    const rollout = this.repo.getRollout(rolloutId);
+    if (!rollout) return { status: 'DENIED', reason: `unknown rollout "${rolloutId}"` };
+    if (rollout.status === 'PAUSED') {
+      return { status: 'DENIED', reason: 'rollout is paused; resume it before starting the next wave' };
+    }
+    const wave = this.repo.startNextWave(rolloutId, now);
+    if (!wave) {
+      return { status: 'DENIED', reason: 'no startable wave (one may be in progress, or all are settled)' };
+    }
+    return { status: 'STARTED', wave };
+  }
+
+  /**
+   * Ingest a receipt from a deployment adapter. Idempotent by receiptId. The
+   * pure classifier decides whether a first-seen receipt is decisive for the
+   * current wave attempt and matches the rollout's bound decision fingerprint;
+   * duplicates, stale/out-of-order receipts, and fingerprint mismatches are
+   * stored (applied=false) but never advance the rollout. The durable write and
+   * the wave settlement happen in one transaction, then a fault point can crash
+   * before replying so a retry finds the receipt already applied.
+   */
+  reportReceipt(input: ReportReceiptInput): ReceiptOutcome {
+    const receivedAt = this.clock.now();
+
+    const outcome = this.repo.transaction<ReceiptOutcome>(() => {
+      const rollout = this.repo.getRollout(input.rolloutId);
+      if (!rollout) return { status: 'DENIED', reason: `unknown rollout "${input.rolloutId}"` };
+
+      // Idempotency: a receipt id lands at most once. A retried delivery is
+      // acknowledged without any second effect.
+      const prior = this.repo.getReceipt(input.receiptId);
+      if (prior) return { status: 'DUPLICATE', receipt: prior };
+
+      const view = this.toRolloutView(rollout);
+      const disposition = classifyReceipt(view, {
+        rolloutId: input.rolloutId,
+        waveId: input.waveId,
+        attempt: input.attempt,
+        result: input.result,
+        evidenceFingerprint: input.evidenceFingerprint,
+        detail: input.detail
+      });
+
+      const applied = disposition.kind === 'ADVANCE';
+      const ignoredReason = disposition.kind === 'IGNORE' ? disposition.reason : null;
+
+      // If decisive, compute how the wave (and possibly the rollout) settles.
+      let settle: { waveId: string; toStatus: WaveStatus; rolloutToStatus: RolloutStatus | null } | null = null;
+      if (disposition.kind === 'ADVANCE') {
+        const waveStatus = nextWaveStatus(disposition.result);
+        let rolloutToStatus: RolloutStatus | null = null;
+        if (waveStatus === 'SUCCEEDED') {
+          // The rollout completes only when this was the last wave; otherwise it
+          // stays IN_PROGRESS awaiting the next wave to be started.
+          const remaining = this.repo
+            .listWaves(input.rolloutId)
+            .filter((w) => w.waveId !== input.waveId && w.status !== 'SUCCEEDED');
+          rolloutToStatus = remaining.length === 0 ? 'COMPLETED' : null;
+        } else if (waveStatus === 'FAILED') {
+          // A failed wave fails the rollout; the owner may retry or roll back.
+          rolloutToStatus = 'FAILED';
+        }
+        // UNKNOWN leaves the wave IN_PROGRESS (waveStatus === current), so we do
+        // not settle: record the receipt but keep waiting.
+        if (waveStatus !== 'IN_PROGRESS') {
+          settle = { waveId: input.waveId, toStatus: waveStatus, rolloutToStatus };
+        }
+      }
+
+      const receipt: ReceiptRecord = {
+        receiptId: input.receiptId,
+        rolloutId: input.rolloutId,
+        waveId: input.waveId,
+        attempt: input.attempt,
+        result: input.result,
+        evidenceFingerprint: input.evidenceFingerprint,
+        receivedAt,
+        detail: input.detail ?? null,
+        applied,
+        ignoredReason
+      };
+      const stored = this.repo.applyReceipt(receipt, settle, receivedAt);
+
+      return disposition.kind === 'ADVANCE'
+        ? { status: 'ADVANCED', receipt: stored, result: disposition.result }
+        : { status: 'IGNORED', receipt: stored, reason: disposition.reason };
+    });
+
+    // Fault point: the receipt is durably recorded above. If armed we crash
+    // before replying; a retry with the same receiptId hits the idempotency
+    // branch and returns DUPLICATE — the effect happened exactly once.
+    if (this.faults.shouldFail('rollout.receipt.after-write-before-reply')) {
+      throw new InjectedCrash('rollout.receipt.after-write-before-reply');
+    }
+
+    return outcome;
+  }
+
+  /** Pause an in-flight rollout; no wave advances until it is resumed. */
+  pauseRollout(rolloutId: string): { status: 'PAUSED' | 'DENIED'; reason?: string } {
+    const now = this.clock.now();
+    const ok = this.repo.setRolloutStatus(rolloutId, ['PENDING', 'IN_PROGRESS'], 'PAUSED', now, 'rollout.paused', {
+      rolloutId
+    });
+    return ok ? { status: 'PAUSED' } : { status: 'DENIED', reason: 'rollout is not in a pausable state' };
+  }
+
+  /** Resume a paused rollout back to IN_PROGRESS. */
+  resumeRollout(rolloutId: string): { status: 'RESUMED' | 'DENIED'; reason?: string } {
+    const now = this.clock.now();
+    const ok = this.repo.setRolloutStatus(rolloutId, ['PAUSED'], 'IN_PROGRESS', now, 'rollout.resumed', {
+      rolloutId
+    });
+    return ok ? { status: 'RESUMED' } : { status: 'DENIED', reason: 'rollout is not paused' };
+  }
+
+  /**
+   * Retry a wave. Bumps the wave's attempt counter and re-opens it, which makes
+   * every receipt for the prior attempt stale (they no longer name the live
+   * attempt), so a late/duplicate receipt from the failed try cannot settle the
+   * retried wave.
+   */
+  retryWave(rolloutId: string, waveId: string): { status: 'RETRIED'; attempt: number } | { status: 'DENIED'; reason: string } {
+    const now = this.clock.now();
+    const attempt = this.repo.retryWave(rolloutId, waveId, now);
+    if (attempt === undefined) {
+      return { status: 'DENIED', reason: 'wave is not retryable (rollout terminal, or wave already succeeded)' };
+    }
+    return { status: 'RETRIED', attempt };
+  }
+
+  /**
+   * Roll back an environment to a prior known-good candidate. This is a
+   * deployment-only action: it creates a new ROLLBACK-kind rollout that
+   * redeploys the target digest and marks the superseded rollout ROLLED_BACK. It
+   * deliberately does NOT call commitDecision, mutate any decision snapshot, or
+   * touch waivers — a rollback never rewrites the original contract decision and
+   * never revives a lapsed/expired waiver. The rollback binds to the target
+   * candidate's own APPROVE decision fingerprint if one exists.
+   */
+  rollback(input: RollbackInput): RolloutOutcome {
+    const environment = input.environment ?? DEFAULT_ENVIRONMENT;
+    const waveNames = input.waves.map((w) => w.trim()).filter((w) => w.length > 0);
+    if (waveNames.length === 0) {
+      return { status: 'DENIED', reason: 'a rollback must schedule at least one wave' };
+    }
+
+    return this.repo.transaction<RolloutOutcome>(() => {
+      const subject = this.repo.getSubject(input.subjectId);
+      if (!subject) return { status: 'DENIED', reason: `unknown subject "${input.subjectId}"` };
+
+      // The target must be a candidate that was actually APPROVED for this
+      // environment before — that is what "a prior known-good version" means,
+      // and it supplies the fingerprint receipts for the rollback must match.
+      const target = this.repo.getProposalByDigest(input.subjectId, input.targetDigest);
+      if (!target) {
+        return { status: 'DENIED', reason: `no candidate with digest ${input.targetDigest} for subject` };
+      }
+      const targetDecision = this.repo.getDecisionForProposal(target.proposalId);
+      if (!targetDecision || targetDecision.type !== 'APPROVE') {
+        return { status: 'DENIED', reason: 'rollback target was never approved; cannot roll back to it' };
+      }
+      if (targetDecision.environment !== environment) {
+        return {
+          status: 'DENIED',
+          reason: `rollback target was approved for ${targetDecision.environment}, not ${environment}`
+        };
+      }
+
+      const now = this.clock.now();
+
+      // Supersede the current live rollout for this environment, if any. We use
+      // CAS transitions so a concurrent completion is respected.
+      const active = this.repo.getActiveRollout(input.subjectId, environment);
+      if (active) {
+        this.repo.setRolloutStatus(
+          active.rolloutId,
+          ['PENDING', 'IN_PROGRESS', 'PAUSED'],
+          'ROLLED_BACK',
+          now,
+          'rollout.rolled_back',
+          { rolloutId: active.rolloutId, targetDigest: input.targetDigest }
+        );
+      }
+
+      const rolloutId = randomUUID();
+      const rollout: RolloutRecord = {
+        rolloutId,
+        subjectId: input.subjectId,
+        environment,
+        kind: 'ROLLBACK',
+        // Deployment-only: it references the target's decision for its
+        // fingerprint but records no new contract decision of its own.
+        decisionId: targetDecision.decisionId,
+        proposalId: target.proposalId,
+        candidateDigest: target.candidateDigest,
+        evidenceFingerprint: targetDecision.evidenceFingerprint,
+        status: 'PENDING',
+        createdAt: now,
+        createdBy: input.createdBy,
+        supersedesRolloutId: active?.rolloutId ?? null,
+        note: input.note ?? null
+      };
+      const waves: WaveRecord[] = waveNames.map((name, i) => ({
+        waveId: randomUUID(),
+        rolloutId,
+        ordinal: i + 1,
+        name,
+        status: 'PENDING' as WaveStatus,
+        attempt: 1,
+        startedAt: null,
+        settledAt: null
+      }));
+      this.repo.insertRollout(rollout, waves);
+      this.repo.appendEvent('rollout.created', now, { subjectId: input.subjectId, proposalId: target.proposalId }, {
+        rolloutId,
+        kind: 'ROLLBACK',
+        supersedesRolloutId: active?.rolloutId ?? null,
+        targetDigest: target.candidateDigest,
+        evidenceFingerprint: targetDecision.evidenceFingerprint,
+        environment,
+        waves: waves.map((w) => ({ waveId: w.waveId, ordinal: w.ordinal, name: w.name }))
+      });
+      return { status: 'CREATED', rollout, waves };
+    });
+  }
+
+  getRolloutDetail(rolloutId: string): RolloutDetail | undefined {
+    const rollout = this.repo.getRollout(rolloutId);
+    if (!rollout) return undefined;
+    return {
+      rollout,
+      waves: this.repo.listWaves(rolloutId),
+      receipts: this.repo.listReceipts(rolloutId)
+    };
+  }
+
+  listRollouts(subjectId: string): RolloutDetail[] {
+    return this.repo.listRollouts(subjectId).map((rollout) => ({
+      rollout,
+      waves: this.repo.listWaves(rollout.rolloutId),
+      receipts: this.repo.listReceipts(rollout.rolloutId)
+    }));
+  }
+
+  private toRolloutView(rollout: RolloutRecord): RolloutView {
+    return {
+      rolloutId: rollout.rolloutId,
+      status: rollout.status,
+      binding: {
+        decisionId: rollout.decisionId ?? '',
+        proposalId: rollout.proposalId ?? '',
+        candidateDigest: rollout.candidateDigest,
+        evidenceFingerprint: rollout.evidenceFingerprint,
+        environment: rollout.environment
+      },
+      waves: this.repo.listWaves(rollout.rolloutId).map((w) => ({
+        waveId: w.waveId,
+        ordinal: w.ordinal,
+        status: w.status,
+        attempt: w.attempt
+      }))
+    };
+  }
+
   // --- read models ---------------------------------------------------------
 
   getProposalView(proposalId: string, environment: Environment = DEFAULT_ENVIRONMENT): ProposalView | undefined {
@@ -618,6 +1026,7 @@ export class ControlCenterService {
       subject: ReturnType<Repository['getSubject']>;
       current: ProposalView | null;
       history: Array<{ proposalId: string; digest: string; state: string; seq: number; predecessorId: string | null; decision: DecisionRecord | null }>;
+      rollouts: RolloutDetail[];
     }>;
     eventSeq: number;
   } {
@@ -642,7 +1051,10 @@ export class ControlCenterService {
           predecessorId: p.predecessorId,
           decision: p.decisionId ? this.repo.getDecision(p.decisionId) ?? null : null
         }));
-      return { subject, current, history };
+      // Rollouts for the requested environment only, so the workbench view is
+      // scoped to the environment the owner is driving.
+      const rollouts = this.listRollouts(subject.subjectId).filter((r) => r.rollout.environment === environment);
+      return { subject, current, history, rollouts };
     });
     const events = this.repo.listEvents();
     const eventSeq = events.length > 0 ? events[events.length - 1].seq : 0;

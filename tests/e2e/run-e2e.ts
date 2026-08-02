@@ -138,6 +138,55 @@ async function main(): Promise<void> {
     }
     console.log('ok  late evidence did not alter the committed decision');
 
+    // 5) Staged rollout durability: approve a candidate, start a rollout,
+    //    crash the server AFTER a receipt is durably written but before reply,
+    //    restart from disk, and prove the wave already settled and a retried
+    //    delivery reconciles as DUPLICATE (receipt loss + process restart).
+    console.log('\n--- staged rollout across process restart + dropped receipt ---');
+    await client.registerSubject({ subjectId: 'rollout-subj', requiredConsumers: ['c'], freshnessWindowMs: 100_000 });
+    const rsub = await client.submitCandidate('rollout-subj', {
+      baselineSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+      candidateSchema: { type: 'object', properties: { id: { type: 'string' }, y: { type: 'string' } }, required: ['id'] },
+      submittedBy: 'dev'
+    });
+    const rDigest = rsub.body.candidateDigest;
+    await client.reportEvidence({ reportId: 'ro-e1', subjectId: 'rollout-subj', targetDigest: rDigest, consumerId: 'c', verdict: 'PASS', producedAt: 0 });
+    const rDecided = await client.decide(rsub.body.proposalId, { expectedDigest: rDigest, type: 'APPROVE', decidedBy: 'mgr' });
+    if (rDecided.body.status !== 'DECIDED') fail(`rollout: expected DECIDED, got ${JSON.stringify(rDecided.body)}`);
+    const roCreated = await client.createRollout({ decisionId: rDecided.body.decision.decisionId, waves: ['canary', 'full'], createdBy: 'mgr' });
+    if (roCreated.body.status !== 'CREATED') fail(`rollout not created: ${JSON.stringify(roCreated.body)}`);
+    const rolloutId = roCreated.body.rollout.rolloutId;
+    const fp = roCreated.body.rollout.evidenceFingerprint;
+    const canaryWaveId = roCreated.body.waves![0].waveId;
+
+    await client.startNextWave(rolloutId);
+    // A dropped receipt: it is durably recorded but the reply is lost. We arm a
+    // crash so the SUCCESS receipt commits and then the process dies before it
+    // can answer — modelling a lost response and a process restart at once.
+    await client.armFault('rollout.receipt.after-write-before-reply', 1);
+    try {
+      await client.reportReceipt({ receiptId: 'ro-canary', rolloutId, waveId: canaryWaveId, attempt: 1, result: 'SUCCESS', evidenceFingerprint: fp });
+    } catch {
+      /* socket may drop on the 503; ignore */
+    }
+
+    await stopServer(proc);
+    proc = startServer(dbPath);
+    serverLog = '';
+    proc.stdout?.on('data', (d) => (serverLog += d));
+    proc.stderr?.on('data', (d) => (serverLog += d));
+    await waitForHealth(client);
+
+    const roAfter = await client.getRollout(rolloutId);
+    const canaryAfter = roAfter.body.waves.find((w: any) => w.waveId === canaryWaveId);
+    if (canaryAfter?.status !== 'SUCCEEDED') fail(`canary wave did not survive restart as SUCCEEDED (was ${canaryAfter?.status})`);
+    // Retrying the lost receipt is idempotent — the effect happened once.
+    const retryReceipt = await client.reportReceipt({ receiptId: 'ro-canary', rolloutId, waveId: canaryWaveId, attempt: 1, result: 'SUCCESS', evidenceFingerprint: fp });
+    if (retryReceipt.body.status !== 'DUPLICATE') fail(`retried receipt should be DUPLICATE, was ${retryReceipt.body.status}`);
+    const applied = roAfter.body.receipts.filter((r: any) => r.applied).length;
+    if (applied !== 1) fail(`rollout receipt should have applied exactly once, got ${applied}`);
+    console.log('ok  rollout wave + receipt idempotency survived crash/restart and dropped reply');
+
     console.log('\nE2E PASSED');
   } catch (err) {
     console.error('server log:\n' + serverLog);

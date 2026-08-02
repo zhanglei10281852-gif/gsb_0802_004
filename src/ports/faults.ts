@@ -10,7 +10,8 @@
  */
 export type FaultPoint =
   | 'evidence.after-write-before-reply'
-  | 'decision.after-commit-before-reply';
+  | 'decision.after-commit-before-reply'
+  | 'rollout.receipt.after-write-before-reply';
 
 export interface FaultInjector {
   /**

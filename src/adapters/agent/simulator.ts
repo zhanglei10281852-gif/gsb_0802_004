@@ -52,6 +52,8 @@ export type Step =
       decidedBy: string;
       note?: string;
       crashAfterCommit?: boolean;
+      // Store the resulting decisionId under this alias for a later rollout.
+      as?: string;
       // Fire two decide calls "concurrently" to test CAS conflict handling.
       concurrentWith?: { decidedBy: string; type: 'APPROVE' | 'REJECT' };
     }
@@ -73,6 +75,52 @@ export type Step =
   | { kind: 'confirmWaiver'; waiverRef: string; confirmedBy: string }
   | { kind: 'rejectWaiver'; waiverRef: string; rejectedBy: string; reason: string }
   | { kind: 'revokeWaiver'; waiverRef: string; revokedBy: string; reason: string }
+  | {
+      // Create a staged rollout from a decision, storing it (and its wave ids +
+      // bound fingerprint) under `as` for later receipt/pause/retry steps.
+      kind: 'createRollout';
+      as: string;
+      decisionRef: string;
+      waves: string[];
+      createdBy: string;
+      note?: string;
+    }
+  | { kind: 'startWave'; rolloutRef: string }
+  | { kind: 'pauseRollout'; rolloutRef: string }
+  | { kind: 'resumeRollout'; rolloutRef: string }
+  | { kind: 'retryWave'; rolloutRef: string; waveIndex: number }
+  | {
+      // A deployment adapter reports a receipt for a wave attempt. The wave is
+      // named by its 0-based index within the rollout; the bound fingerprint is
+      // taken from the rollout unless `fingerprint` overrides it (to test a
+      // mismatched receipt). `repeat` re-delivers the same receipt id (duplicate
+      // handling); `dropResponse` sends but ignores the reply; `crashAfterWrite`
+      // arms the after-write-before-reply fault so the first delivery 503s.
+      kind: 'reportReceipt';
+      receiptId: string;
+      rolloutRef: string;
+      waveIndex: number;
+      attempt: number;
+      result: 'SUCCESS' | 'FAILURE' | 'UNKNOWN';
+      fingerprint?: string;
+      detail?: string;
+      repeat?: number;
+      crashAfterWrite?: boolean;
+      dropResponse?: boolean;
+    }
+  | {
+      // Roll back an environment to a prior known-good candidate; deployment
+      // only. Stores the new ROLLBACK rollout under `as`.
+      kind: 'rollback';
+      as: string;
+      subjectRef?: string;
+      subjectId?: string;
+      targetRef: string;
+      environment?: string;
+      waves: string[];
+      createdBy: string;
+      note?: string;
+    }
   | { kind: 'expect'; description: string; check: (ctx: ScenarioContext) => Promise<void> | void }
   | { kind: 'log'; message: string };
 
@@ -88,6 +136,10 @@ export interface ScenarioContext {
   candidates: Map<string, { proposalId: string; digest: string }>;
   /** alias -> waiverId for waivers requested with `as`. */
   waivers: Map<string, string>;
+  /** alias -> decisionId for decisions taken with `as`. */
+  decisions: Map<string, string>;
+  /** alias -> rollout handle for rollouts created with `as`. */
+  rollouts: Map<string, { rolloutId: string; waveIds: string[]; fingerprint: string }>;
   /** free-form record of step outcomes for assertions. */
   outcomes: Array<{ step: string; result: unknown }>;
 }
@@ -102,7 +154,7 @@ export class AgentSimulator {
   constructor(private readonly client: ControlCenterClient) {}
 
   async run(scenario: Scenario): Promise<RunResult> {
-    const ctx: ScenarioContext = { client: this.client, candidates: new Map(), waivers: new Map(), outcomes: [] };
+    const ctx: ScenarioContext = { client: this.client, candidates: new Map(), waivers: new Map(), decisions: new Map(), rollouts: new Map(), outcomes: [] };
     const steps: RunResult['steps'] = [];
     let passed = true;
 
@@ -237,6 +289,9 @@ export class AgentSimulator {
           note: step.note
         });
         ctx.outcomes.push({ step: `decide ${proposalId}`, result: r.body });
+        if (step.as && r.body?.decision?.decisionId) {
+          ctx.decisions.set(step.as, r.body.decision.decisionId);
+        }
         return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
       }
 
@@ -279,6 +334,110 @@ export class AgentSimulator {
         return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
       }
 
+      case 'createRollout': {
+        const decisionId = this.resolveDecisionId(step.decisionRef, ctx);
+        const r = await this.client.createRollout({
+          decisionId,
+          waves: step.waves,
+          createdBy: step.createdBy,
+          note: step.note
+        });
+        ctx.outcomes.push({ step: `createRollout ${step.as}`, result: r.body });
+        if (r.body?.rollout?.rolloutId) {
+          ctx.rollouts.set(step.as, {
+            rolloutId: r.body.rollout.rolloutId,
+            waveIds: (r.body.waves ?? []).map((w: any) => w.waveId),
+            fingerprint: r.body.rollout.evidenceFingerprint
+          });
+        }
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'startWave': {
+        const ro = this.resolveRollout(step.rolloutRef, ctx);
+        const r = await this.client.startNextWave(ro.rolloutId);
+        // A started wave may be a new one; refresh wave ids so later receipts
+        // resolve correctly even after retries added attempts.
+        await this.refreshWaveIds(ro, ctx);
+        ctx.outcomes.push({ step: `startWave ${step.rolloutRef}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.wave ? ` (ordinal ${r.body.wave.ordinal})` : r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'pauseRollout': {
+        const ro = this.resolveRollout(step.rolloutRef, ctx);
+        const r = await this.client.pauseRollout(ro.rolloutId);
+        ctx.outcomes.push({ step: `pauseRollout ${step.rolloutRef}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'resumeRollout': {
+        const ro = this.resolveRollout(step.rolloutRef, ctx);
+        const r = await this.client.resumeRollout(ro.rolloutId);
+        ctx.outcomes.push({ step: `resumeRollout ${step.rolloutRef}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'retryWave': {
+        const ro = this.resolveRollout(step.rolloutRef, ctx);
+        const waveId = ro.waveIds[step.waveIndex];
+        if (!waveId) throw new Error(`rollout "${step.rolloutRef}" has no wave at index ${step.waveIndex}`);
+        const r = await this.client.retryWave(ro.rolloutId, waveId);
+        ctx.outcomes.push({ step: `retryWave ${step.rolloutRef}#${step.waveIndex}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.attempt ? ` (attempt ${r.body.attempt})` : r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'reportReceipt': {
+        const ro = this.resolveRollout(step.rolloutRef, ctx);
+        const waveId = ro.waveIds[step.waveIndex];
+        if (!waveId) throw new Error(`rollout "${step.rolloutRef}" has no wave at index ${step.waveIndex}`);
+        const fingerprint = step.fingerprint ?? ro.fingerprint;
+        const times = step.repeat ?? 1;
+        const results: string[] = [];
+        for (let i = 0; i < times; i++) {
+          if (step.crashAfterWrite && i === 0) {
+            await this.client.armFault('rollout.receipt.after-write-before-reply', 1);
+          }
+          const r = await this.client.reportReceipt({
+            receiptId: step.receiptId,
+            rolloutId: ro.rolloutId,
+            waveId,
+            attempt: step.attempt,
+            result: step.result,
+            evidenceFingerprint: fingerprint,
+            detail: step.detail
+          });
+          if (step.dropResponse) {
+            results.push('sent(response dropped)');
+            continue;
+          }
+          results.push(`${r.status}:${r.body?.status ?? ''}`);
+        }
+        ctx.outcomes.push({ step: `reportReceipt ${step.receiptId}`, result: results });
+        return results.join(' , ');
+      }
+
+      case 'rollback': {
+        const subjectId = step.subjectId ?? this.resolveSubjectId(step.subjectRef, ctx);
+        const targetDigest = this.resolveDigestRef(step.targetRef, ctx);
+        const r = await this.client.rollback({
+          subjectId,
+          environment: step.environment,
+          targetDigest,
+          waves: step.waves,
+          createdBy: step.createdBy,
+          note: step.note
+        });
+        ctx.outcomes.push({ step: `rollback ${step.as}`, result: r.body });
+        if (r.body?.rollout?.rolloutId) {
+          ctx.rollouts.set(step.as, {
+            rolloutId: r.body.rollout.rolloutId,
+            waveIds: (r.body.waves ?? []).map((w: any) => w.waveId),
+            fingerprint: r.body.rollout.evidenceFingerprint
+          });
+        }
+        return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
       case 'expect': {
         await step.check(ctx);
         return step.description;
@@ -298,6 +457,29 @@ export class AgentSimulator {
     const id = ctx.waivers.get(ref);
     if (!id) throw new Error(`unknown waiver ref "${ref}"`);
     return id;
+  }
+
+  private resolveDecisionId(ref: string, ctx: ScenarioContext): string {
+    const id = ctx.decisions.get(ref);
+    if (!id) throw new Error(`unknown decision ref "${ref}"`);
+    return id;
+  }
+
+  private resolveRollout(ref: string, ctx: ScenarioContext): { rolloutId: string; waveIds: string[]; fingerprint: string } {
+    const ro = ctx.rollouts.get(ref);
+    if (!ro) throw new Error(`unknown rollout ref "${ref}"`);
+    return ro;
+  }
+
+  /** Re-read the rollout's waves so alias indices stay valid across retries. */
+  private async refreshWaveIds(ro: { rolloutId: string; waveIds: string[] }, _ctx: ScenarioContext): Promise<void> {
+    const r = await this.client.getRollout(ro.rolloutId);
+    if (r.status === 200 && Array.isArray(r.body?.waves)) {
+      ro.waveIds = r.body.waves
+        .slice()
+        .sort((a: any, b: any) => a.ordinal - b.ordinal)
+        .map((w: any) => w.waveId);
+    }
   }
 
   private resolveDigest(step: Extract<Step, { kind: 'report' }>, ctx: ScenarioContext): string {

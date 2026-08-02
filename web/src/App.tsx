@@ -7,9 +7,16 @@ import {
   confirmWaiver,
   rejectWaiver,
   revokeWaiver,
+  createRollout,
+  startNextWave,
+  pauseRollout,
+  resumeRollout,
+  retryWave,
+  rollback,
   type Snapshot,
   type ProposalView,
-  type Waiver
+  type Waiver,
+  type RolloutDetail
 } from './api';
 
 /**
@@ -50,6 +57,22 @@ const WAIVER_COLORS: Record<string, string> = {
   REVOKED: '#5f6368',
   EXPIRED: '#5f6368',
   LAPSED: '#5f6368'
+};
+
+const ROLLOUT_COLORS: Record<string, string> = {
+  PENDING: '#5f6368',
+  IN_PROGRESS: '#1a56db',
+  PAUSED: '#a56300',
+  COMPLETED: '#137333',
+  FAILED: '#b3261e',
+  ROLLED_BACK: '#6a1b9a'
+};
+
+const WAVE_COLORS: Record<string, string> = {
+  PENDING: '#5f6368',
+  IN_PROGRESS: '#1a56db',
+  SUCCEEDED: '#137333',
+  FAILED: '#b3261e'
 };
 
 export default function App(): JSX.Element {
@@ -131,6 +154,33 @@ export default function App(): JSX.Element {
   const onRejectWaiver = (w: Waiver) => runWaiverAction(`rej-${w.waiverId}`, () => rejectWaiver(w.waiverId, reviewerB, 'rejected from workbench'));
   const onRevokeWaiver = (w: Waiver) => runWaiverAction(`rev-${w.waiverId}`, () => revokeWaiver(w.waiverId, reviewerB, 'revoked from workbench'));
 
+  const runRolloutAction = async (key: string, fn: () => Promise<{ status: number; body: any }>, okStatuses = [200, 201]) => {
+    setBusy(key);
+    try {
+      const r = await fn();
+      if (!okStatuses.includes(r.status)) setError(`发布操作被拒绝: ${r.body?.reason ?? r.body?.status ?? r.status}`);
+      else setError(null);
+      await refresh();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const onCreateRollout = (view: ProposalView, waves: string[]) => {
+    if (!view.decision) return;
+    return runRolloutAction(`ro-create-${view.proposal.proposalId}`, () =>
+      createRollout({ decisionId: view.decision!.decisionId, waves, createdBy: decidedBy })
+    );
+  };
+  const onStartWave = (rolloutId: string) => runRolloutAction(`ro-start-${rolloutId}`, () => startNextWave(rolloutId));
+  const onPause = (rolloutId: string) => runRolloutAction(`ro-pause-${rolloutId}`, () => pauseRollout(rolloutId));
+  const onResume = (rolloutId: string) => runRolloutAction(`ro-resume-${rolloutId}`, () => resumeRollout(rolloutId));
+  const onRetryWave = (rolloutId: string, waveId: string) => runRolloutAction(`ro-retry-${waveId}`, () => retryWave(rolloutId, waveId));
+  const onRollback = (subjectId: string, environment: string, targetDigest: string, waves: string[]) =>
+    runRolloutAction(`ro-rollback-${subjectId}`, () =>
+      rollback({ subjectId, environment, targetDigest, waves, createdBy: decidedBy })
+    );
+
   return (
     <div style={{ fontFamily: 'Segoe UI, system-ui, sans-serif', maxWidth: 1100, margin: '0 auto', padding: 24, color: '#202124' }}>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
@@ -187,6 +237,20 @@ export default function App(): JSX.Element {
               busy={busy}
             />
           )}
+
+          <RolloutSection
+            subjectId={s.subject.subjectId}
+            environment={snapshot?.environment ?? 'production'}
+            current={s.current}
+            rollouts={s.rollouts ?? []}
+            onCreateRollout={onCreateRollout}
+            onStartWave={onStartWave}
+            onPause={onPause}
+            onResume={onResume}
+            onRetryWave={onRetryWave}
+            onRollback={onRollback}
+            busy={busy}
+          />
 
           {s.history.length > 1 && (
             <details style={{ marginTop: 8 }}>
@@ -410,6 +474,140 @@ function WaiverList({
   );
 }
 
+function RolloutSection({
+  subjectId,
+  environment,
+  current,
+  rollouts,
+  onCreateRollout,
+  onStartWave,
+  onPause,
+  onResume,
+  onRetryWave,
+  onRollback,
+  busy
+}: {
+  subjectId: string;
+  environment: string;
+  current: ProposalView | null;
+  rollouts: RolloutDetail[];
+  onCreateRollout: (v: ProposalView, waves: string[]) => void;
+  onStartWave: (rolloutId: string) => void;
+  onPause: (rolloutId: string) => void;
+  onResume: (rolloutId: string) => void;
+  onRetryWave: (rolloutId: string, waveId: string) => void;
+  onRollback: (subjectId: string, environment: string, targetDigest: string, waves: string[]) => void;
+  busy: string | null;
+}): JSX.Element {
+  const [waveText, setWaveText] = useState('canary, half, full');
+  const canStartRollout =
+    current?.decision?.type === 'APPROVE' &&
+    current.decision.environment === environment &&
+    !rollouts.some((r) => ['PENDING', 'IN_PROGRESS', 'PAUSED'].includes(r.rollout.status));
+
+  // Rollback targets: digests that were approved for this environment before.
+  const rollbackTargets = rollouts
+    .filter((r) => r.rollout.kind === 'RELEASE')
+    .map((r) => r.rollout.candidateDigest);
+
+  return (
+    <div style={{ marginTop: 14, borderTop: '1px dashed #e0e0e0', paddingTop: 10 }}>
+      <h4 style={{ margin: '0 0 6px', fontSize: 13 }}>分阶段发布（环境 {environment}）</h4>
+
+      {canStartRollout && current?.decision && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 12, color: '#5f6368' }}>波次（逗号分隔）：</span>
+          <input value={waveText} onChange={(e) => setWaveText(e.target.value)} style={{ padding: '2px 6px', fontSize: 12, width: 220 }} />
+          <button
+            disabled={busy != null}
+            onClick={() => onCreateRollout(current, waveText.split(',').map((w) => w.trim()).filter(Boolean))}
+            style={{ ...btn, padding: '4px 10px', fontSize: 12, background: '#1a56db', color: '#fff' }}
+          >
+            按环境安排连续波次
+          </button>
+        </div>
+      )}
+
+      {rollouts.length === 0 && <p style={{ fontSize: 12, color: '#5f6368', margin: 0 }}>该环境暂无发布流程。批准候选后可安排波次。</p>}
+
+      {rollouts.map((r) => (
+        <div key={r.rollout.rolloutId} style={{ border: '1px solid #eee', borderRadius: 8, padding: 10, marginBottom: 8 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <Badge text={r.rollout.kind} color={r.rollout.kind === 'ROLLBACK' ? '#6a1b9a' : '#1a56db'} />
+            <Badge text={r.rollout.status} color={ROLLOUT_COLORS[r.rollout.status]} />
+            <code style={{ fontSize: 11 }} title={r.rollout.candidateDigest}>{r.rollout.candidateDigest.slice(0, 20)}…</code>
+            <span style={{ fontSize: 11, color: '#5f6368' }}>指纹 <code>{r.rollout.evidenceFingerprint.slice(0, 16)}…</code></span>
+            {r.rollout.supersedesRolloutId && (
+              <span style={{ fontSize: 11, color: '#5f6368' }}>回退自 <code>{r.rollout.supersedesRolloutId.slice(0, 8)}</code></span>
+            )}
+          </div>
+
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, marginTop: 6 }}>
+            <thead>
+              <tr style={{ textAlign: 'left', color: '#5f6368' }}>
+                <th style={th}>#</th><th style={th}>波次</th><th style={th}>状态</th><th style={th}>尝试</th><th style={th}>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {r.waves.map((w) => (
+                <tr key={w.waveId} style={{ borderTop: '1px solid #eee' }}>
+                  <td style={td}>{w.ordinal}</td>
+                  <td style={td}>{w.name}</td>
+                  <td style={td}><Badge text={w.status} color={WAVE_COLORS[w.status]} /></td>
+                  <td style={td}>{w.attempt}</td>
+                  <td style={td}>
+                    {(w.status === 'FAILED' || w.status === 'IN_PROGRESS') && ['IN_PROGRESS', 'PAUSED'].includes(r.rollout.status) && (
+                      <button disabled={busy != null} onClick={() => onRetryWave(r.rollout.rolloutId, w.waveId)} style={{ ...btn, padding: '2px 6px', fontSize: 11 }}>重试</button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+            {['PENDING', 'IN_PROGRESS'].includes(r.rollout.status) && (
+              <button disabled={busy != null} onClick={() => onStartWave(r.rollout.rolloutId)} style={{ ...btn, padding: '3px 8px', fontSize: 11 }}>启动下一波次</button>
+            )}
+            {['PENDING', 'IN_PROGRESS'].includes(r.rollout.status) && (
+              <button disabled={busy != null} onClick={() => onPause(r.rollout.rolloutId)} style={{ ...btn, padding: '3px 8px', fontSize: 11 }}>暂停</button>
+            )}
+            {r.rollout.status === 'PAUSED' && (
+              <button disabled={busy != null} onClick={() => onResume(r.rollout.rolloutId)} style={{ ...btn, padding: '3px 8px', fontSize: 11 }}>恢复</button>
+            )}
+            {r.rollout.kind === 'RELEASE' && ['IN_PROGRESS', 'PAUSED', 'FAILED'].includes(r.rollout.status) && rollbackTargets.length > 0 && (
+              <button
+                disabled={busy != null}
+                onClick={() => onRollback(subjectId, environment, rollbackTargets[0], ['rollback'])}
+                style={{ ...btn, padding: '3px 8px', fontSize: 11, background: '#6a1b9a', color: '#fff' }}
+                title="回退到上一个已知版本（仅部署，不改写契约决策，不复活已失效豁免）"
+              >
+                回退到上一个已知版本
+              </button>
+            )}
+          </div>
+
+          {r.receipts.length > 0 && (
+            <details style={{ marginTop: 6 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: '#5f6368' }}>部署回执（{r.receipts.length}）</summary>
+              <ul style={{ fontSize: 11, color: '#5f6368', margin: '4px 0' }}>
+                {r.receipts.map((rc) => (
+                  <li key={rc.receiptId}>
+                    <code>{rc.receiptId}</code> {rc.result} · attempt {rc.attempt} · {rc.applied ? '已推进' : `未推进（${rc.ignoredReason ?? '重复'}）`}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      ))}
+      <p style={{ fontSize: 11, color: '#5f6368', margin: '4px 0' }}>
+        回执只推进绑定同一决策快照与波次尝试的当前波次；重复/乱序/指纹不匹配的回执被记录但不生效。回退仅重新部署，不改写原契约决策，也不复活已失效豁免。
+      </p>
+    </div>
+  );
+}
+
 function Badge({ text, color = '#5f6368' }: { text: string; color?: string }): JSX.Element {
   return (
     <span style={{ background: color, color: '#fff', borderRadius: 10, padding: '2px 8px', fontSize: 11, fontWeight: 600 }}>
@@ -417,7 +615,6 @@ function Badge({ text, color = '#5f6368' }: { text: string; color?: string }): J
     </span>
   );
 }
-
 const card: React.CSSProperties = { border: '1px solid #e0e0e0', borderRadius: 10, padding: 16, marginBottom: 12 };
 const btn: React.CSSProperties = { border: '1px solid #dadce0', borderRadius: 6, padding: '6px 12px', background: '#fff', cursor: 'pointer', fontSize: 13 };
 const th: React.CSSProperties = { padding: '4px 6px', fontWeight: 600 };

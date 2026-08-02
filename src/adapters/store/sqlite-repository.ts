@@ -4,10 +4,14 @@ import type {
   EventRecord,
   EvidenceRecord,
   ProposalRecord,
+  ReceiptRecord,
   Repository,
+  RolloutRecord,
   SubjectRecord,
-  WaiverRecord
+  WaiverRecord,
+  WaveRecord
 } from '../../ports/repository.js';
+import type { RolloutStatus, WaveStatus } from '../../domain/rollout.js';
 
 /**
  * SQLite implementation of the persistence port (better-sqlite3, synchronous).
@@ -124,6 +128,53 @@ export class SqliteRepository implements Repository {
         proposal_id TEXT,
         payload TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS rollouts (
+        rollout_id TEXT PRIMARY KEY,
+        subject_id TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        decision_id TEXT,
+        proposal_id TEXT,
+        candidate_digest TEXT NOT NULL,
+        evidence_fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        created_by TEXT NOT NULL,
+        supersedes_rollout_id TEXT,
+        note TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_rollouts_subject ON rollouts(subject_id);
+      -- At most one non-terminal rollout per (subject, environment).
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_rollouts_one_active
+        ON rollouts(subject_id, environment)
+        WHERE status IN ('PENDING','IN_PROGRESS','PAUSED');
+
+      CREATE TABLE IF NOT EXISTS waves (
+        wave_id TEXT PRIMARY KEY,
+        rollout_id TEXT NOT NULL REFERENCES rollouts(rollout_id),
+        ordinal INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        started_at INTEGER,
+        settled_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_waves_rollout ON waves(rollout_id);
+
+      CREATE TABLE IF NOT EXISTS receipts (
+        receipt_id TEXT PRIMARY KEY,
+        rollout_id TEXT NOT NULL REFERENCES rollouts(rollout_id),
+        wave_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        result TEXT NOT NULL,
+        evidence_fingerprint TEXT NOT NULL,
+        received_at INTEGER NOT NULL,
+        detail TEXT,
+        applied INTEGER NOT NULL,
+        ignored_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON receipts(rollout_id);
     `);
   }
 
@@ -503,6 +554,239 @@ export class SqliteRepository implements Repository {
     return tx();
   }
 
+  // --- rollouts / waves / receipts ---
+  insertRollout(rollout: RolloutRecord, waves: WaveRecord[]): void {
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO rollouts
+            (rollout_id, subject_id, environment, kind, decision_id, proposal_id, candidate_digest,
+             evidence_fingerprint, status, created_at, created_by, supersedes_rollout_id, note)
+           VALUES
+            (@rolloutId, @subjectId, @environment, @kind, @decisionId, @proposalId, @candidateDigest,
+             @evidenceFingerprint, @status, @createdAt, @createdBy, @supersedesRolloutId, @note)`
+        )
+        .run({
+          rolloutId: rollout.rolloutId,
+          subjectId: rollout.subjectId,
+          environment: rollout.environment,
+          kind: rollout.kind,
+          decisionId: rollout.decisionId,
+          proposalId: rollout.proposalId,
+          candidateDigest: rollout.candidateDigest,
+          evidenceFingerprint: rollout.evidenceFingerprint,
+          status: rollout.status,
+          createdAt: rollout.createdAt,
+          createdBy: rollout.createdBy,
+          supersedesRolloutId: rollout.supersedesRolloutId,
+          note: rollout.note
+        });
+      const insWave = this.db.prepare(
+        `INSERT INTO waves (wave_id, rollout_id, ordinal, name, status, attempt, started_at, settled_at)
+         VALUES (@waveId, @rolloutId, @ordinal, @name, @status, @attempt, @startedAt, @settledAt)`
+      );
+      for (const w of waves) {
+        insWave.run({
+          waveId: w.waveId,
+          rolloutId: w.rolloutId,
+          ordinal: w.ordinal,
+          name: w.name,
+          status: w.status,
+          attempt: w.attempt,
+          startedAt: w.startedAt,
+          settledAt: w.settledAt
+        });
+      }
+    });
+    tx();
+  }
+
+  getRollout(rolloutId: string): RolloutRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM rollouts WHERE rollout_id = ?').get(rolloutId) as any;
+    return row ? rowToRollout(row) : undefined;
+  }
+
+  listRollouts(subjectId: string): RolloutRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM rollouts WHERE subject_id = ? ORDER BY created_at ASC, rollout_id ASC')
+      .all(subjectId) as any[];
+    return rows.map(rowToRollout);
+  }
+
+  getActiveRollout(subjectId: string, environment: string): RolloutRecord | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM rollouts WHERE subject_id = ? AND environment = ? AND status IN ('PENDING','IN_PROGRESS','PAUSED')"
+      )
+      .get(subjectId, environment) as any;
+    return row ? rowToRollout(row) : undefined;
+  }
+
+  listWaves(rolloutId: string): WaveRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM waves WHERE rollout_id = ? ORDER BY ordinal ASC')
+      .all(rolloutId) as any[];
+    return rows.map(rowToWave);
+  }
+
+  getWave(waveId: string): WaveRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM waves WHERE wave_id = ?').get(waveId) as any;
+    return row ? rowToWave(row) : undefined;
+  }
+
+  getReceipt(receiptId: string): ReceiptRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM receipts WHERE receipt_id = ?').get(receiptId) as any;
+    return row ? rowToReceipt(row) : undefined;
+  }
+
+  listReceipts(rolloutId: string): ReceiptRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM receipts WHERE rollout_id = ? ORDER BY received_at ASC, receipt_id ASC')
+      .all(rolloutId) as any[];
+    return rows.map(rowToReceipt);
+  }
+
+  setRolloutStatus(
+    rolloutId: string,
+    fromStatuses: RolloutStatus[],
+    toStatus: RolloutStatus,
+    at: number,
+    eventType: string,
+    payload: unknown
+  ): boolean {
+    const tx = this.db.transaction((): boolean => {
+      const placeholders = fromStatuses.map(() => '?').join(',');
+      const upd = this.db
+        .prepare(`UPDATE rollouts SET status = ? WHERE rollout_id = ? AND status IN (${placeholders})`)
+        .run(toStatus, rolloutId, ...fromStatuses);
+      if (upd.changes !== 1) return false;
+      const r = this.getRollout(rolloutId)!;
+      this.appendEvent(eventType, at, { subjectId: r.subjectId, proposalId: r.proposalId }, payload);
+      return true;
+    });
+    return tx();
+  }
+
+  startNextWave(rolloutId: string, at: number): WaveRecord | undefined {
+    const tx = this.db.transaction((): WaveRecord | undefined => {
+      const rollout = this.getRollout(rolloutId);
+      if (!rollout || !['PENDING', 'IN_PROGRESS'].includes(rollout.status)) return undefined;
+      // Refuse to start a new wave while one is still live.
+      const inProgress = this.db
+        .prepare("SELECT COUNT(*) AS n FROM waves WHERE rollout_id = ? AND status = 'IN_PROGRESS'")
+        .get(rolloutId) as any;
+      if (inProgress.n > 0) return undefined;
+      const next = this.db
+        .prepare("SELECT * FROM waves WHERE rollout_id = ? AND status = 'PENDING' ORDER BY ordinal ASC LIMIT 1")
+        .get(rolloutId) as any;
+      if (!next) return undefined;
+      this.db
+        .prepare("UPDATE waves SET status = 'IN_PROGRESS', started_at = @at WHERE wave_id = @id")
+        .run({ at, id: next.wave_id });
+      this.db.prepare("UPDATE rollouts SET status = 'IN_PROGRESS' WHERE rollout_id = ?").run(rolloutId);
+      const wave = this.getWave(next.wave_id)!;
+      this.appendEvent('rollout.wave.started', at, { subjectId: rollout.subjectId, proposalId: rollout.proposalId }, {
+        rolloutId,
+        waveId: wave.waveId,
+        ordinal: wave.ordinal,
+        attempt: wave.attempt
+      });
+      return wave;
+    });
+    return tx();
+  }
+
+  applyReceipt(
+    receipt: ReceiptRecord,
+    settle: { waveId: string; toStatus: WaveStatus; rolloutToStatus: RolloutStatus | null } | null,
+    at: number
+  ): ReceiptRecord {
+    const tx = this.db.transaction((): ReceiptRecord => {
+      // Idempotency: a receipt id is processed at most once.
+      const prior = this.getReceipt(receipt.receiptId);
+      if (prior) return prior;
+
+      this.db
+        .prepare(
+          `INSERT INTO receipts
+            (receipt_id, rollout_id, wave_id, attempt, result, evidence_fingerprint, received_at, detail, applied, ignored_reason)
+           VALUES
+            (@receiptId, @rolloutId, @waveId, @attempt, @result, @evidenceFingerprint, @receivedAt, @detail, @applied, @ignoredReason)`
+        )
+        .run({
+          receiptId: receipt.receiptId,
+          rolloutId: receipt.rolloutId,
+          waveId: receipt.waveId,
+          attempt: receipt.attempt,
+          result: receipt.result,
+          evidenceFingerprint: receipt.evidenceFingerprint,
+          receivedAt: receipt.receivedAt,
+          detail: receipt.detail,
+          applied: receipt.applied ? 1 : 0,
+          ignoredReason: receipt.ignoredReason
+        });
+
+      const rollout = this.getRollout(receipt.rolloutId);
+      if (settle && rollout) {
+        // Settle the wave only if it is still the live attempt (guards against
+        // a stale decisive receipt that raced a retry between classify+apply).
+        this.db
+          .prepare(
+            `UPDATE waves SET status = @toStatus, settled_at = @at
+             WHERE wave_id = @waveId AND attempt = @attempt AND status = 'IN_PROGRESS'`
+          )
+          .run({ toStatus: settle.toStatus, at, waveId: settle.waveId, attempt: receipt.attempt });
+        if (settle.rolloutToStatus) {
+          this.db.prepare('UPDATE rollouts SET status = ? WHERE rollout_id = ?').run(settle.rolloutToStatus, receipt.rolloutId);
+        }
+      }
+
+      this.appendEvent(
+        receipt.applied ? 'rollout.receipt.applied' : 'rollout.receipt.ignored',
+        at,
+        { subjectId: rollout?.subjectId ?? null, proposalId: rollout?.proposalId ?? null },
+        {
+          receiptId: receipt.receiptId,
+          rolloutId: receipt.rolloutId,
+          waveId: receipt.waveId,
+          attempt: receipt.attempt,
+          result: receipt.result,
+          ...(receipt.ignoredReason ? { ignoredReason: receipt.ignoredReason } : {}),
+          ...(settle ? { settledTo: settle.toStatus } : {})
+        }
+      );
+      return this.getReceipt(receipt.receiptId)!;
+    });
+    return tx();
+  }
+
+  retryWave(rolloutId: string, waveId: string, at: number): number | undefined {
+    const tx = this.db.transaction((): number | undefined => {
+      const rollout = this.getRollout(rolloutId);
+      // A wave can be retried while the rollout is still live (IN_PROGRESS),
+      // paused, or has already been marked FAILED by the failing wave. Terminal
+      // COMPLETED/ROLLED_BACK rollouts are not retryable.
+      if (!rollout || !['IN_PROGRESS', 'PAUSED', 'FAILED'].includes(rollout.status)) return undefined;
+      const wave = this.getWave(waveId);
+      if (!wave || wave.rolloutId !== rolloutId) return undefined;
+      if (!['IN_PROGRESS', 'FAILED'].includes(wave.status)) return undefined;
+      const attempt = wave.attempt + 1;
+      // Bump the attempt and re-open the wave. Any receipt for the prior
+      // attempt is now stale by attempt number.
+      this.db
+        .prepare("UPDATE waves SET attempt = @attempt, status = 'IN_PROGRESS', started_at = @at, settled_at = NULL WHERE wave_id = @id")
+        .run({ attempt, at, id: waveId });
+      this.db.prepare("UPDATE rollouts SET status = 'IN_PROGRESS' WHERE rollout_id = ?").run(rolloutId);
+      this.appendEvent('rollout.wave.retried', at, { subjectId: rollout.subjectId, proposalId: rollout.proposalId }, {
+        rolloutId,
+        waveId,
+        attempt
+      });
+      return attempt;
+    });
+    return tx();
+  }
+
   // --- events ---
   appendEvent(
     type: string,
@@ -617,5 +901,51 @@ function rowToWaiver(row: any): WaiverRecord {
     closedBy: row.closed_by,
     closedAt: row.closed_at,
     endReason: row.end_reason
+  };
+}
+
+function rowToRollout(row: any): RolloutRecord {
+  return {
+    rolloutId: row.rollout_id,
+    subjectId: row.subject_id,
+    environment: row.environment,
+    kind: row.kind,
+    decisionId: row.decision_id,
+    proposalId: row.proposal_id,
+    candidateDigest: row.candidate_digest,
+    evidenceFingerprint: row.evidence_fingerprint,
+    status: row.status,
+    createdAt: row.created_at,
+    createdBy: row.created_by,
+    supersedesRolloutId: row.supersedes_rollout_id,
+    note: row.note
+  };
+}
+
+function rowToWave(row: any): WaveRecord {
+  return {
+    waveId: row.wave_id,
+    rolloutId: row.rollout_id,
+    ordinal: row.ordinal,
+    name: row.name,
+    status: row.status,
+    attempt: row.attempt,
+    startedAt: row.started_at,
+    settledAt: row.settled_at
+  };
+}
+
+function rowToReceipt(row: any): ReceiptRecord {
+  return {
+    receiptId: row.receipt_id,
+    rolloutId: row.rollout_id,
+    waveId: row.wave_id,
+    attempt: row.attempt,
+    result: row.result,
+    evidenceFingerprint: row.evidence_fingerprint,
+    receivedAt: row.received_at,
+    detail: row.detail,
+    applied: row.applied === 1,
+    ignoredReason: row.ignored_reason
   };
 }

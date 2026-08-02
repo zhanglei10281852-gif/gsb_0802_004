@@ -169,6 +169,85 @@ export async function buildServer(opts: BuildServerOptions): Promise<FastifyInst
     return waiver;
   });
 
+  // --- staged rollouts ---
+  app.post('/api/rollouts', async (req, reply) => {
+    const body = req.body as any;
+    const outcome = service.createRollout({
+      decisionId: String(body.decisionId),
+      waves: Array.isArray(body.waves) ? body.waves.map(String) : [],
+      createdBy: String(body.createdBy ?? 'unknown'),
+      note: body.note ? String(body.note) : undefined
+    });
+    return reply.status(outcome.status === 'CREATED' ? 201 : 422).send(outcome);
+  });
+
+  app.post('/api/rollouts/:rolloutId/start-wave', async (req, reply) => {
+    const { rolloutId } = req.params as { rolloutId: string };
+    const outcome = service.startNextWave(rolloutId);
+    return reply.status(outcome.status === 'STARTED' ? 201 : 422).send(outcome);
+  });
+
+  app.post('/api/rollouts/:rolloutId/pause', async (req, reply) => {
+    const { rolloutId } = req.params as { rolloutId: string };
+    const outcome = service.pauseRollout(rolloutId);
+    return reply.status(outcome.status === 'PAUSED' ? 200 : 422).send(outcome);
+  });
+
+  app.post('/api/rollouts/:rolloutId/resume', async (req, reply) => {
+    const { rolloutId } = req.params as { rolloutId: string };
+    const outcome = service.resumeRollout(rolloutId);
+    return reply.status(outcome.status === 'RESUMED' ? 200 : 422).send(outcome);
+  });
+
+  app.post('/api/rollouts/:rolloutId/waves/:waveId/retry', async (req, reply) => {
+    const { rolloutId, waveId } = req.params as { rolloutId: string; waveId: string };
+    const outcome = service.retryWave(rolloutId, waveId);
+    return reply.status(outcome.status === 'RETRIED' ? 201 : 422).send(outcome);
+  });
+
+  app.post('/api/rollbacks', async (req, reply) => {
+    const body = req.body as any;
+    const outcome = service.rollback({
+      subjectId: String(body.subjectId),
+      environment: body.environment ? String(body.environment) : undefined,
+      targetDigest: String(body.targetDigest),
+      waves: Array.isArray(body.waves) ? body.waves.map(String) : [],
+      createdBy: String(body.createdBy ?? 'unknown'),
+      note: body.note ? String(body.note) : undefined
+    });
+    return reply.status(outcome.status === 'CREATED' ? 201 : 422).send(outcome);
+  });
+
+  // --- deployment adapter receipts ---
+  app.post('/api/receipts', async (req, reply) => {
+    const body = req.body as any;
+    const result = body.result === 'FAILURE' ? 'FAILURE' : body.result === 'UNKNOWN' ? 'UNKNOWN' : 'SUCCESS';
+    const outcome = service.reportReceipt({
+      receiptId: String(body.receiptId),
+      rolloutId: String(body.rolloutId),
+      waveId: String(body.waveId),
+      attempt: Number(body.attempt),
+      result,
+      evidenceFingerprint: String(body.evidenceFingerprint),
+      detail: body.detail ? String(body.detail) : undefined
+    });
+    const code =
+      outcome.status === 'ADVANCED' ? 201 : outcome.status === 'DENIED' ? 422 : 200;
+    return reply.status(code).send(outcome);
+  });
+
+  app.get('/api/rollouts/:rolloutId', async (req, reply) => {
+    const { rolloutId } = req.params as { rolloutId: string };
+    const detail = service.getRolloutDetail(rolloutId);
+    if (!detail) return reply.status(404).send({ error: 'NOT_FOUND' });
+    return detail;
+  });
+
+  app.get('/api/subjects/:subjectId/rollouts', async (req) => {
+    const { subjectId } = req.params as { subjectId: string };
+    return { rollouts: service.listRollouts(subjectId) };
+  });
+
   // --- read models ---
   app.get('/api/proposals/:proposalId', async (req, reply) => {
     const { proposalId } = req.params as { proposalId: string };
