@@ -1,0 +1,35 @@
+{
+  "name": "contract-change-control",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "数据契约变更控制中心：基线/候选契约摘要、兼容性判定、消费方证据门禁、不可变决策快照",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json && vite build web",
+    "start": "node dist/server/main.js",
+    "agent": "node dist/agent/simulator.js",
+    "e2e": "node dist/scripts/e2e.js"
+  },
+  "dependencies": {
+    "@fastify/static": "^7.0.4",
+    "ajv": "^8.17.1",
+    "better-sqlite3": "^11.10.0",
+    "fastify": "^4.28.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.14.15",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2",
+    "vitest": "^2.0.5"
+  }
+}
