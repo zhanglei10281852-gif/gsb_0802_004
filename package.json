@@ -1,0 +1,42 @@
+{
+  "name": "contract-gate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Data contract change control center with evidence-based gating, immutable decisions and crash recovery",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "install:all": "npm install",
+    "build": "npm run build:server && npm run build:e2e && npm run build:web",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:e2e": "tsc -p tsconfig.e2e.json",
+    "build:web": "vite build",
+    "test": "tsx scripts/run-tests.ts",
+    "start": "node dist/server/main.js",
+    "e2e": "npm run build && node dist/e2e/run-e2e.js",
+    "dev": "tsx watch src/server/main.ts",
+    "simulate": "tsx src/agent/cli.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@fastify/static": "^7.0.4",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "better-sqlite3": "^11.3.0",
+    "fastify": "^4.28.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.16.5",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "tsx": "^4.19.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.6"
+  }
+}
