@@ -40,7 +40,7 @@ export interface Waiver {
   consumerId: string;
   environment: string;
   compatDirection: string;
-  status: 'REQUESTED' | 'ACTIVE' | 'REJECTED' | 'REVOKED' | 'EXPIRED';
+  status: 'REQUESTED' | 'ACTIVE' | 'REJECTED' | 'REVOKED' | 'EXPIRED' | 'LAPSED';
   reason: string;
   requestedBy: string;
   requestedAt: number;
@@ -75,6 +75,12 @@ export interface ProposalView {
     gateSnapshot: Gate;
   };
   waivers: Waiver[];
+  lineage: {
+    predecessorId: string | null;
+    predecessorDigest: string | null;
+    successorId: string | null;
+    successorDigest: string | null;
+  };
 }
 
 export interface Snapshot {
@@ -84,7 +90,7 @@ export interface Snapshot {
   subjects: Array<{
     subject: { subjectId: string; requiredConsumers: string[]; freshnessWindowMs: number };
     current: ProposalView | null;
-    history: Array<{ proposalId: string; digest: string; state: string; seq: number; decision: any }>;
+    history: Array<{ proposalId: string; digest: string; state: string; seq: number; predecessorId: string | null; decision: any }>;
   }>;
 }
 

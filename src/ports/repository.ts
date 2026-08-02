@@ -34,6 +34,13 @@ export interface ProposalRecord {
   submittedBy: string;
   /** Set once the proposal is decided; null while OPEN/SUPERSEDED. */
   decisionId: string | null;
+  /**
+   * The proposal this one succeeds, if it was created as a correction of an
+   * earlier candidate for the same subject. null for the first proposal in a
+   * lineage. This is the explicit lineage link; the successor always carries a
+   * fresh candidate digest and starts with no inherited evidence or waivers.
+   */
+  predecessorId: string | null;
 }
 
 export interface EvidenceRecord {
@@ -174,6 +181,13 @@ export interface Repository {
    * touched, so re-running never double-expires.
    */
   expireWaivers(now: number): string[];
+  /**
+   * Lapse every REQUESTED or ACTIVE waiver scoped to a candidate, marking them
+   * LAPSED with an audit event. Used when a proposal is replaced by a successor:
+   * waivers fall away with the old candidate by their exact scope and are never
+   * inherited. Returns the ids lapsed. Idempotent for already-terminal rows.
+   */
+  lapseWaiversForCandidate(subjectId: string, candidateDigest: string, at: number, reason: string): string[];
 
   // --- events / causal log ---
   appendEvent(type: string, at: number, ids: { subjectId?: string | null; proposalId?: string | null }, payload: unknown): number;

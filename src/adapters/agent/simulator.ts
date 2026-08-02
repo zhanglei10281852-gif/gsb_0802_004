@@ -17,7 +17,7 @@ import { ControlCenterClient } from './client.js';
  */
 export type Step =
   | { kind: 'registerSubject'; subjectId: string; requiredConsumers: string[]; freshnessWindowMs: number }
-  | { kind: 'submitCandidate'; subjectId: string; baselineSchema: unknown; candidateSchema: unknown; submittedBy: string; as?: string }
+  | { kind: 'submitCandidate'; subjectId: string; baselineSchema: unknown; candidateSchema: unknown; submittedBy: string; as?: string; expectedPredecessorRef?: string }
   | {
       kind: 'report';
       reportId: string;
@@ -137,16 +137,21 @@ export class AgentSimulator {
       }
 
       case 'submitCandidate': {
+        const expectedPredecessorId = step.expectedPredecessorRef
+          ? ctx.candidates.get(step.expectedPredecessorRef)?.proposalId
+          : undefined;
         const r = await this.client.submitCandidate(step.subjectId, {
           baselineSchema: step.baselineSchema,
           candidateSchema: step.candidateSchema,
-          submittedBy: step.submittedBy
+          submittedBy: step.submittedBy,
+          expectedPredecessorId
         });
         assert(r.status === 200 || r.status === 201, `submitCandidate failed: ${r.status}`);
         if (step.as) {
           ctx.candidates.set(step.as, { proposalId: r.body.proposalId, digest: r.body.candidateDigest });
         }
-        return `candidate ${r.body.candidateDigest.slice(0, 14)} (${r.body.compat.result})${r.body.deduplicated ? ' [dedup]' : ''}`;
+        const lineage = r.body.predecessorId ? ` <- ${r.body.predecessorId.slice(0, 8)}` : '';
+        return `candidate ${r.body.candidateDigest.slice(0, 14)} (${r.body.compat.result})${r.body.deduplicated ? ' [dedup]' : ''}${lineage}`;
       }
 
       case 'report': {

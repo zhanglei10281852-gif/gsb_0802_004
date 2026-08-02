@@ -78,14 +78,16 @@ export async function buildServer(opts: BuildServerOptions): Promise<FastifyInst
       subjectId,
       baselineSchema: body.baselineSchema ?? {},
       candidateSchema: body.candidateSchema ?? {},
-      submittedBy: String(body.submittedBy ?? 'unknown')
+      submittedBy: String(body.submittedBy ?? 'unknown'),
+      expectedPredecessorId: body.expectedPredecessorId ? String(body.expectedPredecessorId) : undefined
     });
     return reply.status(result.deduplicated ? 200 : 201).send({
       proposalId: result.proposal.proposalId,
       candidateDigest: result.proposal.candidateDigest,
       state: result.proposal.state,
       compat: result.proposal.compat,
-      deduplicated: result.deduplicated
+      deduplicated: result.deduplicated,
+      predecessorId: result.predecessorId
     });
   });
 

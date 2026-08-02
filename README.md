@@ -101,7 +101,7 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 
 ### 6. 因果记录与可解释性
 
-每个有意义的状态转移都写入**只增不改**的事件日志（`events` 表）：`subject.registered`、`proposal.submitted`、`proposal.superseded`、`evidence.applied`、`evidence.ignored`（含忽略原因）、`decision.committed`（含依据的豁免 id）、`waiver.requested`、`waiver.confirmed`、`waiver.rejected`、`waiver.revoked`、`waiver.expired`（含到期原因）。工作台底部实时展示该日志，`GET /api/events` 可按序号增量拉取。
+每个有意义的状态转移都写入**只增不改**的事件日志（`events` 表）：`subject.registered`、`proposal.submitted`（含 `predecessorId`）、`proposal.replaced`（前序被后继替代，含随之失效的豁免）、`proposal.superseded`、`evidence.applied`、`evidence.ignored`（含忽略原因）、`decision.committed`（含依据的豁免 id）、`waiver.requested`、`waiver.confirmed`、`waiver.rejected`、`waiver.revoked`、`waiver.expired`（含到期原因）、`waiver.lapsed`（因候选被替代而按原作用域失效）。工作台底部实时展示该日志，`GET /api/events` 可按序号增量拉取。
 
 ---
 
@@ -119,6 +119,21 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 - **历史快照保持原样**：决策时冻结的 `gateSnapshot` 记录了它**依据的具体豁免**（`appliedWaivers`）。此后该豁免到期或被撤销，只改变**实时**评估，**绝不**改动已经形成的历史快照与已决结论。证据指纹把「应用了哪些豁免」一并纳入，所以「凭豁免批准」与「无豁免批准」是两个不同的决策依据。
 
 豁免的完整生命周期（申请、复核、拒绝、撤销、到期原因）都写入因果审计链（见上一节的事件类型），并随 SQLite 重启完整恢复。
+
+---
+
+## 后继提案与谱系（上游修正候选）
+
+上游可能在等待期间修正候选契约。系统支持从当前提案创建**后继提案**，并展示清晰谱系：
+
+- **新内容 = 新摘要 = 新提案**：后继候选的内容不同，产生**新的候选摘要**（`digest.ts` 基于内容，天然不同）。它以独立提案存在，通过 `predecessorId` 显式链接到前序；工作台展示「后继自 …」/「已被后继替代 …」的谱系链，`proposal.replaced` 事件记录替代关系。
+- **旧证据不自动沿用**：构建证据以**前序提案的 `proposalId`** 存储，后继提案从零开始收集——不会继承任何 `PASS`。因此后继一提交即处于 `COLLECTING`，必须重新取证。
+- **上一轮豁免按原精确作用域失效**：前序被替代时，其 `REQUESTED`/`ACTIVE` 豁免统一转为终态 `LAPSED`（`waiver.lapsed` 审计）。由于豁免绑定**旧候选摘要**，即使后继有同名消费方缺席，旧豁免也**不因名称相同而被继承**——既因作用域不匹配，也因已 `LAPSED`。
+- **并发到达的旧结果仍归原提案，且不放行后继**：针对旧候选摘要的迟到 / 并发结果解析到那个（现为 `SUPERSEDED` 的）原提案，`applied=false` 存档（`evidence.ignored`，原因点明「已被后继替代」），**绝不**参与后继门禁——它甚至不指向后继的摘要。
+- **并发创建后继的保护**：`submitCandidate` 可携带 `expectedPredecessorId`。若当前开放提案已不是调用者所设想的那个（例如另一个后继先落地），提交被拒（`409 CONFLICT`），避免误替换了另一个候选。
+- **相同内容仍幂等**：重复提交同一内容（同摘要）仍返回既有提案，不产生并列提案。
+
+谱系、替代、豁免失效、迟到忽略都写入因果链并随 SQLite 重启完整恢复。
 
 ---
 
@@ -207,7 +222,7 @@ tests/
 | `GET  /api/health` | 健康检查 |
 | `POST /api/subjects` | 注册主题：`{ subjectId, requiredConsumers[], freshnessWindowMs }` |
 | `POST /api/analyze` | 无状态预览：`{ baselineSchema, candidateSchema }` → `{ candidateDigest, compat }` |
-| `POST /api/subjects/:id/candidates` | 提交候选：`{ baselineSchema, candidateSchema, submittedBy }` |
+| `POST /api/subjects/:id/candidates` | 提交候选 / 后继：`{ baselineSchema, candidateSchema, submittedBy, expectedPredecessorId? }`（相同内容幂等；不同内容则成为当前提案的后继） |
 | `POST /api/evidence` | 报送证据：`{ reportId, subjectId, targetDigest, consumerId, verdict, producedAt, detail? }` |
 | `POST /api/proposals/:id/decision` | 决策：`{ expectedDigest, expectedFingerprint?, environment?, type, decidedBy, note? }` |
 | `POST /api/waivers` | 申请豁免：`{ subjectId, candidateDigest, consumerId, environment?, compatDirection, reason, requestedBy, ttlMs }` |
@@ -239,5 +254,5 @@ tests/
 
 ## 测试与验证
 
-- `npm test`：54 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复，以及豁免：双人复核、精确作用域、绝不覆盖 FAIL、到期/撤销退出、决策快照不可变、审计链与重启恢复。
-- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景（含 `dual-controlled-waiver-covers-offline-consumer-then-expires` 与 `waiver-cannot-mask-a-fail`，全程逻辑时钟无真实等待），随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照。
+- `npm test`：60 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复；豁免：双人复核、精确作用域、绝不覆盖 FAIL、到期/撤销退出、决策快照不可变、审计链与重启恢复；后继提案：新摘要、证据不沿用、豁免按原作用域失效、并发旧结果不放行后继、`expectedPredecessorId` 冲突保护、替代/失效/迟到的因果记录与恢复。
+- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景（含 `dual-controlled-waiver-covers-offline-consumer-then-expires`、`waiver-cannot-mask-a-fail`、`successor-proposal-does-not-inherit-evidence-or-waivers`，全程逻辑时钟无真实等待），随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照。

@@ -58,6 +58,7 @@ export class SqliteRepository implements Repository {
         submitted_at INTEGER NOT NULL,
         submitted_by TEXT NOT NULL,
         decision_id TEXT,
+        predecessor_id TEXT,
         UNIQUE(subject_id, candidate_digest)
       );
       CREATE INDEX IF NOT EXISTS idx_proposals_subject ON proposals(subject_id);
@@ -160,10 +161,10 @@ export class SqliteRepository implements Repository {
       .prepare(
         `INSERT INTO proposals
           (proposal_id, subject_id, candidate_digest, baseline_schema, candidate_schema,
-           compat, state, seq, submitted_at, submitted_by, decision_id)
+           compat, state, seq, submitted_at, submitted_by, decision_id, predecessor_id)
          VALUES
           (@proposalId, @subjectId, @candidateDigest, @baseline, @candidate,
-           @compat, @state, @seq, @submittedAt, @submittedBy, @decisionId)`
+           @compat, @state, @seq, @submittedAt, @submittedBy, @decisionId, @predecessorId)`
       )
       .run({
         proposalId: rec.proposalId,
@@ -176,7 +177,8 @@ export class SqliteRepository implements Repository {
         seq: rec.seq,
         submittedAt: rec.submittedAt,
         submittedBy: rec.submittedBy,
-        decisionId: rec.decisionId
+        decisionId: rec.decisionId,
+        predecessorId: rec.predecessorId
       });
   }
 
@@ -466,6 +468,41 @@ export class SqliteRepository implements Repository {
     return tx();
   }
 
+  lapseWaiversForCandidate(subjectId: string, candidateDigest: string, at: number, reason: string): string[] {
+    // When a candidate is replaced, its still-open waivers (REQUESTED or ACTIVE)
+    // fall away with the old candidate. They are matched by their exact scope
+    // (subject + candidate digest), so a successor's fresh digest never keeps
+    // them alive. Terminal waivers are left untouched (idempotent).
+    const tx = this.db.transaction((): string[] => {
+      const open = this.db
+        .prepare(
+          "SELECT * FROM waivers WHERE subject_id = ? AND candidate_digest = ? AND status IN ('REQUESTED','ACTIVE')"
+        )
+        .all(subjectId, candidateDigest) as any[];
+      const ids: string[] = [];
+      for (const row of open) {
+        const w = rowToWaiver(row);
+        this.db
+          .prepare(
+            `UPDATE waivers SET status = 'LAPSED', closed_at = @at, end_reason = @reason
+             WHERE waiver_id = @id AND status IN ('REQUESTED','ACTIVE')`
+          )
+          .run({ id: w.waiverId, at, reason });
+        this.appendEvent('waiver.lapsed', at, { subjectId: w.subjectId }, {
+          waiverId: w.waiverId,
+          consumerId: w.consumerId,
+          environment: w.environment,
+          compatDirection: w.compatDirection,
+          candidateDigest,
+          reason
+        });
+        ids.push(w.waiverId);
+      }
+      return ids;
+    });
+    return tx();
+  }
+
   // --- events ---
   appendEvent(
     type: string,
@@ -525,7 +562,8 @@ function rowToProposal(row: any): ProposalRecord {
     seq: row.seq,
     submittedAt: row.submitted_at,
     submittedBy: row.submitted_by,
-    decisionId: row.decision_id
+    decisionId: row.decision_id,
+    predecessorId: row.predecessor_id ?? null
   };
 }
 

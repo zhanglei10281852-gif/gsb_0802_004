@@ -31,8 +31,8 @@ export class ControlCenterClient {
     return this.req('POST', '/api/subjects', input);
   }
 
-  submitCandidate(subjectId: string, input: { baselineSchema: unknown; candidateSchema: unknown; submittedBy: string }) {
-    return this.req<{ proposalId: string; candidateDigest: string; compat: any; deduplicated: boolean }>(
+  submitCandidate(subjectId: string, input: { baselineSchema: unknown; candidateSchema: unknown; submittedBy: string; expectedPredecessorId?: string }) {
+    return this.req<{ proposalId: string; candidateDigest: string; compat: any; deduplicated: boolean; predecessorId: string | null }>(
       'POST',
       `/api/subjects/${encodeURIComponent(subjectId)}/candidates`,
       input

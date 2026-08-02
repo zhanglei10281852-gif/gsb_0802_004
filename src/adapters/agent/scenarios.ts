@@ -35,6 +35,18 @@ const breakingCandidate = {
   required: ['id', 'currency']
 };
 
+// A corrected, still-compatible candidate distinct from `compatibleCandidate`
+// (different optional field) — used as a successor, so it has a new digest.
+const correctedCandidate = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    amount: { type: 'number' },
+    region: { type: 'string' }
+  },
+  required: ['id']
+};
+
 function digestOf(schema: unknown): string {
   return candidateDigest(schema);
 }
@@ -279,6 +291,56 @@ export function buildScenarios(): Scenario[] {
           kind: 'expect',
           description: 'still BLOCKED — a FAIL is never waived',
           check: (ctx) => expectSnapshotGate(ctx, 'risk-svc', (g) => g.status === 'BLOCKED' && !g.canApprove, 'fail-not-waived')
+        }
+      ]
+    },
+
+    // 9) Successor proposal: upstream corrects the candidate mid-wait. New
+    //    digest, no inherited evidence, prior waiver lapses by scope, and a
+    //    concurrent late result for the old candidate cannot release the
+    //    successor.
+    {
+      name: 'successor-proposal-does-not-inherit-evidence-or-waivers',
+      steps: [
+        { kind: 'registerSubject', subjectId: 'payments', requiredConsumers: ['ledger', 'audit'], freshnessWindowMs: 10_000_000 },
+        { kind: 'submitCandidate', subjectId: 'payments', baselineSchema: baseline, candidateSchema: compatibleCandidate, submittedBy: 'dev', as: 'v1' },
+        // v1: ledger passes; audit is offline, covered by a dual-confirmed waiver.
+        { kind: 'report', reportId: 'r-ledger-v1', subjectId: 'payments', targetRef: 'v1', consumerId: 'ledger', verdict: 'PASS', producedAt: 0 },
+        {
+          kind: 'requestWaiver', as: 'wv1', subjectId: 'payments', candidateRef: 'v1',
+          consumerId: 'audit', compatDirection: 'COMPATIBLE', reason: 'audit offline', requestedBy: 'alice', ttlMs: 100_000
+        },
+        { kind: 'confirmWaiver', waiverRef: 'wv1', confirmedBy: 'bob' },
+        {
+          kind: 'expect',
+          description: 'v1 READY (audit WAIVED)',
+          check: (ctx) => expectSnapshotGate(ctx, 'payments', (g) => g.status === 'READY', 'v1-ready')
+        },
+        // Upstream corrects the candidate -> successor v2 (new digest).
+        { kind: 'submitCandidate', subjectId: 'payments', baselineSchema: baseline, candidateSchema: correctedCandidate, submittedBy: 'dev', as: 'v2', expectedPredecessorRef: 'v1' },
+        {
+          kind: 'expect',
+          description: 'v2 is the current candidate, COLLECTING with no inherited evidence, and v1 waiver lapsed',
+          check: async (ctx) => {
+            const c1 = ctx.candidates.get('v1')!;
+            const c2 = ctx.candidates.get('v2')!;
+            if (c1.digest === c2.digest) throw new Error('successor must have a new digest');
+            const snap = await ctx.client.snapshot();
+            const subj = snap.body.subjects.find((s: any) => s.subject.subjectId === 'payments');
+            if (subj.current.proposal.proposalId !== c2.proposalId) throw new Error('v2 should be current');
+            if (subj.current.gate.status !== 'COLLECTING') throw new Error(`v2 should be COLLECTING, was ${subj.current.gate.status}`);
+            if (subj.current.gate.consumers.some((x: any) => x.status === 'WAIVED')) throw new Error('successor must not inherit a waiver');
+            if (subj.current.lineage.predecessorId !== c1.proposalId) throw new Error('v2 lineage must point at v1');
+            const wv = await ctx.client.getWaiver(ctx.waivers.get('wv1')!);
+            if (wv.body.status !== 'LAPSED') throw new Error(`v1 waiver should be LAPSED, was ${wv.body.status}`);
+          }
+        },
+        // A late/concurrent result for the OLD candidate arrives after replacement.
+        { kind: 'report', reportId: 'r-audit-v1-late', subjectId: 'payments', targetRef: 'v1', consumerId: 'audit', verdict: 'PASS', producedAt: 0 },
+        {
+          kind: 'expect',
+          description: 'late old result is ignored and does not release the successor',
+          check: (ctx) => expectSnapshotGate(ctx, 'payments', (g) => g.status === 'COLLECTING' && !g.canApprove, 'old-result-ignored')
         }
       ]
     }

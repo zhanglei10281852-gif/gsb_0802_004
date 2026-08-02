@@ -48,7 +48,8 @@ const WAIVER_COLORS: Record<string, string> = {
   ACTIVE: '#6a1b9a',
   REJECTED: '#b3261e',
   REVOKED: '#5f6368',
-  EXPIRED: '#5f6368'
+  EXPIRED: '#5f6368',
+  LAPSED: '#5f6368'
 };
 
 export default function App(): JSX.Element {
@@ -259,6 +260,18 @@ function CandidatePanel({
       <div style={{ fontSize: 11, color: '#5f6368', marginTop: 4 }}>
         证据指纹 <code>{gate.evidenceFingerprint.slice(0, 26)}…</code>
       </div>
+
+      {(view.lineage.predecessorId || view.lineage.successorId) && (
+        <div style={{ fontSize: 11, color: '#5f6368', marginTop: 4 }}>
+          谱系：
+          {view.lineage.predecessorId && (
+            <> 后继自 <code title={view.lineage.predecessorId}>{view.lineage.predecessorDigest?.slice(0, 16)}…</code>（前序提案，证据/豁免不沿用）</>
+          )}
+          {view.lineage.successorId && (
+            <> · 已被后继替代 <code title={view.lineage.successorId}>{view.lineage.successorDigest?.slice(0, 16)}…</code></>
+          )}
+        </div>
+      )}
 
       <h4 style={{ margin: '12px 0 4px', fontSize: 13 }}>依赖消费方与证据新鲜度</h4>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>

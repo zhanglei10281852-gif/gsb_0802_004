@@ -97,9 +97,13 @@ export interface WaiverScope {
  * - REJECTED:  a second reviewer declined it; never participated.
  * - REVOKED:   an active waiver was withdrawn; stops participating immediately.
  * - EXPIRED:   its time limit passed; stops participating.
- * REJECTED / REVOKED / EXPIRED are terminal and never re-enter evaluation.
+ * - LAPSED:    the proposal it was scoped to was replaced by a successor
+ *              candidate; the waiver falls away with the old candidate and is
+ *              never inherited by the successor.
+ * REJECTED / REVOKED / EXPIRED / LAPSED are terminal and never re-enter
+ * evaluation.
  */
-export type WaiverStatus = 'REQUESTED' | 'ACTIVE' | 'REJECTED' | 'REVOKED' | 'EXPIRED';
+export type WaiverStatus = 'REQUESTED' | 'ACTIVE' | 'REJECTED' | 'REVOKED' | 'EXPIRED' | 'LAPSED';
 
 /**
  * An active waiver as seen by the pure gate. The gate is told only what it

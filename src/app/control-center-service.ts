@@ -42,12 +42,22 @@ export interface SubmitCandidateInput {
   baselineSchema: JsonSchema;
   candidateSchema: JsonSchema;
   submittedBy: string;
+  /**
+   * Optional optimistic-concurrency guard for creating a successor: the id of
+   * the OPEN proposal the caller believes they are correcting. If given and it
+   * no longer matches the current open proposal (e.g. a rival successor landed
+   * first), the submit is rejected instead of silently replacing a different
+   * candidate.
+   */
+  expectedPredecessorId?: string;
 }
 
 export interface SubmitCandidateResult {
   proposal: ProposalRecord;
   /** True if an identical candidate already existed (idempotent submit). */
   deduplicated: boolean;
+  /** The predecessor this proposal replaced, if it was created as a successor. */
+  predecessorId: string | null;
 }
 
 export interface ReportEvidenceInput {
@@ -112,6 +122,13 @@ export interface ProposalView {
   decision: DecisionRecord | null;
   /** All waivers ever raised for this candidate (any status), for audit. */
   waivers: WaiverRecord[];
+  /** Lineage: the proposal this one succeeded, and the one that succeeded it. */
+  lineage: {
+    predecessorId: string | null;
+    predecessorDigest: string | null;
+    successorId: string | null;
+    successorDigest: string | null;
+  };
 }
 
 export class ControlCenterService {
@@ -162,15 +179,41 @@ export class ControlCenterService {
       // instead of creating a rival proposal for identical content.
       const existing = this.repo.getProposalByDigest(input.subjectId, digest);
       if (existing) {
-        return { proposal: existing, deduplicated: true };
+        return { proposal: existing, deduplicated: true, predecessorId: existing.predecessorId };
       }
 
-      // A new distinct candidate supersedes the current OPEN proposal, if any.
-      // This is what makes "the current proposal" a well-defined target and
-      // lets us reject late evidence for older candidates.
+      // A new distinct candidate becomes the SUCCESSOR of the current OPEN
+      // proposal, if any. This is what makes "the current proposal" a
+      // well-defined target, lets us reject late evidence for older candidates,
+      // and records an explicit lineage link.
       const open = this.repo.getOpenProposal(input.subjectId);
+
+      // Optimistic concurrency: if the caller named the predecessor they meant
+      // to correct, refuse when reality has moved on (a rival successor won).
+      if (input.expectedPredecessorId !== undefined && open?.proposalId !== input.expectedPredecessorId) {
+        throw new ServiceError(
+          'CONFLICT',
+          `expected to succeed proposal "${input.expectedPredecessorId}" but the current open proposal is "${open?.proposalId ?? '<none>'}"`
+        );
+      }
+
       if (open) {
+        // The predecessor is closed to further release, its build evidence stays
+        // bound to it (never carried forward — the successor has a new digest),
+        // and its still-open waivers lapse by their exact scope so nothing is
+        // inherited by name.
         this.repo.markSuperseded(open.proposalId, now);
+        const lapsed = this.repo.lapseWaiversForCandidate(
+          open.subjectId,
+          open.candidateDigest,
+          now,
+          `predecessor ${open.proposalId} replaced by successor`
+        );
+        this.repo.appendEvent('proposal.replaced', now, { subjectId: input.subjectId, proposalId: open.proposalId }, {
+          predecessorId: open.proposalId,
+          predecessorDigest: open.candidateDigest,
+          lapsedWaivers: lapsed
+        });
       }
 
       const compat = analyzeCompatibility(input.baselineSchema, input.candidateSchema);
@@ -186,15 +229,16 @@ export class ControlCenterService {
         seq,
         submittedAt: now,
         submittedBy: input.submittedBy,
-        decisionId: null
+        decisionId: null,
+        predecessorId: open?.proposalId ?? null
       };
       this.repo.insertProposal(proposal);
       this.repo.appendEvent('proposal.submitted', now, { subjectId: input.subjectId, proposalId: proposal.proposalId }, {
         candidateDigest: digest,
         compat: compat.result,
-        supersededOpen: open?.proposalId ?? null
+        predecessorId: open?.proposalId ?? null
       });
-      return { proposal, deduplicated: false };
+      return { proposal, deduplicated: false, predecessorId: open?.proposalId ?? null };
     });
   }
 
@@ -246,7 +290,14 @@ export class ControlCenterService {
         ignoredReason = `no candidate with digest ${input.targetDigest} for subject`;
         proposalIdForRow = SENTINEL_PROPOSAL;
       } else if (targetProposal.state !== 'OPEN') {
-        ignoredReason = `candidate is ${targetProposal.state}, not the current open proposal`;
+        // A result for an older candidate (now SUPERSEDED, or already decided).
+        // It stays attributed to that original proposal for the audit trail and
+        // is never applied — a late/concurrent old result can never release a
+        // successor, whose digest it does not even name.
+        ignoredReason =
+          targetProposal.state === 'SUPERSEDED'
+            ? `candidate was replaced by a successor (proposal is SUPERSEDED); result stays with the original proposal and does not release the successor`
+            : `candidate is ${targetProposal.state}, not the current open proposal`;
         proposalIdForRow = targetProposal.proposalId;
       } else if (!subject.requiredConsumers.includes(input.consumerId)) {
         // Unknown consumer for this subject: recorded for audit, never counts.
@@ -539,7 +590,20 @@ export class ControlCenterService {
     const gate = this.evaluateProposalGate(proposal, subject.requiredConsumers, subject.freshnessWindowMs, environment);
     const decision = proposal.decisionId ? this.repo.getDecision(proposal.decisionId) ?? null : null;
     const waivers = this.repo.listWaiversForCandidate(proposal.subjectId, proposal.candidateDigest);
-    return { proposal, gate, decision, waivers };
+
+    // Lineage: resolve the predecessor and the successor (the proposal that
+    // named this one as its predecessor), so the workbench can show the chain.
+    const predecessor = proposal.predecessorId ? this.repo.getProposal(proposal.predecessorId) : undefined;
+    const successor = this.repo
+      .listProposals(proposal.subjectId)
+      .find((p) => p.predecessorId === proposal.proposalId);
+    const lineage = {
+      predecessorId: proposal.predecessorId,
+      predecessorDigest: predecessor?.candidateDigest ?? null,
+      successorId: successor?.proposalId ?? null,
+      successorDigest: successor?.candidateDigest ?? null
+    };
+    return { proposal, gate, decision, waivers, lineage };
   }
 
   /**
@@ -553,7 +617,7 @@ export class ControlCenterService {
     subjects: Array<{
       subject: ReturnType<Repository['getSubject']>;
       current: ProposalView | null;
-      history: Array<{ proposalId: string; digest: string; state: string; seq: number; decision: DecisionRecord | null }>;
+      history: Array<{ proposalId: string; digest: string; state: string; seq: number; predecessorId: string | null; decision: DecisionRecord | null }>;
     }>;
     eventSeq: number;
   } {
@@ -575,6 +639,7 @@ export class ControlCenterService {
           digest: p.candidateDigest,
           state: p.state,
           seq: p.seq,
+          predecessorId: p.predecessorId,
           decision: p.decisionId ? this.repo.getDecision(p.decisionId) ?? null : null
         }));
       return { subject, current, history };
@@ -657,7 +722,8 @@ export class ControlCenterService {
         seq: 0,
         submittedAt: now,
         submittedBy: 'system',
-        decisionId: null
+        decisionId: null,
+        predecessorId: null
       });
     }
     this.sentinelEnsured = true;
