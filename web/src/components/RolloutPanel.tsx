@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, fmtTime, type Proposal, type Rollout, type Wave } from '../api';
+import { api, fmtTime, type Proposal, type Rollout, type Wave, type CoverageGap } from '../api';
 
 interface Props {
   proposal: Proposal;
@@ -97,6 +97,12 @@ export function RolloutPanel({ proposal, rollout, onChanged }: Props) {
     });
   };
 
+  const openGaps = rollout?.coverageGaps.filter((g) => g.status === 'open') ?? [];
+  const hasOpenGaps = openGaps.length > 0;
+  const isCoveragePaused = rollout?.status === 'paused' && rollout.pauseReason === 'coverage_gap';
+  const canResume = rollout?.status === 'paused' && !hasOpenGaps;
+  const activeWaves = rollout?.status === 'in_progress' || rollout?.status === 'paused' || rollout?.status === 'failed';
+
   return (
     <div className="card">
       <div className="flex-row" style={{ justifyContent: 'space-between' }}>
@@ -141,11 +147,37 @@ export function RolloutPanel({ proposal, rollout, onChanged }: Props) {
       {rollout && (
         <>
           <div className="muted" style={{ fontSize: 12, margin: '8px 0' }}>
-            status: <strong>{rollout.status}</strong> · decision <span className="mono">{rollout.decisionId.slice(0, 8)}</span> ·
+            status: <strong>{rollout.status}</strong>
+            {rollout.pauseReason && (
+              <> · pause: <span className="badge" style={{ fontSize: 10 }}>{rollout.pauseReason}</span></>
+            )}
+            {' · '}decision <span className="mono">{rollout.decisionId.slice(0, 8)}</span> ·
             candidate <span className="mono">{rollout.candidateHash.slice(0, 10)}</span>
             {rollout.previousVersion && <> · previous: {rollout.previousVersion}</>}
             {rollout.rolledBackTo && <> · rolled back to <strong>{rollout.rolledBackTo}</strong> at {fmtTime(rollout.rolledBackAt!)}</>}
           </div>
+
+          {isCoveragePaused && (
+            <div className="blocking-list" style={{ marginTop: 6, marginBottom: 6 }}>
+              <li>
+                <strong>Auto-paused due to coverage gap.</strong>{' '}
+                {hasOpenGaps
+                  ? `New consumer(s) joined after the decision was frozen: ${openGaps.map((g) => g.consumerId).join(', ')}. Their re-verification must be recorded before the next wave can start.`
+                  : 'All coverage gaps resolved; the rollout can be resumed.'}
+              </li>
+            </div>
+          )}
+
+          {rollout.coverageGaps.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+                Coverage gaps (dependency topology changes after the decision snapshot was frozen)
+              </div>
+              {rollout.coverageGaps.map((g) => (
+                <GapRow key={g.id} gap={g} rolloutId={rollout.id} onChanged={onChanged} disabled={busy} setBusy={setBusy} setError={setError} />
+              ))}
+            </div>
+          )}
 
           <div className="consumer-grid">
             {rollout.waves.map((w) => (
@@ -153,7 +185,7 @@ export function RolloutPanel({ proposal, rollout, onChanged }: Props) {
             ))}
           </div>
 
-          {(rollout.status === 'in_progress' || rollout.status === 'paused' || rollout.status === 'failed') && (
+          {activeWaves && (
             <div style={{ background: 'var(--panel-2)', padding: 12, borderRadius: 6, marginTop: 10 }}>
               <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
                 Adapter receipt (duplicate/out-of-order receipts are idempotent and bound to this decision snapshot)
@@ -186,7 +218,11 @@ export function RolloutPanel({ proposal, rollout, onChanged }: Props) {
               <div className="actions">
                 <button className="primary" onClick={report} disabled={busy}>Send receipt</button>
                 {rollout.status === 'in_progress' && <button onClick={pause} disabled={busy}>Pause</button>}
-                {rollout.status === 'paused' && <button onClick={resume} disabled={busy}>Resume</button>}
+                {rollout.status === 'paused' && (
+                  <button onClick={resume} disabled={busy || !canResume} title={hasOpenGaps ? 'Resolve all coverage gaps first' : ''}>
+                    Resume
+                  </button>
+                )}
                 {rollout.status !== 'rolled_back' && (
                   <>
                     <input
@@ -199,13 +235,92 @@ export function RolloutPanel({ proposal, rollout, onChanged }: Props) {
                   </>
                 )}
               </div>
+              {hasOpenGaps && rollout.status === 'paused' && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+                  Resume is blocked until {openGaps.length} open coverage gap(s) are resolved below.
+                </div>
+              )}
             </div>
           )}
 
           <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
             Rollback points deployment at the previous known version but never changes the contract decision or revives voided exemptions.
+            Coverage gaps freeze not-yet-started waves; the already-frozen decision snapshot is never modified.
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+function GapRow({
+  gap,
+  rolloutId,
+  onChanged,
+  disabled,
+  setBusy,
+  setError,
+}: {
+  gap: CoverageGap;
+  rolloutId: string;
+  onChanged: () => void;
+  disabled: boolean;
+  setBusy: (v: boolean) => void;
+  setError: (e: string | null) => void;
+}) {
+  const [verdict, setVerdict] = useState<'compatible' | 'incompatible' | 'error'>('compatible');
+  const [details, setDetails] = useState('');
+  const [vKey] = useState(() => `verify-${Math.random().toString(36).slice(2, 8)}`);
+  const isOpen = gap.status === 'open';
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.verifyCoverageGap(rolloutId, {
+        consumerId: gap.consumerId,
+        verdict,
+        details,
+        idempotencyKey: vKey,
+      });
+      onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="consumer-row" style={{ borderColor: isOpen ? 'var(--warn, #b58105)' : 'var(--ok, #389e0d)' }}>
+      <div>
+        <div className="name">
+          {gap.consumerId}
+          <span className={`badge ${isOpen ? 'paused' : gap.status === 'resolved_compatible' ? 'succeeded' : 'failed'}`} style={{ marginLeft: 8 }}>
+            {gap.status}
+          </span>
+        </div>
+        <div className="cid mono">
+          detected {fmtTime(gap.detectedAt)}
+          {gap.verdict && <> · verdict: {gap.verdict}</>}
+        </div>
+        {gap.details && <div className="cid">{gap.details}</div>}
+      </div>
+      {isOpen && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          <select value={verdict} onChange={(e) => setVerdict(e.target.value as typeof verdict)} style={{ fontSize: 12 }}>
+            <option value="compatible">compatible</option>
+            <option value="incompatible">incompatible</option>
+            <option value="error">error</option>
+          </select>
+          <input
+            placeholder="details"
+            value={details}
+            onChange={(e) => setDetails(e.target.value)}
+            style={{ width: 160, fontSize: 12 }}
+          />
+          <button onClick={submit} disabled={disabled} style={{ padding: '2px 10px' }}>Verify</button>
+        </div>
       )}
     </div>
   );

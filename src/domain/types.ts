@@ -1,10 +1,16 @@
-export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'superseded';
+export type ProposalStatus = "pending" | "approved" | "rejected" | "superseded";
 
-export type EvidenceVerdict = 'compatible' | 'incompatible' | 'error';
+export type EvidenceVerdict = "compatible" | "incompatible" | "error";
 
-export type ExemptionStatus = 'pending' | 'active' | 'rejected' | 'revoked' | 'expired' | 'voided';
+export type ExemptionStatus =
+  | "pending"
+  | "active"
+  | "rejected"
+  | "revoked"
+  | "expired"
+  | "voided";
 
-export type ExemptionDirection = 'compatible' | 'incompatible';
+export type ExemptionDirection = "compatible" | "incompatible";
 
 export interface Consumer {
   id: string;
@@ -72,7 +78,7 @@ export interface Proposal {
 export interface Decision {
   id: string;
   proposalId: string;
-  decision: 'approved' | 'rejected';
+  decision: "approved" | "rejected";
   reason: string;
   snapshot: DecisionSnapshot;
   decidedAt: number;
@@ -155,11 +161,46 @@ export interface ExemptionRequest {
   validUntil: number;
 }
 
-export type WaveStatus = 'pending' | 'in_progress' | 'succeeded' | 'failed' | 'paused' | 'rolled_back';
+export type WaveStatus =
+  | "pending"
+  | "in_progress"
+  | "succeeded"
+  | "failed"
+  | "paused"
+  | "rolled_back";
 
-export type RolloutStatus = 'not_started' | 'in_progress' | 'paused' | 'succeeded' | 'failed' | 'rolled_back';
+export type RolloutStatus =
+  | "not_started"
+  | "in_progress"
+  | "paused"
+  | "succeeded"
+  | "failed"
+  | "rolled_back";
 
-export type ReceiptResult = 'success' | 'failure' | 'unknown';
+export type ReceiptResult = "success" | "failure" | "unknown";
+
+export type PauseReason = "manual" | "coverage_gap" | null;
+
+export type CoverageGapStatus =
+  | "open"
+  | "resolved_compatible"
+  | "resolved_incompatible";
+
+export interface CoverageGap {
+  id: string;
+  rolloutId: string;
+  proposalId: string;
+  candidateHash: string;
+  decisionId: string;
+  consumerId: string;
+  status: CoverageGapStatus;
+  detectedAt: number;
+  resolvedAt: number | null;
+  verdict: EvidenceVerdict | null;
+  details: string | null;
+  idempotencyKey: string | null;
+  recordedAt: number | null;
+}
 
 export interface WaveSpec {
   sequence: number;
@@ -206,36 +247,42 @@ export interface Rollout {
   previousVersion: string | null;
   rolledBackTo: string | null;
   rolledBackAt: number | null;
+  pauseReason: PauseReason;
+  coverageGaps: CoverageGap[];
   createdAt: number;
   updatedAt: number;
 }
 
 export type CausalEventType =
-  | 'proposal_created'
-  | 'proposal_superseded'
-  | 'successor_created'
-  | 'consumer_registered'
-  | 'evidence_accepted'
-  | 'evidence_received_late'
-  | 'evidence_rejected'
-  | 'decision_made'
-  | 'exemption_requested'
-  | 'exemption_confirmed'
-  | 'exemption_rejected'
-  | 'exemption_revoked'
-  | 'exemption_expired'
-  | 'exemption_voided'
-  | 'rollout_started'
-  | 'wave_started'
-  | 'wave_receipt'
-  | 'wave_succeeded'
-  | 'wave_failed'
-  | 'rollout_succeeded'
-  | 'rollout_failed'
-  | 'rollout_paused'
-  | 'rollout_resumed'
-  | 'wave_retried'
-  | 'rollout_rolled_back';
+  | "proposal_created"
+  | "proposal_superseded"
+  | "successor_created"
+  | "consumer_registered"
+  | "evidence_accepted"
+  | "evidence_received_late"
+  | "evidence_rejected"
+  | "decision_made"
+  | "exemption_requested"
+  | "exemption_confirmed"
+  | "exemption_rejected"
+  | "exemption_revoked"
+  | "exemption_expired"
+  | "exemption_voided"
+  | "rollout_started"
+  | "wave_started"
+  | "wave_receipt"
+  | "wave_succeeded"
+  | "wave_failed"
+  | "rollout_succeeded"
+  | "rollout_failed"
+  | "rollout_paused"
+  | "rollout_resumed"
+  | "wave_retried"
+  | "rollout_rolled_back"
+  | "coverage_gap_detected"
+  | "rollout_auto_paused_coverage"
+  | "reverification_recorded"
+  | "coverage_gap_resolved";
 
 export interface CausalEvent {
   id: number;

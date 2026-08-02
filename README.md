@@ -16,13 +16,13 @@ Then open http://127.0.0.1:3000. The SQLite database is created at `dist/data/cc
 
 Other fixed entry points:
 
-| Command | What it does |
-| --- | --- |
-| `npm install` | Installs dependencies |
-| `npm test` | Runs the Vitest unit suite (domain + storage guarantees) |
-| `npm run build` | Compiles the TypeScript server and builds the React UI into `dist/` |
-| `npm start` | Starts the compiled server and serves the built workbench |
-| `npm run e2e` | Builds everything, spawns the real server, runs the scripted agent simulator against it (including a process restart), and asserts all invariants |
+| Command         | What it does                                                                                                                                      |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm install`   | Installs dependencies                                                                                                                             |
+| `npm test`      | Runs the Vitest unit suite (domain + storage guarantees)                                                                                          |
+| `npm run build` | Compiles the TypeScript server and builds the React UI into `dist/`                                                                               |
+| `npm start`     | Starts the compiled server and serves the built workbench                                                                                         |
+| `npm run e2e`   | Builds everything, spawns the real server, runs the scripted agent simulator against it (including a process restart), and asserts all invariants |
 
 Environment variables: `CCC_PORT` (default 3000), `CCC_HOST` (default 127.0.0.1), `CCC_DB_PATH`, `CCC_WEB_ROOT`, `CCC_LOG=1` for request logging.
 
@@ -60,6 +60,7 @@ When a decision is made, the system stores a full snapshot of the proposal, all 
 Each evidence submission carries an `idempotencyKey`. The same key retried for the same `(proposal, consumer)` is a no-op and returns the original record (`deduped: true`). A genuinely new key updates that consumer's latest evidence while pending. This collapses duplicate retries, dropped responses, and "wrote the DB then crashed before replying" into exactly one effective write.
 
 Late results are quarantined:
+
 - Unknown consumer id → rejected.
 - `candidateHash` not equal to the proposal hash → rejected (old candidate / wrong proposal).
 - Proposal already decided → rejected.
@@ -83,11 +84,11 @@ The web workbench connects to `/api/stream` (SSE). On every (re)connection the s
 A consumer that is temporarily offline during a release window can be waived, but the waiver is deliberately narrow:
 
 - **Scoped** — an exemption binds exactly one `(candidateHash, consumerId, environment, direction)`. It cannot cover a different candidate, a different environment, or a different compatibility direction.
-- **Two reviewers** — a reviewer (the requester) files the exemption; a *different* reviewer must confirm it before it becomes `active`. Self-confirmation is rejected with HTTP 409. Pending exemptions do not affect the gate.
+- **Two reviewers** — a reviewer (the requester) files the exemption; a _different_ reviewer must confirm it before it becomes `active`. Self-confirmation is rejected with HTTP 409. Pending exemptions do not affect the gate.
 - **Time-limited** — each exemption has `validFrom`/`validUntil`. Once `validUntil` passes it is swept to `expired` (on the next read/decision/clock advance) and stops participating in new decisions. It can also be `revoked` at any time. Expiry and revocation are recorded as causal events.
 - **Does not dilute the candidate summary** — an exemption never changes the candidate hash or the system compatibility result. A breaking schema is still blocked by the system check even if every consumer is exempted.
 - **Does not override real evidence** — if a consumer actually reports `incompatible`, that verdict blocks the gate regardless of any exemption.
-- **Frozen in the decision snapshot** — when a decision is made, every applied exemption is copied into the immutable `DecisionSnapshot` (requester, confirmer, window, reason). Later expiry or revocation changes the exemption row for *future* decisions but never mutates the historical snapshot. A new proposal after an exemption expired sees the gate blocked again.
+- **Frozen in the decision snapshot** — when a decision is made, every applied exemption is copied into the immutable `DecisionSnapshot` (requester, confirmer, window, reason). Later expiry or revocation changes the exemption row for _future_ decisions but never mutates the historical snapshot. A new proposal after an exemption expired sees the gate blocked again.
 
 Exemption lifecycle events (`exemption_requested`, `exemption_confirmed`, `exemption_rejected`, `exemption_revoked`, `exemption_expired`) are appended to the same causal audit chain as proposals, evidence, and decisions.
 
@@ -103,7 +104,7 @@ When upstream revises a candidate while a proposal is still waiting, a release m
 - The parent is atomically flipped to `superseded` and can no longer be approved or rejected; its gate never reports ready.
 - The successor starts with **zero evidence**. Build evidence is bound to `proposal_id`, so the parent's evidence is never inherited — a consumer must verify the new candidate.
 - All **open exemptions** for the parent's candidate hash are set to `voided` (recorded as `exemption_voided` events). Even though the consumer name and environment may be identical, an exemption is scoped to the exact candidate hash and therefore cannot carry over. A fresh dual-reviewed exemption is required for the successor.
-- If a build agent that was still running against the old candidate reports back after the successor is created, the result is accepted onto the **superseded parent** (flagged `late: true` and recorded as `evidence_received_late`) for audit. It never lands on the successor and cannot unblock it. A report submitted to the successor with the *old* candidate hash is rejected with HTTP 409.
+- If a build agent that was still running against the old candidate reports back after the successor is created, the result is accepted onto the **superseded parent** (flagged `late: true` and recorded as `evidence_received_late`) for audit. It never lands on the successor and cannot unblock it. A report submitted to the successor with the _old_ candidate hash is rejected with HTTP 409.
 - The full replacement is captured as `proposal_superseded` and `successor_created` causal events. Lineage (parent, revision, successors) survives process restart because it is stored in SQLite.
 
 The workbench shows a lineage strip (parent → current → successors), a "Create revised proposal" form for pending proposals without successors, a `superseded` badge, and a `late` badge on evidence received after supersession.
@@ -123,6 +124,19 @@ Once a proposal is approved, a release owner can connect it to a phased deployme
 - **Persistence and recovery** — rollouts, waves, and receipts are stored in SQLite with `UNIQUE(rollout_id, sequence)` and `UNIQUE(wave_id, idempotency_key)` constraints. Wave status, attempt counts, and rollout state survive a process kill and restart; the adapter can resume by querying `GET /api/rollouts/:id` and retrying with the same idempotency key.
 
 The workbench shows a rollout panel for approved proposals: a start form (default canary → staging → production waves), per-wave status badges and attempt counts, an adapter receipt form with a rotating idempotency key, retry on failed waves, pause/resume, and a rollback control.
+
+### Coverage gaps (dependency topology changes during rollout)
+
+If a new consumer registers after the contract decision was frozen — meaning it was not in the `DecisionSnapshot.requiredConsumerIds` — the rollout detects a **coverage gap**:
+
+- The historical decision snapshot is **never modified**. The new consumer is not retroactively added; `requiredConsumerIds`, evidence, and applied exemptions remain exactly as they were at decision time.
+- A `coverage_gap_detected` causal event is recorded, linked to the same `proposalId`/`lineageRootId`. The rollout is **auto-paused** (`pauseReason = 'coverage_gap'`), and **not-yet-started waves are held**.
+- The wave already in flight stays `in_progress` — an adapter receipt that was already dispatched is accepted deterministically. On success, that wave is marked `succeeded` but the next wave does **not** start; the rollout remains paused until the gap is resolved. On failure, the rollout halts as usual.
+- To resolve a gap, the new consumer (or its build agent) submits a **re-verification** (`POST /api/rollouts/:id/verify`) with a verdict (`compatible`/`incompatible`/`error`), details, and an idempotency key. A `compatible` verdict resolves the gap; the rollout can then be manually resumed. An `incompatible`/`error` verdict resolves the gap as negative and fails the rollout.
+- **Deterministic concurrency:** because every mutation runs in a single SQLite `BEGIN IMMEDIATE` transaction, the race between an in-flight receipt and a topology change has one serialized outcome: either the receipt commits first (wave advances, then the gap pauses before the next wave) or the gap commits first (the current wave still accepts its receipt, but no further wave starts). In both cases no wave is skipped and no receipt is silently lost.
+- All gap detection, auto-pause, re-verification, and resolution events (`coverage_gap_detected`, `rollout_auto_paused_coverage`, `reverification_recorded`, `coverage_gap_resolved`) are appended to the causal audit chain and survive process restart from SQLite.
+
+The workbench displays each gap with its consumer, detection time, resolution status, and a verification form. A banner explains why the rollout is paused and which consumers must verify before resume is enabled.
 
 ## Architecture
 
@@ -145,31 +159,32 @@ test/              Vitest unit tests
 
 ## HTTP API
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/api/health` | Liveness |
-| GET/POST | `/api/consumers` | List / register consumers |
-| GET/POST | `/api/proposals` | List / submit `{candidateSchema, baselineSchema, environment?}` |
-| GET | `/api/proposals/:id` | Detail with evidence, exemptions, gate state, blocking reasons, decision |
-| POST | `/api/proposals/:id/evidence` | Agent report `{consumerId, candidateHash, verdict, details, idempotencyKey}` |
-| POST | `/api/proposals/:id/decision` | `{action: "approve"|"reject", reason}` |
-| POST | `/api/proposals/:id/successor` | Create a revised candidate; supersedes the parent, voids its exemptions |
-| GET | `/api/proposals/:id/lineage` | Full revision chain by lineage root |
-| GET/POST | `/api/proposals/:id/rollout` | Get / start a phased rollout (`{waves:[{sequence,environment}], previousVersion?}`) |
-| GET | `/api/rollouts/:id` | Rollout state with all waves |
-| POST | `/api/rollouts/:id/receipt` | Adapter receipt `{sequence, result, adapterId, idempotencyKey, message?}` |
-| POST | `/api/rollouts/:id/pause` | Pause an in-progress rollout (`{reason?}`) |
-| POST | `/api/rollouts/:id/resume` | Resume a paused rollout |
-| POST | `/api/rollouts/:id/retry` | Retry a failed wave (`{sequence}`) |
-| POST | `/api/rollouts/:id/rollback` | Roll back to a previous known version (`{targetVersion, reason?}`) |
-| GET/POST | `/api/exemptions?candidateHash=` | List / request a dual-reviewed, time-limited exemption |
-| POST | `/api/exemptions/:id/confirm` | Second reviewer confirms (`{confirmerId}`, must differ from requester) |
-| POST | `/api/exemptions/:id/reject` | Reject a pending exemption (`{reviewerId, note}`) |
-| POST | `/api/exemptions/:id/revoke` | Revoke an active exemption (`{reviewerId, note}`) |
-| GET | `/api/snapshot` | Full state snapshot (consumers + exemptions + proposal details + events) |
-| GET | `/api/causal-events` | Append-only causal log |
-| GET | `/api/stream` | Server-Sent Events: snapshot on connect, then causal events |
-| POST | `/api/test/clock/advance` | Test-only: advance virtual clock (`{ms}`); only when `CCC_CLOCK=virtual` |
+| Method   | Path                             | Purpose                                                                                           |
+| -------- | -------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------ |
+| GET      | `/api/health`                    | Liveness                                                                                          |
+| GET/POST | `/api/consumers`                 | List / register consumers                                                                         |
+| GET/POST | `/api/proposals`                 | List / submit `{candidateSchema, baselineSchema, environment?}`                                   |
+| GET      | `/api/proposals/:id`             | Detail with evidence, exemptions, gate state, blocking reasons, decision                          |
+| POST     | `/api/proposals/:id/evidence`    | Agent report `{consumerId, candidateHash, verdict, details, idempotencyKey}`                      |
+| POST     | `/api/proposals/:id/decision`    | `{action: "approve"                                                                               | "reject", reason}` |
+| POST     | `/api/proposals/:id/successor`   | Create a revised candidate; supersedes the parent, voids its exemptions                           |
+| GET      | `/api/proposals/:id/lineage`     | Full revision chain by lineage root                                                               |
+| GET/POST | `/api/proposals/:id/rollout`     | Get / start a phased rollout (`{waves:[{sequence,environment}], previousVersion?}`)               |
+| GET      | `/api/rollouts/:id`              | Rollout state with all waves                                                                      |
+| POST     | `/api/rollouts/:id/receipt`      | Adapter receipt `{sequence, result, adapterId, idempotencyKey, message?}`                         |
+| POST     | `/api/rollouts/:id/pause`        | Pause an in-progress rollout (`{reason?}`)                                                        |
+| POST     | `/api/rollouts/:id/resume`       | Resume a paused rollout                                                                           |
+| POST     | `/api/rollouts/:id/retry`        | Retry a failed wave (`{sequence}`)                                                                |
+| POST     | `/api/rollouts/:id/rollback`     | Roll back to a previous known version (`{targetVersion, reason?}`)                                |
+| POST     | `/api/rollouts/:id/verify`       | Re-verification for a coverage gap (`{consumerId, verdict, details, idempotencyKey, adapterId?}`) |
+| GET/POST | `/api/exemptions?candidateHash=` | List / request a dual-reviewed, time-limited exemption                                            |
+| POST     | `/api/exemptions/:id/confirm`    | Second reviewer confirms (`{confirmerId}`, must differ from requester)                            |
+| POST     | `/api/exemptions/:id/reject`     | Reject a pending exemption (`{reviewerId, note}`)                                                 |
+| POST     | `/api/exemptions/:id/revoke`     | Revoke an active exemption (`{reviewerId, note}`)                                                 |
+| GET      | `/api/snapshot`                  | Full state snapshot (consumers + exemptions + proposal details + events)                          |
+| GET      | `/api/causal-events`             | Append-only causal log                                                                            |
+| GET      | `/api/stream`                    | Server-Sent Events: snapshot on connect, then causal events                                       |
+| POST     | `/api/test/clock/advance`        | Test-only: advance virtual clock (`{ms}`); only when `CCC_CLOCK=virtual`                          |
 
 ## Fault recovery boundaries
 
@@ -181,7 +196,9 @@ test/              Vitest unit tests
 - **Exemption expiry/revocation after a decision:** the exemption row changes status for future decisions, but the `appliedExemptions` already frozen inside the decision snapshot are never altered.
 - **Duplicate/lost adapter receipts:** the `(wave_id, idempotency_key)` unique constraint collapses retries; a crash-after-write before the HTTP response is resolved by retrying with the same key (returns the stored receipt, no double advance). Out-of-order receipts for a non-current wave are rejected.
 - **Rollback:** rollback marks unfinished waves `rolled_back` and records the target version, but never mutates the `decisions` row, the proposal's `approved` status, or any exemption (voided exemptions stay voided).
-- **Process restart mid-rollout:** wave status, attempt counts, receipts, and rollout status are all in SQLite; after restart the adapter queries the rollout, finds the current wave, and resumes. A paused rollout stays paused.
+- **Process restart mid-rollout:** wave status, attempt counts, receipts, coverage gaps, and rollout status are all in SQLite; after restart the adapter queries the rollout, finds the current wave, and resumes. A paused rollout stays paused; resolved gaps stay resolved.
+- **Topology change during rollout (coverage gap):** a new consumer registration in the same SQLite transaction creates a gap and auto-pauses the rollout. The in-flight wave's receipt is still accepted (deterministic serialization), but no subsequent wave starts until the gap is resolved with a re-verification. The frozen decision snapshot is never altered.
+- **Incompatible re-verification:** a negative verdict resolves the gap as `resolved_incompatible` and fails the rollout; the proposal stays approved but deployment is halted for human review.
 - **Web disconnect:** SSE auto-reconnects and receives a fresh full snapshot; missed events are not required for correctness.
 
 ## End-to-end scenarios
@@ -200,6 +217,7 @@ test/              Vitest unit tests
 10. On a separate **virtual-clock** server: dual-reviewer exemption request (self-confirm rejected, different reviewer accepted), approval through the exemption, frozen snapshot containing the exemption, then a second proposal whose exemption expires deterministically after advancing the virtual clock (asserted gate re-blocks, `exemption_expired` audited, and the earlier frozen snapshot is unchanged).
 11. **Successor lineage:** create a revised candidate from a pending proposal (asserted parent superseded, new hash, revision 2, zero inherited evidence, old open exemptions voided); a late result for the old candidate is filed to the superseded parent as `late` and never reaches the successor; a report to the successor carrying the old hash is rejected; `proposal_superseded`/`successor_created`/`exemption_voided`/`evidence_received_late` are audited; after a process restart the lineage links and late flag are recovered.
 12. **Phased rollout (on a dedicated server):** an approved proposal starts a 3-wave rollout bound to its decision snapshot; a duplicate receipt delivery is deduped (one receipt, one attempt); a lost-response/crash-after-write receipt is retried with the same key and deduped; out-of-order receipts for pending/succeeded waves are rejected; a failure halts the rollout, retry returns the wave to `in_progress`, an `unknown` receipt is recorded without advancing; the rollout is paused, the server is killed and restarted (paused state, attempt counts, and prior waves survive), then resumed and completed; rollback of a succeeded rollout is rejected; a separate successor-based rollout verifies that rollback leaves the contract decision `approved` and does not revive `voided` exemptions. All rollout/wave lifecycle events are audited in the causal chain.
+13. **Coverage gaps (on a dedicated server):** after wave 1 succeeds and wave 2 is in flight, a new consumer registers (topology change). The rollout auto-pauses with `pauseReason=coverage_gap`; the in-flight wave 2 receipt is still accepted (deterministic) but wave 3 is held; resume is blocked until the gap is resolved. A compatible re-verification resolves the gap, resume starts wave 3, and the rollout completes — while the frozen decision snapshot still records only the original consumers. Duplicate verification submissions are deduped. After a process restart the gap and its resolution persist. A second rollout verifies that an incompatible re-verification fails the rollout, and that verification on an already-succeeded rollout is rejected.
 
 ## Local development workflow
 

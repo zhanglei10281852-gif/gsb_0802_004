@@ -1,7 +1,7 @@
-import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import type { Database as DB } from 'better-sqlite3';
+import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import type { Database as DB } from "better-sqlite3";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -98,12 +98,32 @@ CREATE TABLE IF NOT EXISTS rollouts (
   decision_id TEXT NOT NULL,
   environment TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('not_started','in_progress','paused','succeeded','failed','rolled_back')),
+  pause_reason TEXT CHECK (pause_reason IS NULL OR pause_reason IN ('manual','coverage_gap')),
   previous_version TEXT,
   rolled_back_to TEXT,
   rolled_back_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS coverage_gaps (
+  id TEXT PRIMARY KEY,
+  rollout_id TEXT NOT NULL REFERENCES rollouts(id) ON DELETE CASCADE,
+  proposal_id TEXT NOT NULL,
+  candidate_hash TEXT NOT NULL,
+  decision_id TEXT NOT NULL,
+  consumer_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('open','resolved_compatible','resolved_incompatible')),
+  detected_at INTEGER NOT NULL,
+  resolved_at INTEGER,
+  verdict TEXT CHECK (verdict IS NULL OR verdict IN ('compatible','incompatible','error')),
+  details TEXT,
+  idempotency_key TEXT,
+  recorded_at INTEGER,
+  UNIQUE (rollout_id, consumer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_coverage_gaps_rollout ON coverage_gaps(rollout_id, status);
 
 CREATE TABLE IF NOT EXISTS waves (
   id TEXT PRIMARY KEY,
@@ -141,7 +161,9 @@ CREATE INDEX IF NOT EXISTS idx_receipts_wave ON receipts(wave_id, recorded_at);
 `;
 
 function hasColumn(db: DB, table: string, column: string): boolean {
-  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
   return rows.some((r) => r.name === column);
 }
 
@@ -149,13 +171,13 @@ function tableSql(db: DB, table: string): string {
   const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
     .get(table) as { sql: string } | undefined;
-  return row?.sql ?? '';
+  return row?.sql ?? "";
 }
 
 function migrateProposalsStatus(db: DB): void {
-  const sql = tableSql(db, 'proposals');
+  const sql = tableSql(db, "proposals");
   if (sql.includes("'superseded'")) return;
-  db.pragma('foreign_keys = OFF');
+  db.pragma("foreign_keys = OFF");
   db.exec(`
     CREATE TABLE proposals_new (
       id TEXT PRIMARY KEY,
@@ -182,11 +204,11 @@ function migrateProposalsStatus(db: DB): void {
     CREATE INDEX IF NOT EXISTS idx_proposals_lineage ON proposals(lineage_root_id, revision);
     CREATE INDEX IF NOT EXISTS idx_proposals_parent ON proposals(parent_proposal_id);
   `);
-  db.pragma('foreign_keys = ON');
+  db.pragma("foreign_keys = ON");
 }
 
 function migrateExemptionsStatus(db: DB): void {
-  const sql = tableSql(db, 'exemptions');
+  const sql = tableSql(db, "exemptions");
   if (sql.includes("'voided'")) return;
   db.exec(`
     CREATE TABLE exemptions_new (
@@ -224,26 +246,39 @@ function migrateExemptionsStatus(db: DB): void {
 export function openDatabase(path: string): DB {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000');
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  db.pragma("busy_timeout = 5000");
   db.exec(SCHEMA);
-  if (!hasColumn(db, 'proposals', 'environment')) {
-    db.exec("ALTER TABLE proposals ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'");
+  if (!hasColumn(db, "proposals", "environment")) {
+    db.exec(
+      "ALTER TABLE proposals ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'",
+    );
   }
-  if (!hasColumn(db, 'proposals', 'parent_proposal_id')) {
+  if (!hasColumn(db, "proposals", "parent_proposal_id")) {
     db.exec("ALTER TABLE proposals ADD COLUMN parent_proposal_id TEXT");
     db.exec("ALTER TABLE proposals ADD COLUMN replaces_candidate_hash TEXT");
     db.exec("ALTER TABLE proposals ADD COLUMN lineage_root_id TEXT");
-    db.exec("ALTER TABLE proposals ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
-    db.exec("UPDATE proposals SET lineage_root_id = id WHERE lineage_root_id IS NULL");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_proposals_lineage ON proposals(lineage_root_id, revision)");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_proposals_parent ON proposals(parent_proposal_id)");
+    db.exec(
+      "ALTER TABLE proposals ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+    );
+    db.exec(
+      "UPDATE proposals SET lineage_root_id = id WHERE lineage_root_id IS NULL",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_proposals_lineage ON proposals(lineage_root_id, revision)",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_proposals_parent ON proposals(parent_proposal_id)",
+    );
   }
-  if (!hasColumn(db, 'evidence', 'late')) {
+  if (!hasColumn(db, "evidence", "late")) {
     db.exec("ALTER TABLE evidence ADD COLUMN late INTEGER NOT NULL DEFAULT 0");
   }
   migrateProposalsStatus(db);
   migrateExemptionsStatus(db);
+  if (!hasColumn(db, "rollouts", "pause_reason")) {
+    db.exec("ALTER TABLE rollouts ADD COLUMN pause_reason TEXT");
+  }
   return db;
 }
