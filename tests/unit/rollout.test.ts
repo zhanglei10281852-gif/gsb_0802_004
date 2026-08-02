@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyReceipt, nextWaveStatus, type RolloutView, type IncomingReceipt } from '../../src/domain/rollout.ts';
+import { classifyReceipt, nextWaveStatus, newlyRequiredConsumers, type RolloutView, type IncomingReceipt } from '../../src/domain/rollout.ts';
 
 const FP = 'sha256:decision-fingerprint';
 
@@ -85,4 +85,14 @@ test('an UNKNOWN receipt still advances (classification), but leaves the wave in
   const d = classifyReceipt(rollout(), receipt({ result: 'UNKNOWN' }));
   assert.deepEqual(d, { kind: 'ADVANCE', result: 'UNKNOWN' });
   assert.equal(nextWaveStatus('UNKNOWN'), 'IN_PROGRESS');
+});
+
+test('newlyRequiredConsumers returns only the added consumers, in after-order', () => {
+  assert.deepEqual(newlyRequiredConsumers(['a', 'b'], ['a', 'b']), []);
+  assert.deepEqual(newlyRequiredConsumers(['a'], ['a', 'b', 'c']), ['b', 'c']);
+  // Order follows `after`, not `before`.
+  assert.deepEqual(newlyRequiredConsumers(['b'], ['c', 'a', 'b']), ['c', 'a']);
+  // Removals are not "newly required".
+  assert.deepEqual(newlyRequiredConsumers(['a', 'b'], ['a']), []);
+  assert.deepEqual(newlyRequiredConsumers([], ['x']), ['x']);
 });

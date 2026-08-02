@@ -158,6 +158,24 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 
 ---
 
+## 发布期间的依赖拓扑变化（自动暂停 + 可追溯再验证）
+
+发布进行中，依赖拓扑可能变化——尤其是**某个新消费方成为必需依赖**。此时系统必须一边保护已落盘的历史结论不被改写，一边阻止把「尚未覆盖新依赖」的候选继续铺开。纯判定在 `src/domain/rollout.ts` 的 `newlyRequiredConsumers`，编排在 `control-center-service.ts` 的 `registerSubject` → `reactToTopologyGrowth` 与 `resolveRevalidation`。
+
+设计要点：
+
+- **历史决策快照仍然不可修改**：拓扑变化**从不**触碰任何 `decisions` 行、候选摘要、已有豁免或已结算的波次边界。它只在 rollout 上设置一个操作性的 `holdReason`，并新增一条独立的再验证结论——原契约决策保持 `APPROVED` 原样。
+- **尚未开始的波次因覆盖缺口自动暂停**：当新必需消费方对某个**在飞** RELEASE rollout 的已部署候选**没有新鲜 PASS** 时，该 rollout 立即被打上 `holdReason`。`startNextWave` 在存在 `holdReason` 时一律拒绝——**只冻结尚未开始的波次**，已经在跑或已结算的波次不受影响。
+- **在同一提案谱系上生成可追溯的再验证结论**：系统开出一条 `revalidation` 记录，`rolloutId` + `proposalId` + `candidateDigest` 都绑定到**正在部署的那个提案**（同一谱系），列出触发缺口的新增消费方与人类可读的因果依据（`reason`）。它是一个全新的、可追溯的结论，`OPEN → RESOLVED`（`RESUMED`/`HELD`），绝不修改历史决策。
+- **回执与拓扑变更并发到达的确定结果**：两者各自在**单个 better-sqlite3 事务**内串行执行、绝不交错。因此结果确定：要么回执先提交（结算它那一波，随后拓扑变更基于结算后的状态评估覆盖），要么拓扑变更先提交（冻结后续波次，而已在飞波次的决定性回执之后照常结算它）。**hold 只拦截尚未开始的波次，永不拒绝一条回执。**
+- **覆盖判定读取真实证据、而非「已应用」集合**：已部署候选的提案已 `APPROVED`（关闭），因此决策后到达的新消费方证据被存档但不计入原门禁。再验证的覆盖判定（`coverageGap`）**直接读取该候选的全部证据**（每消费方取最新、要求新鲜 PASS），从而在**不改写决策快照**的前提下对新事实下结论。
+- **暂停或继续的因果依据在工作台说明**：rollout 展示黄色横幅「已因依赖拓扑变化自动暂停后续波次：<原因>」；再验证表列出新增依赖、状态、因果依据与结论。负责人可「继续」（仅当缺口已由新消费方的新鲜 PASS 关闭时才放行，否则拒绝并说明还差谁）或「保持暂停」（记录一条可追溯的 `HELD` 结论）。
+- **与前四轮边界一致**：候选摘要、豁免作用域（豁免只作用于 OPEN 候选，因此再验证的覆盖只由新鲜 PASS 关闭，而非对已部署的关闭候选补授豁免）、谱系与波次边界都保持不变。再验证是叠加在既有不变量之上的独立结论。
+
+再验证生命周期写入因果链：`rollout.held`、`rollout.revalidation.opened`、`rollout.revalidation.resolved`、`rollout.hold_cleared`，并随 SQLite 重启完整恢复。
+
+---
+
 ## 故障恢复边界（明确说明能与不能）
 
 真实链路会重复、乱序、丢响应，服务也可能在**写入后、回复前崩溃**。系统的边界如下：
@@ -199,6 +217,7 @@ npm run sim          # 对运行中的服务运行内置代理模拟场景（见
 | `waiver-cannot-mask-a-fail` | 豁免绝不掩盖真实 FAIL |
 | `successor-proposal-does-not-inherit-evidence-or-waivers` | 后继提案新摘要、不沿用证据、旧豁免按作用域失效、并发旧结果不放行后继 |
 | `staged-rollout-receipts-bound-to-decision-with-pause-retry-rollback` | 分阶段发布：回执绑定决策快照与波次尝试；重复/乱序/指纹不匹配惰性；暂停、失败重试、写入后崩溃幂等、回退到上一个已知版本且不改写契约决策 |
+| `topology-change-mid-rollout-auto-holds-and-revalidates` | 发布中新增必需消费方：尚未开始的波次因覆盖缺口自动暂停、在同一提案谱系开出可追溯再验证、历史决策不变、已落盘回执照常结算、缺口经新鲜 PASS 关闭后继续 |
 
 对运行中的可控服务单独跑模拟器：
 
@@ -220,7 +239,7 @@ src/
     digest.ts             规范化 JSON + 稳定候选摘要
     compatibility.ts      JSON Schema 2020-12 静态兼容性分析器（纯函数）
     gate.ts               门禁评估与决策资格状态机（纯函数）
-    rollout.ts            分阶段发布回执分类（纯函数：绑定决策快照 + 当前波次尝试）
+    rollout.ts            分阶段发布回执分类（纯函数：绑定决策快照 + 当前波次尝试）+ 拓扑增量判定
   ports/
     repository.ts         持久化端口（应用层只依赖它，不依赖 SQLite）
     faults.ts             故障注入端口（NoFaults / ArmableFaults）
@@ -263,8 +282,9 @@ tests/
 | `POST /api/rollouts/:id/waves/:waveId/retry` | 重试波次（`attempt` 加一，使旧尝试回执陈旧） |
 | `POST /api/rollbacks` | 回退到上一个已知版本：`{ subjectId, environment?, targetDigest, waves[], createdBy, note? }`（仅部署，不改写决策/豁免） |
 | `POST /api/receipts` | 部署适配器回执：`{ receiptId, rolloutId, waveId, attempt, result, evidenceFingerprint, detail? }` |
-| `GET  /api/rollouts/:id` | 单个发布详情（rollout + 波次 + 回执） |
+| `GET  /api/rollouts/:id` | 单个发布详情（rollout + 波次 + 回执 + 拓扑再验证） |
 | `GET  /api/subjects/:id/rollouts` | 某主题的全部发布 |
+| `POST /api/revalidations/:id/resolve` | 结论拓扑变化再验证：`{ resolution: 'RESUMED'\|'HELD', resolvedBy, note? }`（RESUMED 仅在缺口关闭时放行） |
 | `GET  /api/proposals/:id?environment=` | 单个提案视图（含实时门禁、决策、豁免列表） |
 | `GET  /api/snapshot?environment=` | 一致快照（工作台使用，源自持久化存储） |
 | `GET  /api/events?since=<seq>` | 因果事件日志（增量） |
@@ -284,11 +304,12 @@ tests/
 6. 若某消费方在发布窗口内暂时离线（`MISSING`/`STALE`），复核人 A 可对精确作用域 `申请豁免`；复核人 B（不同人）`确认`后该消费方变为 `WAIVED`，门禁可达 `READY`。豁免不覆盖 `FAIL`，过期/撤销后自动退出。
 7. 发布负责人批准 / 驳回，结论以不可变快照落库（含依据的豁免）；之后的迟到证据或豁免到期/撤销都不改变结论。
 8. 批准后，负责人在工作台「分阶段发布」区按环境安排连续波次；部署适配器 `POST /api/receipts` 回传每个波次尝试的结果。可暂停 / 恢复、失败重试（尝试号加一使旧回执陈旧），或**回退到上一个已知版本**（仅重新部署，不改写契约决策，也不复活已失效豁免）。
-9. 需要复现异常时序时，用 `CONTROLLABLE=1` 启动并通过 `npm run e2e` 或模拟器 CLI 脚本化重放。
+9. 若发布途中某个**新消费方成为必需依赖**（再次 `POST /api/subjects` 扩大必需集合），系统会自动为覆盖缺口暂停尚未开始的波次并在同一提案谱系开出可追溯的再验证；工作台说明暂停原因。待新消费方对已部署候选报送**新鲜 PASS** 后，负责人 `POST /api/revalidations/:id/resolve` 选择「继续」或「保持暂停」——历史决策快照始终不变。
+10. 需要复现异常时序时，用 `CONTROLLABLE=1` 启动并通过 `npm run e2e` 或模拟器 CLI 脚本化重放。
 
 ---
 
 ## 测试与验证
 
-- `npm test`：79 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复；豁免：双人复核、精确作用域、绝不覆盖 FAIL、到期/撤销退出、决策快照不可变、审计链与重启恢复；后继提案：新摘要、证据不沿用、豁免按原作用域失效、并发旧结果不放行后继、`expectedPredecessorId` 冲突保护、替代/失效/迟到的因果记录与恢复；分阶段发布：纯回执分类、绑定决策快照、幂等/乱序/陈旧/指纹不匹配惰性、连续波次、暂停/重试、失败后重试使旧尝试回执陈旧、跨提案隔离、回退不改写契约决策/不复活豁免、回执写入后崩溃 + 重启幂等恢复。
-- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景（含 `dual-controlled-waiver-covers-offline-consumer-then-expires`、`waiver-cannot-mask-a-fail`、`successor-proposal-does-not-inherit-evidence-or-waivers`、`staged-rollout-receipts-bound-to-decision-with-pause-retry-rollback`，全程逻辑时钟无真实等待），随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照，并**专门覆盖发布回执写入后崩溃 / 回执丢失 + 进程重启**：波次按持久化状态结算、重投回执幂等为 `DUPLICATE`。
+- `npm test`：88 个单元 / 集成用例，覆盖摘要稳定性、兼容性分档、门禁规则、幂等、迟到 / 未知隔离、新鲜度过期、并发冲突、注入崩溃、SQLite 重启恢复；豁免：双人复核、精确作用域、绝不覆盖 FAIL、到期/撤销退出、决策快照不可变、审计链与重启恢复；后继提案：新摘要、证据不沿用、豁免按原作用域失效、并发旧结果不放行后继、`expectedPredecessorId` 冲突保护、替代/失效/迟到的因果记录与恢复；分阶段发布：纯回执分类、绑定决策快照、幂等/乱序/陈旧/指纹不匹配惰性、连续波次、暂停/重试、失败后重试使旧尝试回执陈旧、跨提案隔离、回退不改写契约决策/不复活豁免、回执写入后崩溃 + 重启幂等恢复；拓扑变化：新增必需消费方自动暂停未开始波次、同谱系再验证、历史决策不可变、并发回执/拓扑变更确定性、RESUMED 仅在缺口关闭时放行、HELD 可追溯、hold + OPEN 再验证随重启恢复。
+- `npm run e2e`：编译后启动**真实服务进程**，用**真实代理模拟器**通过 HTTP 跑完所有内置场景（含 `dual-controlled-waiver-covers-offline-consumer-then-expires`、`waiver-cannot-mask-a-fail`、`successor-proposal-does-not-inherit-evidence-or-waivers`、`staged-rollout-receipts-bound-to-decision-with-pause-retry-rollback`、`topology-change-mid-rollout-auto-holds-and-revalidates`，全程逻辑时钟无真实等待），随后**硬杀并重启**服务，断言决策 + 因果日志从磁盘恢复、重连快照一致、迟到证据不改动已决快照，并**专门覆盖发布回执写入后崩溃 / 回执丢失 + 进程重启**：波次按持久化状态结算、重投回执幂等为 `DUPLICATE`。

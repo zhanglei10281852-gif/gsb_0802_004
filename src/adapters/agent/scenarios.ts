@@ -506,6 +506,101 @@ export function buildScenarios(): Scenario[] {
           }
         }
       ]
+    },
+
+    // 11) Dependency topology changes mid-rollout: a new consumer becomes
+    //     required while a rollout is in flight. Not-yet-started waves must
+    //     auto-hold on the coverage gap; a traceable re-validation opens on the
+    //     SAME proposal; the historical decision snapshot stays immutable; and a
+    //     receipt that already landed still settled its wave. The gap closes
+    //     only when the new consumer reports a fresh PASS, then the owner
+    //     resumes.
+    {
+      name: 'topology-change-mid-rollout-auto-holds-and-revalidates',
+      steps: [
+        { kind: 'registerSubject', subjectId: 'ledger-svc', requiredConsumers: ['cart'], freshnessWindowMs: 10_000_000 },
+        { kind: 'submitCandidate', subjectId: 'ledger-svc', baselineSchema: baseline, candidateSchema: compatibleCandidate, submittedBy: 'dev', as: 'c1' },
+        { kind: 'report', reportId: 'ls-cart', subjectId: 'ledger-svc', targetRef: 'c1', consumerId: 'cart', verdict: 'PASS', producedAt: 0 },
+        { kind: 'decide', proposalRef: 'c1', expectedDigestRef: 'c1', useCurrentFingerprint: true, type: 'APPROVE', decidedBy: 'release-mgr', as: 'd1' },
+        { kind: 'createRollout', as: 'ro', decisionRef: 'd1', waves: ['canary', 'half', 'full'], createdBy: 'release-mgr' },
+
+        // Canary starts and a receipt lands, settling it BEFORE the topology change.
+        { kind: 'startWave', rolloutRef: 'ro' },
+        { kind: 'reportReceipt', receiptId: 'ls-rc-canary', rolloutRef: 'ro', waveIndex: 0, attempt: 1, result: 'SUCCESS' },
+
+        // The dependency topology grows: 'fraud' is now a required consumer.
+        { kind: 'registerSubject', subjectId: 'ledger-svc', requiredConsumers: ['cart', 'fraud'], freshnessWindowMs: 10_000_000 },
+        {
+          kind: 'expect',
+          description: 'rollout auto-held with an OPEN re-validation on the same proposal; canary stayed SUCCEEDED; decision immutable',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            if (!r.body.rollout.holdReason) throw new Error('rollout should be auto-held after topology change');
+            const open = (r.body.revalidations ?? []).find((rv: any) => rv.status === 'OPEN');
+            if (!open) throw new Error('an OPEN re-validation should exist');
+            if (JSON.stringify(open.addedConsumers) !== JSON.stringify(['fraud'])) throw new Error('re-validation should name the added consumer');
+            const c1 = ctx.candidates.get('c1')!;
+            if (open.proposalId !== c1.proposalId) throw new Error('re-validation must bind to the same proposal lineage');
+            const canary = r.body.waves.find((w: any) => w.ordinal === 1);
+            if (canary.status !== 'SUCCEEDED') throw new Error('a receipt that landed before the change must still have settled its wave');
+            // Historical decision snapshot is untouched.
+            const view = await ctx.client.getProposal(c1.proposalId);
+            if (view.body.proposal.state !== 'APPROVED') throw new Error('decision must remain APPROVED');
+          }
+        },
+
+        // The held rollout refuses to start the next wave.
+        { kind: 'startWave', rolloutRef: 'ro' },
+        {
+          kind: 'expect',
+          description: 'next wave cannot start while held (half not started)',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            const half = r.body.waves.find((w: any) => w.ordinal === 2);
+            if (half.status !== 'PENDING') throw new Error('half must remain PENDING while held');
+          }
+        },
+
+        // Trying to resume before the gap closes is refused.
+        { kind: 'resolveRevalidation', rolloutRef: 'ro', resolution: 'RESUMED', resolvedBy: 'release-mgr' },
+        {
+          kind: 'expect',
+          description: 'still held: fraud has no fresh PASS yet',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            if (!r.body.rollout.holdReason) throw new Error('should still be held before the gap closes');
+          }
+        },
+
+        // The new consumer reports a fresh PASS for the deployed candidate.
+        { kind: 'report', reportId: 'ls-fraud', subjectId: 'ledger-svc', targetRef: 'c1', consumerId: 'fraud', verdict: 'PASS', producedAt: 0 },
+        { kind: 'resolveRevalidation', rolloutRef: 'ro', resolution: 'RESUMED', resolvedBy: 'release-mgr' },
+        {
+          kind: 'expect',
+          description: 'gap closed: hold lifted, re-validation RESOLVED/RESUMED, next wave can start',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            if (r.body.rollout.holdReason) throw new Error('hold should be lifted after resume');
+            const reval = r.body.revalidations[0];
+            if (reval.status !== 'RESOLVED' || reval.resolution !== 'RESUMED') throw new Error('re-validation should be RESOLVED/RESUMED');
+          }
+        },
+        { kind: 'startWave', rolloutRef: 'ro' },
+        {
+          kind: 'expect',
+          description: 'half is now in progress after resume',
+          check: async (ctx) => {
+            const ro = ctx.rollouts.get('ro')!;
+            const r = await ctx.client.getRollout(ro.rolloutId);
+            const half = r.body.waves.find((w: any) => w.ordinal === 2);
+            if (half.status !== 'IN_PROGRESS') throw new Error('half should be IN_PROGRESS after resume + start');
+          }
+        }
+      ]
     }
   ];
 }

@@ -4,8 +4,10 @@ import { analyzeCompatibility } from '../domain/compatibility.js';
 import { evaluateGate } from '../domain/gate.js';
 import {
   classifyReceipt,
+  newlyRequiredConsumers,
   nextWaveStatus,
   type ReceiptResult,
+  type RevalidationResolution,
   type RolloutStatus,
   type RolloutView,
   type WaveStatus
@@ -24,8 +26,9 @@ import {
 import type {
   DecisionRecord,
   ProposalRecord,
-  ReceiptRecord,
   Repository,
+  ReceiptRecord,
+  RevalidationRecord,
   RolloutRecord,
   WaiverRecord,
   WaveRecord
@@ -189,6 +192,8 @@ export interface RolloutDetail {
   rollout: RolloutRecord;
   waves: WaveRecord[];
   receipts: ReceiptRecord[];
+  /** Topology-change re-validations opened against this rollout, if any. */
+  revalidations: RevalidationRecord[];
 }
 
 export class ControlCenterService {
@@ -208,18 +213,102 @@ export class ControlCenterService {
       throw new ServiceError('BAD_REQUEST', 'freshnessWindowMs must be positive');
     }
     const now = this.clock.now();
+    // The whole upsert + topology-change reaction is a single transaction.
+    // better-sqlite3 is synchronous and single-threaded, so this transaction and
+    // any concurrent reportReceipt transaction are strictly serialized — never
+    // interleaved. That is what makes "a receipt landing while the topology
+    // changes" deterministic: either the receipt commits first (settling its
+    // wave, and we then evaluate coverage against the resulting state) or the
+    // topology change commits first (holding future waves, while the already
+    // in-flight wave's decisive receipt still settles it afterwards). The hold
+    // only ever blocks NOT-YET-STARTED waves; it never rejects a receipt.
     this.repo.transaction(() => {
+      const before = this.repo.getSubject(input.subjectId);
+      const beforeConsumers = before?.requiredConsumers ?? [];
+
       this.repo.upsertSubject({
         subjectId: input.subjectId,
         requiredConsumers: [...input.requiredConsumers],
         freshnessWindowMs: input.freshnessWindowMs,
-        createdAt: now
+        createdAt: before?.createdAt ?? now
       });
       this.repo.appendEvent('subject.registered', now, { subjectId: input.subjectId }, {
         requiredConsumers: input.requiredConsumers,
-        freshnessWindowMs: input.freshnessWindowMs
+        freshnessWindowMs: input.freshnessWindowMs,
+        previousConsumers: beforeConsumers
       });
+
+      // Dependency-topology growth: consumers that are required now but were not
+      // before. If any of them is not yet covered for an in-flight rollout's
+      // deployed candidate, that rollout must auto-hold its remaining waves and
+      // grow a traceable re-validation on the same proposal lineage.
+      const added = newlyRequiredConsumers(beforeConsumers, input.requiredConsumers);
+      if (added.length > 0) {
+        this.reactToTopologyGrowth(input.subjectId, added, input.freshnessWindowMs, now);
+      }
     });
+  }
+
+  /**
+   * For each in-flight RELEASE rollout of a subject whose deployed candidate no
+   * longer covers every required consumer (because new consumers were just
+   * added), auto-hold the rollout's not-yet-started waves and open a
+   * re-validation conclusion bound to the SAME proposal. The historical
+   * decision snapshot is never touched — the re-validation is a fresh,
+   * traceable conclusion about coverage under the new topology.
+   */
+  private reactToTopologyGrowth(subjectId: string, added: string[], freshnessWindowMs: number, now: number): void {
+    for (const rollout of this.repo.listRollouts(subjectId)) {
+      // Only live forward releases can be held; terminal or rollback rollouts
+      // have no future waves to guard.
+      if (rollout.kind !== 'RELEASE') continue;
+      if (!['PENDING', 'IN_PROGRESS', 'PAUSED'].includes(rollout.status)) continue;
+      if (!rollout.proposalId) continue;
+      // One OPEN re-validation per rollout is enough; a second topology change
+      // while one is open just extends the same conclusion's audit trail via a
+      // new event, not a duplicate hold.
+      if (this.repo.getOpenRevalidation(rollout.rolloutId)) continue;
+
+      const proposal = this.repo.getProposal(rollout.proposalId);
+      if (!proposal) continue;
+
+      // Re-evaluate the DEPLOYED candidate's coverage under the NEW required
+      // set. Any newly-required consumer without a fresh PASS for this candidate
+      // is a coverage gap. This reads reality directly and never touches the
+      // immutable decision snapshot.
+      const gap = this.coverageGap(proposal, added, freshnessWindowMs);
+      if (gap.length === 0) continue; // new consumers already covered; no hold
+
+      const reason = `dependency topology changed mid-rollout: new required consumer(s) ${gap.join(', ')} not yet covered for candidate ${proposal.candidateDigest.slice(0, 20)}… in ${rollout.environment}`;
+      this.repo.setRolloutHold(rollout.rolloutId, reason, now, 'rollout.held', {
+        rolloutId: rollout.rolloutId,
+        addedConsumers: added,
+        gapConsumers: gap
+      });
+      const revalidation: RevalidationRecord = {
+        revalidationId: randomUUID(),
+        rolloutId: rollout.rolloutId,
+        subjectId,
+        proposalId: proposal.proposalId,
+        candidateDigest: proposal.candidateDigest,
+        environment: rollout.environment,
+        addedConsumers: gap,
+        status: 'OPEN',
+        reason,
+        openedAt: now,
+        resolution: null,
+        resolvedAt: null,
+        resolvedBy: null,
+        resolutionNote: null
+      };
+      this.repo.insertRevalidation(revalidation);
+      this.repo.appendEvent('rollout.revalidation.opened', now, { subjectId, proposalId: proposal.proposalId }, {
+        revalidationId: revalidation.revalidationId,
+        rolloutId: rollout.rolloutId,
+        addedConsumers: gap,
+        reason
+      });
+    }
   }
 
   // --- candidate submission ------------------------------------------------
@@ -689,7 +778,8 @@ export class ControlCenterService {
         createdAt: now,
         createdBy: input.createdBy,
         supersedesRolloutId: null,
-        note: input.note ?? null
+        note: input.note ?? null,
+        holdReason: null
       };
       const waves: WaveRecord[] = waveNames.map((name, i) => ({
         waveId: randomUUID(),
@@ -726,6 +816,19 @@ export class ControlCenterService {
     if (!rollout) return { status: 'DENIED', reason: `unknown rollout "${rolloutId}"` };
     if (rollout.status === 'PAUSED') {
       return { status: 'DENIED', reason: 'rollout is paused; resume it before starting the next wave' };
+    }
+    // A coverage gap from a mid-rollout topology change holds all not-yet-started
+    // waves until the linked re-validation is resolved. The explanation lives on
+    // the rollout's holdReason and the OPEN revalidation, so the workbench can
+    // say exactly why the next wave will not start.
+    if (rollout.holdReason) {
+      const open = this.repo.getOpenRevalidation(rolloutId);
+      return {
+        status: 'DENIED',
+        reason: open
+          ? `held for re-validation ${open.revalidationId}: ${rollout.holdReason}`
+          : `held: ${rollout.holdReason}`
+      };
     }
     const wave = this.repo.startNextWave(rolloutId, now);
     if (!wave) {
@@ -923,7 +1026,8 @@ export class ControlCenterService {
         createdAt: now,
         createdBy: input.createdBy,
         supersedesRolloutId: active?.rolloutId ?? null,
-        note: input.note ?? null
+        note: input.note ?? null,
+        holdReason: null
       };
       const waves: WaveRecord[] = waveNames.map((name, i) => ({
         waveId: randomUUID(),
@@ -955,7 +1059,8 @@ export class ControlCenterService {
     return {
       rollout,
       waves: this.repo.listWaves(rolloutId),
-      receipts: this.repo.listReceipts(rolloutId)
+      receipts: this.repo.listReceipts(rolloutId),
+      revalidations: this.repo.listRevalidations(rolloutId)
     };
   }
 
@@ -963,8 +1068,66 @@ export class ControlCenterService {
     return this.repo.listRollouts(subjectId).map((rollout) => ({
       rollout,
       waves: this.repo.listWaves(rollout.rolloutId),
-      receipts: this.repo.listReceipts(rollout.rolloutId)
+      receipts: this.repo.listReceipts(rollout.rolloutId),
+      revalidations: this.repo.listRevalidations(rollout.rolloutId)
     }));
+  }
+
+  /**
+   * Conclude a topology-change re-validation. The owner either RESUMES (the
+   * coverage gap for the newly-required consumers is now closed — fresh PASS or
+   * a matching waiver — so the hold is lifted and future waves may start again)
+   * or keeps the rollout HELD (a traceable decision to wait). Re-validation is
+   * a fresh conclusion on the same proposal lineage; it NEVER alters the
+   * immutable contract decision snapshot, nor the candidate digest, waivers, or
+   * already-settled wave boundaries.
+   */
+  resolveRevalidation(
+    revalidationId: string,
+    resolution: RevalidationResolution,
+    resolvedBy: string,
+    note?: string
+  ): { status: 'RESOLVED'; resolution: RevalidationResolution } | { status: 'DENIED'; reason: string } {
+    return this.repo.transaction(() => {
+      const reval = this.repo.getRevalidation(revalidationId);
+      if (!reval) return { status: 'DENIED', reason: `unknown re-validation "${revalidationId}"` } as const;
+      if (reval.status !== 'OPEN') {
+        return { status: 'DENIED', reason: `re-validation is already ${reval.status}` } as const;
+      }
+      const rollout = this.repo.getRollout(reval.rolloutId);
+      if (!rollout) return { status: 'DENIED', reason: 'rollout no longer exists' } as const;
+
+      if (resolution === 'RESUMED') {
+        // Only allow resuming when the gap is genuinely closed now: every
+        // added consumer must have a fresh PASS for the deployed candidate.
+        // This re-checks live reality so an owner cannot resume into the very
+        // gap that caused the hold.
+        const subject = this.repo.getSubject(reval.subjectId)!;
+        const proposal = this.repo.getProposal(reval.proposalId);
+        if (!proposal) return { status: 'DENIED', reason: 'proposal no longer exists' } as const;
+        const stillGap = this.coverageGap(proposal, reval.addedConsumers, subject.freshnessWindowMs);
+        if (stillGap.length > 0) {
+          return {
+            status: 'DENIED',
+            reason: `cannot resume: consumer(s) ${stillGap.join(', ')} still lack a fresh PASS for the deployed candidate`
+          } as const;
+        }
+      }
+
+      const now = this.clock.now();
+      const ok = this.repo.resolveRevalidation(revalidationId, resolution, resolvedBy, note ?? null, now);
+      if (!ok) return { status: 'DENIED', reason: 're-validation was concurrently resolved' } as const;
+
+      // RESUMED lifts the operational hold so future waves may start again.
+      // HELD leaves the hold in place (with the audit trail recording why).
+      if (resolution === 'RESUMED') {
+        this.repo.setRolloutHold(reval.rolloutId, null, now, 'rollout.hold_cleared', {
+          rolloutId: reval.rolloutId,
+          revalidationId
+        });
+      }
+      return { status: 'RESOLVED', resolution } as const;
+    });
   }
 
   private toRolloutView(rollout: RolloutRecord): RolloutView {
@@ -1066,6 +1229,38 @@ export class ControlCenterService {
   }
 
   // --- internals -----------------------------------------------------------
+
+  /**
+   * Coverage check for a topology-change re-validation. Returns the subset of
+   * `consumers` that the ALREADY-DEPLOYED candidate does not yet cover: i.e. the
+   * consumer has no fresh PASS for this candidate digest (missing, stale, or a
+   * FAIL). This deliberately reads ALL evidence for the candidate — not just the
+   * "applied" set the gate/decision used — because the deployed proposal is
+   * closed (APPROVED), so post-decision evidence for a newly-required consumer
+   * is stored but not "applied". Reading it here lets a re-validation conclude
+   * on fresh reality WITHOUT ever mutating the immutable decision snapshot.
+   */
+  private coverageGap(proposal: ProposalRecord, consumers: string[], freshnessWindowMs: number): string[] {
+    const now = this.clock.now();
+    const all = this.repo.listEvidenceForProposal(proposal.proposalId);
+    const newest = new Map<string, { verdict: Verdict; producedAt: number; receivedAt: number; reportId: string }>();
+    for (const e of all) {
+      const prev = newest.get(e.consumerId);
+      const isNewer =
+        !prev ||
+        e.producedAt > prev.producedAt ||
+        (e.producedAt === prev.producedAt && e.receivedAt > prev.receivedAt) ||
+        (e.producedAt === prev.producedAt && e.receivedAt === prev.receivedAt && e.reportId > prev.reportId);
+      if (isNewer) newest.set(e.consumerId, { verdict: e.verdict, producedAt: e.producedAt, receivedAt: e.receivedAt, reportId: e.reportId });
+    }
+    const gap: string[] = [];
+    for (const c of consumers) {
+      const ev = newest.get(c);
+      const fresh = ev && now - ev.producedAt <= freshnessWindowMs;
+      if (!ev || !fresh || ev.verdict !== 'PASS') gap.push(c);
+    }
+    return gap;
+  }
 
   private evaluateProposalGate(
     proposal: ProposalRecord,

@@ -41,6 +41,36 @@ export type RolloutStatus =
 export type RolloutKind = 'RELEASE' | 'ROLLBACK';
 
 /**
+ * Lifecycle of a re-validation opened when the dependency topology changes
+ * mid-rollout (a new consumer becomes required). It is a traceable conclusion
+ * about whether the *already-deployed* candidate still covers every required
+ * consumer under the new topology — it never touches the immutable contract
+ * decision.
+ *  - OPEN:     a coverage gap exists; the rollout is auto-held.
+ *  - RESOLVED: an owner concluded it (see RevalidationResolution).
+ */
+export type RevalidationStatus = 'OPEN' | 'RESOLVED';
+
+/**
+ * How a re-validation was concluded.
+ *  - RESUMED: the gap was covered (new consumer has fresh PASS / a waiver), so
+ *    the held rollout was resumed.
+ *  - HELD:    the owner chose to keep the rollout paused despite (or because of)
+ *    the gap; the conclusion is recorded for traceability.
+ */
+export type RevalidationResolution = 'RESUMED' | 'HELD';
+
+/**
+ * Consumers newly present in `after` but absent from `before` — i.e. the
+ * dependency-topology growth that can open a coverage gap for an in-flight
+ * rollout. Pure and order-preserving (returns them in `after`'s order).
+ */
+export function newlyRequiredConsumers(before: readonly string[], after: readonly string[]): string[] {
+  const prev = new Set(before);
+  return after.filter((c) => !prev.has(c));
+}
+
+/**
  * The immutable identity a rollout is bound to. A rollout is tied to exactly
  * one approved decision snapshot (and thus one proposal/candidate/environment).
  * Receipts must carry a matching fingerprint to have any effect; because a

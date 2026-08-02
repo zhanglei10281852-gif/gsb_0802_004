@@ -121,6 +121,16 @@ export type Step =
       createdBy: string;
       note?: string;
     }
+  | {
+      // Resolve the OPEN topology-change re-validation of a referenced rollout.
+      // RESUMED lifts the auto-hold (only if the coverage gap is closed); HELD
+      // records a traceable decision to keep waiting.
+      kind: 'resolveRevalidation';
+      rolloutRef: string;
+      resolution: 'RESUMED' | 'HELD';
+      resolvedBy: string;
+      note?: string;
+    }
   | { kind: 'expect'; description: string; check: (ctx: ScenarioContext) => Promise<void> | void }
   | { kind: 'log'; message: string };
 
@@ -436,6 +446,17 @@ export class AgentSimulator {
           });
         }
         return `${r.status}:${r.body?.status}${r.body?.reason ? ` (${r.body.reason})` : ''}`;
+      }
+
+      case 'resolveRevalidation': {
+        const ro = this.resolveRollout(step.rolloutRef, ctx);
+        // Find the OPEN re-validation on the rollout to resolve it by id.
+        const detail = await this.client.getRollout(ro.rolloutId);
+        const open = (detail.body?.revalidations ?? []).find((rv: any) => rv.status === 'OPEN');
+        if (!open) throw new Error(`rollout "${step.rolloutRef}" has no OPEN re-validation to resolve`);
+        const r = await this.client.resolveRevalidation(open.revalidationId, step.resolution, step.resolvedBy, step.note);
+        ctx.outcomes.push({ step: `resolveRevalidation ${step.rolloutRef}`, result: r.body });
+        return `${r.status}:${r.body?.status}${r.body?.resolution ? ` (${r.body.resolution})` : r.body?.reason ? ` (${r.body.reason})` : ''}`;
       }
 
       case 'expect': {

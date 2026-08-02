@@ -1,5 +1,5 @@
 import type { CompatDirection, CompatReport, DecisionType, Environment, GateEvaluation, JsonSchema, Verdict, WaiverStatus } from '../domain/types.js';
-import type { ReceiptResult, RolloutKind, RolloutStatus, WaveStatus } from '../domain/rollout.js';
+import type { ReceiptResult, RevalidationResolution, RevalidationStatus, RolloutKind, RolloutStatus, WaveStatus } from '../domain/rollout.js';
 
 /**
  * Persistence port.
@@ -150,6 +150,42 @@ export interface RolloutRecord {
   /** For a ROLLBACK: the rollout it superseded and the digest it reverted to. */
   supersedesRolloutId: string | null;
   note: string | null;
+  /**
+   * Set when the rollout is auto-held because the dependency topology changed
+   * mid-flight (a new consumer became required and is not yet covered). While
+   * this is set, not-yet-started waves cannot begin; a linked revalidation must
+   * be resolved first. Cleared when the revalidation resolves to RESUMED. This
+   * is purely an operational hold on *future* waves — already-settled waves and
+   * the immutable contract decision are untouched.
+   */
+  holdReason: string | null;
+}
+
+/**
+ * A traceable re-validation conclusion opened when the dependency topology
+ * grows mid-rollout. It is bound to the same proposal (and thus the same
+ * lineage / candidate digest) as the rollout it guards, so the audit trail
+ * shows the re-validation on the exact proposal that was already being
+ * deployed. It NEVER modifies the historical decision snapshot.
+ */
+export interface RevalidationRecord {
+  revalidationId: string;
+  rolloutId: string;
+  subjectId: string;
+  proposalId: string;
+  candidateDigest: string;
+  environment: Environment;
+  /** The consumers that became required after the rollout started. */
+  addedConsumers: string[];
+  status: RevalidationStatus;
+  /** Human-readable coverage-gap explanation shown on the workbench. */
+  reason: string;
+  openedAt: number;
+  /** Set once resolved. */
+  resolution: RevalidationResolution | null;
+  resolvedAt: number | null;
+  resolvedBy: string | null;
+  resolutionNote: string | null;
 }
 
 export interface WaveRecord {
@@ -293,6 +329,30 @@ export interface Repository {
    * attempt number, or undefined if not retryable.
    */
   retryWave(rolloutId: string, waveId: string, at: number): number | undefined;
+
+  // --- topology-change re-validation ---
+  /**
+   * Set or clear a rollout's operational hold reason (no status change). Used
+   * to auto-hold future waves when a coverage gap appears, and to clear the
+   * hold when the gap is resolved. Idempotent.
+   */
+  setRolloutHold(rolloutId: string, holdReason: string | null, at: number, eventType: string, payload: unknown): void;
+  insertRevalidation(rec: RevalidationRecord): void;
+  getRevalidation(revalidationId: string): RevalidationRecord | undefined;
+  /** The single OPEN revalidation for a rollout, if any. */
+  getOpenRevalidation(rolloutId: string): RevalidationRecord | undefined;
+  listRevalidations(rolloutId: string): RevalidationRecord[];
+  /**
+   * Resolve an OPEN revalidation (compare-and-set on OPEN). Returns false on a
+   * lost race / already resolved. Appends an audit event when it succeeds.
+   */
+  resolveRevalidation(
+    revalidationId: string,
+    resolution: RevalidationResolution,
+    resolvedBy: string,
+    note: string | null,
+    at: number
+  ): boolean;
 
   // --- events / causal log ---
   appendEvent(type: string, at: number, ids: { subjectId?: string | null; proposalId?: string | null }, payload: unknown): number;

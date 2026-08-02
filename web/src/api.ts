@@ -97,6 +97,7 @@ export interface Rollout {
   createdBy: string;
   supersedesRolloutId: string | null;
   note: string | null;
+  holdReason: string | null;
 }
 
 export interface Wave {
@@ -123,10 +124,28 @@ export interface Receipt {
   ignoredReason: string | null;
 }
 
+export interface Revalidation {
+  revalidationId: string;
+  rolloutId: string;
+  subjectId: string;
+  proposalId: string;
+  candidateDigest: string;
+  environment: string;
+  addedConsumers: string[];
+  status: 'OPEN' | 'RESOLVED';
+  reason: string;
+  openedAt: number;
+  resolution: 'RESUMED' | 'HELD' | null;
+  resolvedAt: number | null;
+  resolvedBy: string | null;
+  resolutionNote: string | null;
+}
+
 export interface RolloutDetail {
   rollout: Rollout;
   waves: Wave[];
   receipts: Receipt[];
+  revalidations: Revalidation[];
 }
 
 export interface Snapshot {
@@ -220,4 +239,8 @@ export function retryWave(rolloutId: string, waveId: string) {
 
 export function rollback(input: { subjectId: string; environment: string; targetDigest: string; waves: string[]; createdBy: string; note?: string }) {
   return post('/api/rollbacks', input);
+}
+
+export function resolveRevalidation(revalidationId: string, resolution: 'RESUMED' | 'HELD', resolvedBy: string, note?: string) {
+  return post(`/api/revalidations/${encodeURIComponent(revalidationId)}/resolve`, { resolution, resolvedBy, note });
 }

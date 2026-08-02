@@ -248,6 +248,20 @@ export async function buildServer(opts: BuildServerOptions): Promise<FastifyInst
     return { rollouts: service.listRollouts(subjectId) };
   });
 
+  // --- topology-change re-validation ---
+  app.post('/api/revalidations/:revalidationId/resolve', async (req, reply) => {
+    const { revalidationId } = req.params as { revalidationId: string };
+    const body = req.body as any;
+    const resolution = body.resolution === 'HELD' ? 'HELD' : 'RESUMED';
+    const outcome = service.resolveRevalidation(
+      revalidationId,
+      resolution,
+      String(body.resolvedBy ?? 'unknown'),
+      body.note ? String(body.note) : undefined
+    );
+    return reply.status(outcome.status === 'RESOLVED' ? 200 : 422).send(outcome);
+  });
+
   // --- read models ---
   app.get('/api/proposals/:proposalId', async (req, reply) => {
     const { proposalId } = req.params as { proposalId: string };

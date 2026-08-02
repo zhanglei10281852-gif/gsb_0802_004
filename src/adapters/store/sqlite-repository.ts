@@ -6,12 +6,13 @@ import type {
   ProposalRecord,
   ReceiptRecord,
   Repository,
+  RevalidationRecord,
   RolloutRecord,
   SubjectRecord,
   WaiverRecord,
   WaveRecord
 } from '../../ports/repository.js';
-import type { RolloutStatus, WaveStatus } from '../../domain/rollout.js';
+import type { RevalidationResolution, RolloutStatus, WaveStatus } from '../../domain/rollout.js';
 
 /**
  * SQLite implementation of the persistence port (better-sqlite3, synchronous).
@@ -142,7 +143,8 @@ export class SqliteRepository implements Repository {
         created_at INTEGER NOT NULL,
         created_by TEXT NOT NULL,
         supersedes_rollout_id TEXT,
-        note TEXT
+        note TEXT,
+        hold_reason TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_rollouts_subject ON rollouts(subject_id);
       -- At most one non-terminal rollout per (subject, environment).
@@ -175,6 +177,27 @@ export class SqliteRepository implements Repository {
         ignored_reason TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON receipts(rollout_id);
+
+      CREATE TABLE IF NOT EXISTS revalidations (
+        revalidation_id TEXT PRIMARY KEY,
+        rollout_id TEXT NOT NULL REFERENCES rollouts(rollout_id),
+        subject_id TEXT NOT NULL,
+        proposal_id TEXT NOT NULL,
+        candidate_digest TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        added_consumers TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        opened_at INTEGER NOT NULL,
+        resolution TEXT,
+        resolved_at INTEGER,
+        resolved_by TEXT,
+        resolution_note TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_revalidations_rollout ON revalidations(rollout_id);
+      -- At most one OPEN revalidation per rollout.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_revalidations_one_open
+        ON revalidations(rollout_id) WHERE status = 'OPEN';
     `);
   }
 
@@ -561,10 +584,10 @@ export class SqliteRepository implements Repository {
         .prepare(
           `INSERT INTO rollouts
             (rollout_id, subject_id, environment, kind, decision_id, proposal_id, candidate_digest,
-             evidence_fingerprint, status, created_at, created_by, supersedes_rollout_id, note)
+             evidence_fingerprint, status, created_at, created_by, supersedes_rollout_id, note, hold_reason)
            VALUES
             (@rolloutId, @subjectId, @environment, @kind, @decisionId, @proposalId, @candidateDigest,
-             @evidenceFingerprint, @status, @createdAt, @createdBy, @supersedesRolloutId, @note)`
+             @evidenceFingerprint, @status, @createdAt, @createdBy, @supersedesRolloutId, @note, @holdReason)`
         )
         .run({
           rolloutId: rollout.rolloutId,
@@ -579,7 +602,8 @@ export class SqliteRepository implements Repository {
           createdAt: rollout.createdAt,
           createdBy: rollout.createdBy,
           supersedesRolloutId: rollout.supersedesRolloutId,
-          note: rollout.note
+          note: rollout.note,
+          holdReason: rollout.holdReason
         });
       const insWave = this.db.prepare(
         `INSERT INTO waves (wave_id, rollout_id, ordinal, name, status, attempt, started_at, settled_at)
@@ -787,6 +811,97 @@ export class SqliteRepository implements Repository {
     return tx();
   }
 
+  // --- topology-change re-validation ---
+  setRolloutHold(rolloutId: string, holdReason: string | null, at: number, eventType: string, payload: unknown): void {
+    const tx = this.db.transaction(() => {
+      const info = this.db
+        .prepare('UPDATE rollouts SET hold_reason = @holdReason WHERE rollout_id = @id')
+        .run({ holdReason, id: rolloutId });
+      if (info.changes === 1) {
+        const r = this.getRollout(rolloutId)!;
+        this.appendEvent(eventType, at, { subjectId: r.subjectId, proposalId: r.proposalId }, payload);
+      }
+    });
+    tx();
+  }
+
+  insertRevalidation(rec: RevalidationRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO revalidations
+          (revalidation_id, rollout_id, subject_id, proposal_id, candidate_digest, environment,
+           added_consumers, status, reason, opened_at, resolution, resolved_at, resolved_by, resolution_note)
+         VALUES
+          (@revalidationId, @rolloutId, @subjectId, @proposalId, @candidateDigest, @environment,
+           @addedConsumers, @status, @reason, @openedAt, @resolution, @resolvedAt, @resolvedBy, @resolutionNote)`
+      )
+      .run({
+        revalidationId: rec.revalidationId,
+        rolloutId: rec.rolloutId,
+        subjectId: rec.subjectId,
+        proposalId: rec.proposalId,
+        candidateDigest: rec.candidateDigest,
+        environment: rec.environment,
+        addedConsumers: JSON.stringify(rec.addedConsumers),
+        status: rec.status,
+        reason: rec.reason,
+        openedAt: rec.openedAt,
+        resolution: rec.resolution,
+        resolvedAt: rec.resolvedAt,
+        resolvedBy: rec.resolvedBy,
+        resolutionNote: rec.resolutionNote
+      });
+  }
+
+  getRevalidation(revalidationId: string): RevalidationRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM revalidations WHERE revalidation_id = ?').get(revalidationId) as any;
+    return row ? rowToRevalidation(row) : undefined;
+  }
+
+  getOpenRevalidation(rolloutId: string): RevalidationRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM revalidations WHERE rollout_id = ? AND status = 'OPEN'")
+      .get(rolloutId) as any;
+    return row ? rowToRevalidation(row) : undefined;
+  }
+
+  listRevalidations(rolloutId: string): RevalidationRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM revalidations WHERE rollout_id = ? ORDER BY opened_at ASC, revalidation_id ASC')
+      .all(rolloutId) as any[];
+    return rows.map(rowToRevalidation);
+  }
+
+  resolveRevalidation(
+    revalidationId: string,
+    resolution: RevalidationResolution,
+    resolvedBy: string,
+    note: string | null,
+    at: number
+  ): boolean {
+    const tx = this.db.transaction((): boolean => {
+      const upd = this.db
+        .prepare(
+          `UPDATE revalidations
+             SET status = 'RESOLVED', resolution = @resolution, resolved_at = @at, resolved_by = @by, resolution_note = @note
+           WHERE revalidation_id = @id AND status = 'OPEN'`
+        )
+        .run({ id: revalidationId, resolution, at, by: resolvedBy, note });
+      if (upd.changes !== 1) return false;
+      const rec = this.getRevalidation(revalidationId)!;
+      this.appendEvent('rollout.revalidation.resolved', at, { subjectId: rec.subjectId, proposalId: rec.proposalId }, {
+        revalidationId,
+        rolloutId: rec.rolloutId,
+        resolution,
+        resolvedBy,
+        addedConsumers: rec.addedConsumers,
+        note
+      });
+      return true;
+    });
+    return tx();
+  }
+
   // --- events ---
   appendEvent(
     type: string,
@@ -918,7 +1033,27 @@ function rowToRollout(row: any): RolloutRecord {
     createdAt: row.created_at,
     createdBy: row.created_by,
     supersedesRolloutId: row.supersedes_rollout_id,
-    note: row.note
+    note: row.note,
+    holdReason: row.hold_reason ?? null
+  };
+}
+
+function rowToRevalidation(row: any): RevalidationRecord {
+  return {
+    revalidationId: row.revalidation_id,
+    rolloutId: row.rollout_id,
+    subjectId: row.subject_id,
+    proposalId: row.proposal_id,
+    candidateDigest: row.candidate_digest,
+    environment: row.environment,
+    addedConsumers: JSON.parse(row.added_consumers),
+    status: row.status,
+    reason: row.reason,
+    openedAt: row.opened_at,
+    resolution: row.resolution,
+    resolvedAt: row.resolved_at,
+    resolvedBy: row.resolved_by,
+    resolutionNote: row.resolution_note
   };
 }
 

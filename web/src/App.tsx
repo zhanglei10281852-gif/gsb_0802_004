@@ -13,6 +13,7 @@ import {
   resumeRollout,
   retryWave,
   rollback,
+  resolveRevalidation,
   type Snapshot,
   type ProposalView,
   type Waiver,
@@ -180,6 +181,8 @@ export default function App(): JSX.Element {
     runRolloutAction(`ro-rollback-${subjectId}`, () =>
       rollback({ subjectId, environment, targetDigest, waves, createdBy: decidedBy })
     );
+  const onResolveRevalidation = (revalidationId: string, resolution: 'RESUMED' | 'HELD') =>
+    runRolloutAction(`ro-reval-${revalidationId}`, () => resolveRevalidation(revalidationId, resolution, decidedBy));
 
   return (
     <div style={{ fontFamily: 'Segoe UI, system-ui, sans-serif', maxWidth: 1100, margin: '0 auto', padding: 24, color: '#202124' }}>
@@ -249,6 +252,7 @@ export default function App(): JSX.Element {
             onResume={onResume}
             onRetryWave={onRetryWave}
             onRollback={onRollback}
+            onResolveRevalidation={onResolveRevalidation}
             busy={busy}
           />
 
@@ -485,6 +489,7 @@ function RolloutSection({
   onResume,
   onRetryWave,
   onRollback,
+  onResolveRevalidation,
   busy
 }: {
   subjectId: string;
@@ -497,6 +502,7 @@ function RolloutSection({
   onResume: (rolloutId: string) => void;
   onRetryWave: (rolloutId: string, waveId: string) => void;
   onRollback: (subjectId: string, environment: string, targetDigest: string, waves: string[]) => void;
+  onResolveRevalidation: (revalidationId: string, resolution: 'RESUMED' | 'HELD') => void;
   busy: string | null;
 }): JSX.Element {
   const [waveText, setWaveText] = useState('canary, half, full');
@@ -541,6 +547,43 @@ function RolloutSection({
               <span style={{ fontSize: 11, color: '#5f6368' }}>回退自 <code>{r.rollout.supersedesRolloutId.slice(0, 8)}</code></span>
             )}
           </div>
+
+          {r.rollout.holdReason && (
+            <div style={{ marginTop: 6, background: '#fef7e0', border: '1px solid #f9d67a', borderRadius: 6, padding: '6px 10px', fontSize: 12, color: '#a56300' }}>
+              ⏸ 已因依赖拓扑变化自动暂停后续波次：{r.rollout.holdReason}
+            </div>
+          )}
+
+          {r.revalidations.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              <h5 style={{ margin: '4px 0', fontSize: 12 }}>拓扑变化再验证（同一提案谱系，历史决策不可改）</h5>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', color: '#5f6368' }}>
+                    <th style={th}>新增依赖</th><th style={th}>状态</th><th style={th}>因果依据</th><th style={th}>结论</th><th style={th}>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {r.revalidations.map((rv) => (
+                    <tr key={rv.revalidationId} style={{ borderTop: '1px solid #eee' }}>
+                      <td style={td}>{rv.addedConsumers.join(', ')}</td>
+                      <td style={td}><Badge text={rv.status} color={rv.status === 'OPEN' ? '#a56300' : '#137333'} /></td>
+                      <td style={{ ...td, color: '#5f6368' }}>{rv.reason}</td>
+                      <td style={td}>{rv.resolution ? `${rv.resolution}${rv.resolvedBy ? ` by ${rv.resolvedBy}` : ''}` : '—'}</td>
+                      <td style={td}>
+                        {rv.status === 'OPEN' ? (
+                          <span style={{ display: 'flex', gap: 4 }}>
+                            <button disabled={busy != null} onClick={() => onResolveRevalidation(rv.revalidationId, 'RESUMED')} style={{ ...btn, padding: '2px 6px', fontSize: 11, background: '#137333', color: '#fff' }} title="缺口已由新消费方的新鲜 PASS 或匹配豁免覆盖后，继续发布">继续</button>
+                            <button disabled={busy != null} onClick={() => onResolveRevalidation(rv.revalidationId, 'HELD')} style={{ ...btn, padding: '2px 6px', fontSize: 11 }} title="记录一条继续保持暂停的可追溯结论">保持暂停</button>
+                          </span>
+                        ) : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, marginTop: 6 }}>
             <thead>

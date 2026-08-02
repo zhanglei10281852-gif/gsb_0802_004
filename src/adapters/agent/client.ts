@@ -159,6 +159,14 @@ export class ControlCenterClient {
     return this.req<{ rollouts: any[] }>('GET', `/api/subjects/${encodeURIComponent(subjectId)}/rollouts`);
   }
 
+  resolveRevalidation(revalidationId: string, resolution: 'RESUMED' | 'HELD', resolvedBy: string, note?: string) {
+    return this.req<{ status: string; reason?: string; resolution?: string }>(
+      'POST',
+      `/api/revalidations/${encodeURIComponent(revalidationId)}/resolve`,
+      { resolution, resolvedBy, note }
+    );
+  }
+
   snapshot() {
     return this.req<any>('GET', '/api/snapshot');
   }
